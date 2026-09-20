@@ -1,0 +1,34 @@
+# Inert here: GitHub only reads `.github/workflows` at a repo ROOT, and this
+# file lives under `src/.github/workflows` in the development repo, where
+# `src/` is a subdirectory, not the root. It has no effect until this tree is
+# projected onto the public repo by the release process, where `src/`
+# becomes the repo root and this file lands at the real
+# `.github/workflows/tests.yml`. Runs only there, against the published
+# package.
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      # The repo root IS the `hexn` package here; installing it pulls
+      # `hexset` from the pinned git URL in pyproject.toml. pytest itself is
+      # not a declared dependency of the package (only of running its own
+      # suite), so it is installed alongside rather than through the
+      # package's own metadata. Torch is deliberately not a dependency and
+      # must not be installed -- the torch-dependent tests skip cleanly
+      # without it.
+      - run: pip install -e . pytest
+      - run: pytest tests -q

@@ -1,0 +1,48 @@
+[project]
+name = "hexn"
+version = "0.23.3"
+description = "PPO/training research on the hexset engine"
+requires-python = ">=3.11"
+license = { text = "GPL-3.0-only" }
+classifiers = [
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+# `hexset` (the rules engine, bots, ledger and observation encoder) lives in
+# the public HexSet repo, which is a single root distribution named `hexset`
+# and is no longer part of this distribution or this checkout. The private
+# development checkout vendors that repo as a git submodule at `hexset/`
+# pinned to the same commit as the URL below, so development installs the
+# engine straight from the submodule root:
+#     pip install -e hexset
+#     pip install -e src
+# A consumer of the published `hexn` package has no submodule, so it gets
+# `hexset` the normal way, via the git URL dependency pinned below. Keep both
+# pins (this URL and the submodule gitlink under `hexset/`) at the same
+# commit -- `src/tests/hexn/test_engine_pin.py` checks that they agree.
+# `heximax` is a sibling top-level package in that same distribution
+# (its root `pyproject.toml`'s `[tool.setuptools.packages.find]` includes
+# `hexset`, `hexset.*`, `heximax` and `heximax.*`), so this one requirement
+# installs both -- nothing else to add for `heximax`.
+dependencies = [
+    "hexset @ git+https://github.com/0xBrsm/HexSet.git@b8f63dc42ff6b255c9becc2bd961076126d023d0",
+    "numpy>=1.26",
+]
+
+# torch is not declared here either, same reasoning as always: it is
+# provisioned separately (the training/GPU image) so the parts of this
+# package that don't need it stay installable without it.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["hexn*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
