@@ -7,10 +7,8 @@ imported across the boundary -- a test file is not an installable package
 when both suites shared one `tests/` directory (`from test_mcts import ...`).
 Keep this in sync with `test_mcts.py` by hand if either changes.
 
-Trimmed 2026-09-04: `give`/`clear_hand`/`a_purchase`/`a_steal` were needed
-only by `test_floor.py`, `test_rank.py` and `test_sibling.py`, all cut in the
-essential-tests pass; `test_expert.py` is the sole remaining consumer and
-only needs the two fixtures below.
+`test_expert.py` is the sole consumer and needs only the two fixtures below;
+keep it that way rather than growing this module for one more caller.
 """
 
 from __future__ import annotations

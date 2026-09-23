@@ -13,10 +13,10 @@ Standings come from the games themselves — every game scores every learner —
 so the heat's gate reads off the log. The heat measures who learns best in
 this shared ecology, not isolated self-play; external anchors calibrate.
 
-    python -m hexn.league --base runs/scratch-mlp/iter-00450.pt \\
+    python -m hexn.league --base runs/example/iter-00450.pt \\
         --learner entropy=0.02 --learner entropy=0.03 \\
         --learner entropy=0.05 --learner entropy=0.08 \\
-        --iterations 60 --checkpoint-dir runs/heat-entropy
+        --iterations 60 --checkpoint-dir runs/my-heat
 """
 
 from __future__ import annotations

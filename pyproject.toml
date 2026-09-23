@@ -1,6 +1,6 @@
 [project]
 name = "hexn"
-version = "0.23.3"
+version = "0.23.5"
 description = "PPO/training research on the hexset engine"
 requires-python = ">=3.11"
 license = { text = "GPL-3.0-only" }

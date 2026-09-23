@@ -137,10 +137,10 @@ _OUTPUT_NAMES = ("action_index", "prior", "value")
 _BATCH = "batch"
 
 # What the graph stamps as `contract`: the engine's own constant. The record
-# layout and this export's tuple move together again since HexSet #56 bumped
-# `hexset.onnx_record.CONTRACT_VERSION` to "6" (the knight is one slot; the
-# trading redesign shares the same unreleased contract), so importing it is
-# what keeps a deployed file's number equal to the record it speaks.
+# layout and this export's tuple move together again now that
+# `hexset.onnx_record.CONTRACT_VERSION` is "6" (the knight is one slot; the
+# trading redesign shares the same contract), so importing it is what keeps a
+# deployed file's number equal to the record it speaks.
 from hexset.onnx_record import CONTRACT_VERSION as _CONTRACT_VERSION
 
 # `action_mask` is the only bool input; every other input is int64 -- there

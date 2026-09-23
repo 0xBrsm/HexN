@@ -10,4 +10,23 @@ kinds with `hexset.arena`'s registry -- see
 `hexset.clients.netbot.register_entrants`.
 """
 
-__version__ = "0.1.0"
+from __future__ import annotations
+
+import tomllib
+from importlib import metadata
+from pathlib import Path
+
+# `hexn` is one distribution (`../pyproject.toml`), and that file is the only
+# place its version lives. Read it from the source tree first: an editable
+# install's dist-info metadata is only regenerated on reinstall and goes stale
+# silently. Fall back to installed metadata only for a wheel, which ships no
+# `pyproject.toml`. This was a literal "0.1.0" through 0.23.4, which every
+# release since 0.1.0 contradicted.
+try:
+    with open(Path(__file__).resolve().parent.parent / "pyproject.toml", "rb") as f:
+        __version__ = tomllib.load(f)["project"]["version"]
+except (OSError, KeyError, tomllib.TOMLDecodeError):
+    try:
+        __version__ = metadata.version("hexn")
+    except metadata.PackageNotFoundError:
+        __version__ = "0+unknown"

@@ -2,6 +2,30 @@
 
 All notable changes to the `hexn` package are recorded here.
 
+## 0.23.5
+
+### Fixed
+
+- **`hexn.__version__` reports the package's version.** It was a literal
+  `"0.1.0"`, so every release since then reported the wrong number to
+  anything that asked. It is now read from `pyproject.toml`, the one place
+  the version lives, falling back to installed metadata for a wheel.
+  `tests/hexn/test_versions.py` checks the two agree.
+
+## 0.23.4
+
+No behaviour change. Three comments and docstrings read as notes to the
+people who wrote them rather than to someone reading the published code.
+
+### Changed
+
+- **`export_onnx`'s contract-version comment** states the current contract
+  ("6") instead of the change request that introduced it.
+- **`league`'s usage example** names generic checkpoint and output paths
+  instead of specific local runs.
+- **`tests/hexn/_mcts_fixtures.py`'s docstring** says what the module is for
+  instead of recounting when it was trimmed.
+
 ## 0.23.3
 
 ### Added
