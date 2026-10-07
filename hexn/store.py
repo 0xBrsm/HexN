@@ -25,6 +25,16 @@ deletes any evicted one in the same call, so the directory's contents are
 always exactly the retained window; `resume` reloads by reading whatever
 shards are still there, in iteration order, and trusts the budget already
 applied when they were written.
+
+**Every write is atomic** (`hexn.durable.write_atomic`), `replace`'s
+reanalysed rewrites included, so a kill mid-write leaves the old shard and
+never a truncated one that would break the next resume. **A shard is its
+iteration's completed collection.** A crash after `append` and before the
+checkpoint leaves a shard for an iteration the checkpoint has not reached;
+`resume(before=...)` holds such shards back and `adopt` takes each into the
+window when the resumed run reaches its iteration, so that collection is
+neither lost nor collected again. `append` of an iteration already held
+replaces its shard and never keeps two.
 """
 
 from __future__ import annotations
@@ -35,6 +45,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .durable import write_atomic
 from .selfplay import Episode
 
 if TYPE_CHECKING:
@@ -76,15 +87,36 @@ class EpisodeStore:
         self.directory = Path(directory)
         self.capacity = capacity
         self._shards: deque[_Shard] = deque()
+        # Shards on disk for iterations a resumed run has not reached yet, by
+        # iteration: collections a crash left ahead of their checkpoint.
+        self.ahead: dict[int, tuple[Episode, ...]] = {}
 
     def append(self, iteration: int, episodes: list[Episode]) -> None:
         """Add one iteration's episodes: write its shard, then evict the
         oldest shards until the window is back at or under `capacity` -- or
-        down to one shard, whichever comes first."""
+        down to one shard, whichever comes first. An iteration already in
+        the window has its shard replaced, not joined by a second."""
         self.directory.mkdir(parents=True, exist_ok=True)
         path = shard_path(self.directory, iteration)
-        path.write_bytes(pickle.dumps(list(episodes)))
-        self._shards.append(_Shard(iteration, path, tuple(episodes)))
+        write_atomic(path, pickle.dumps(list(episodes)))
+        self.ahead.pop(iteration, None)
+        self._insert(_Shard(iteration, path, tuple(episodes)))
+
+    def adopt(self, iteration: int) -> list[Episode]:
+        """Take a shard `resume` held back into the window as its iteration's
+        collection, exactly as `append` would have put it there, and return
+        its episodes. The file is already on disk and is not rewritten."""
+        episodes = self.ahead.pop(iteration)
+        self._insert(_Shard(iteration, shard_path(self.directory, iteration), episodes))
+        return list(episodes)
+
+    def _insert(self, shard: _Shard) -> None:
+        for index, held in enumerate(self._shards):
+            if held.iteration == shard.iteration:
+                self._shards[index] = shard
+                break
+        else:
+            self._shards.append(shard)
         self._evict()
 
     def _evict(self) -> None:
@@ -100,7 +132,7 @@ class EpisodeStore:
         cache. Raises if `iteration` has since been evicted."""
         for index, shard in enumerate(self._shards):
             if shard.iteration == iteration:
-                shard.path.write_bytes(pickle.dumps(list(episodes)))
+                write_atomic(shard.path, pickle.dumps(list(episodes)))
                 self._shards[index] = _Shard(iteration, shard.path, tuple(episodes))
                 return
         raise KeyError(f"iteration {iteration} is not in the store")
@@ -142,7 +174,9 @@ class EpisodeStore:
         return Batch.concat(parts)
 
     @classmethod
-    def resume(cls, directory: Path, capacity: int) -> "EpisodeStore":
+    def resume(
+        cls, directory: Path, capacity: int, *, before: int | None = None
+    ) -> "EpisodeStore":
         """Reload every shard already on disk, in iteration order.
 
         The shards on disk are exactly the retained window as of the last
@@ -150,6 +184,11 @@ class EpisodeStore:
         drops it from memory -- so this trusts what is there rather than
         re-applying the budget; a directory left inconsistent by a crash mid
         `append` (a shard written, its eviction never run) is read as-is.
+
+        `before` is the iteration the run resumes at. A shard at or after it
+        was written ahead of the checkpoint -- collected, then the crash --
+        and is held in `ahead` for `adopt` rather than loaded into the window
+        early, where it would train updates that came before it.
         """
         store = cls(directory, capacity)
         directory = Path(directory)
@@ -157,6 +196,9 @@ class EpisodeStore:
             return store
         for path in sorted(directory.glob("iter-*.pkl")):
             iteration = int(path.stem.split("-")[1])
-            episodes = pickle.loads(path.read_bytes())
-            store._shards.append(_Shard(iteration, path, tuple(episodes)))
+            episodes = tuple(pickle.loads(path.read_bytes()))
+            if before is not None and iteration >= before:
+                store.ahead[iteration] = episodes
+            else:
+                store._shards.append(_Shard(iteration, path, episodes))
         return store

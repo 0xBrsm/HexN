@@ -38,6 +38,14 @@ which asks a different question of the same samples -- the *shape* of each
 position's conditional return distribution, not just its variance -- and needs
 the samples themselves to do it. Absent the flag, nothing is written and every
 other line of output is unaffected.
+
+Every position is one line of `--rows` (a JSONL journal, named from the
+settings when not given) the moment its rollouts are in, and a rerun with the
+same settings probes only the positions the journal does not hold yet. Each
+position draws its rollouts from streams keyed by its own index, so it reads
+the same whichever positions came before it; the shared streams it used to
+draw from made it depend on all of them. `--dump-returns` is written from the
+journal once every position is in.
 """
 
 from __future__ import annotations
@@ -54,6 +62,7 @@ import numpy as np
 from hexset.bench.throughput import environment
 from hexset.board.board import random_base_board
 from hexset.game import imagine
+from hexn import durable
 from hexn.rewards import reward
 from hexn.selfplay import Collector, Episode
 
@@ -176,6 +185,12 @@ def main(argv: list[str] | None = None) -> int:
             "else changes."
         ),
     )
+    parser.add_argument(
+        "--rows",
+        default="",
+        help="the journal each position is appended to as it finishes, and "
+        "the one a rerun resumes from; named from the settings when omitted",
+    )
     args = parser.parse_args(argv)
 
     import torch
@@ -202,7 +217,7 @@ def main(argv: list[str] | None = None) -> int:
         players=args.players,
         seed=args.seed + 1,
         action_cap=args.action_cap,
-        max_trades=loaded.max_trades,
+        max_offers=loaded.max_offers,
         deal=args.seed_games,
         board=board,
     )
@@ -216,18 +231,37 @@ def main(argv: list[str] | None = None) -> int:
     chosen = rng.sample(kept, min(args.positions, len(kept)))
     seeded = time.perf_counter() - started
 
+    header = {
+        **{
+            k: v
+            for k, v in vars(args).items()
+            if k not in ("json", "dump_returns", "rows")
+        },
+        "iteration": loaded.iteration,
+    }
+    journal = durable.Rows(args.rows or durable.rows_path("floor", header), header)
     rows = []
     dumped = []
-    for snapshot, progress in chosen:
+    for index, (snapshot, progress) in enumerate(chosen):
+        fingerprint = durable.fingerprint(snapshot.seat, snapshot.prediction, progress)
+        done = journal.check(index, fingerprint)
+        if done is not None:
+            rows.append(done["row"])
+            dumped.append(done["dump"])
+            continue
+        # This position's own streams, so it reads the same whichever
+        # positions came before it.
+        stream = random.Random(f"{args.seed}:{index}:floor")
+        generator.manual_seed(stream.getrandbits(63))
         branch = Branching(
             policy,
             snapshot.game,
-            rng=rng,
+            rng=stream,
             lanes=args.rollouts,
             players=args.players,
             seed=args.seed + 3,
             action_cap=args.action_cap,
-            max_trades=loaded.max_trades,
+            max_offers=loaded.max_offers,
             deal=args.rollouts,
             board=board,
         )
@@ -236,46 +270,50 @@ def main(argv: list[str] | None = None) -> int:
             dtype=np.float64,
         )
         floor, bias = split(returns, snapshot.prediction)
-        rows.append(
-            {
-                "progress": round(progress, 3),
-                "rollouts": int(returns.size),
-                "floor": floor,
-                "bias_squared": bias,
-                "mse": floor + bias,
-            }
-        )
-        if args.dump_returns:
-            dumped.append(
-                {
-                    "progress": round(progress, 3),
-                    "seat": snapshot.seat,
-                    "prediction": snapshot.prediction,
-                    "returns": returns.tolist(),
-                }
-            )
+        row = {
+            "progress": round(progress, 3),
+            "rollouts": int(returns.size),
+            "floor": floor,
+            "bias_squared": bias,
+            "mse": floor + bias,
+        }
+        # The raw returns ride in the journal whether or not they are dumped,
+        # so a resumed run can still write `--dump-returns` in full.
+        dump = {
+            "progress": round(progress, 3),
+            "seat": snapshot.seat,
+            "prediction": snapshot.prediction,
+            "returns": returns.tolist(),
+        }
+        journal.add(index, fingerprint, row=row, dump=dump)
+        rows.append(row)
+        dumped.append(dump)
     elapsed = time.perf_counter() - started
 
     if args.dump_returns:
-        with open(args.dump_returns, "w") as handle:
-            json.dump(
+        durable.write_atomic(
+            args.dump_returns,
+            json.dumps(
                 {
                     "checkpoint": args.checkpoint,
                     "iteration": loaded.iteration,
                     "seed": args.seed,
                     "positions": dumped,
-                },
-                handle,
-            )
+                }
+            ).encode(),
+        )
 
     stages = _stages(rows, args.bins)
 
-    # `dump_returns` is excluded rather than left in: it names a filesystem
-    # path with no bearing on what the run measured, and this dict is what
-    # bit-identical-off-path is checked against, so a CLI flag that defaults
-    # off must not be visible here at all -- present or absent -- or every
-    # recorded floor.py output would stop matching a fresh run bit for bit.
-    recorded_args = {k: v for k, v in vars(args).items() if k != "dump_returns"}
+    # `dump_returns` and `rows` are excluded rather than left in: they name
+    # filesystem paths with no bearing on what the run measured, and this dict
+    # is what bit-identical-off-path is checked against, so a CLI flag that
+    # defaults off must not be visible here at all -- present or absent -- or
+    # every recorded floor.py output would stop matching a fresh run bit for
+    # bit.
+    recorded_args = {
+        k: v for k, v in vars(args).items() if k not in ("dump_returns", "rows")
+    }
     payload = {
         "environment": environment(),
         "checkpoint": args.checkpoint,

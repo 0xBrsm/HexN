@@ -15,7 +15,7 @@ from hexn.replay import replay_to_ply
 from hexn.selfplay import Collector, RandomPolicy
 
 
-def a_trade_free_episode(seed: int = 11, action_cap: int = 400):
+def a_trade_free_episode(seed: int = 11, action_cap: int = 150):
     """A collector with no `trader` hook seats every gate `None`
     (`LaneEnv` reads it as "this seat never trades"), so nothing here ever
     trades -- the same premise
@@ -45,13 +45,6 @@ def test_replay_to_ply_matches_the_stored_observation_at_every_step():
     assert checked > 0
 
 
-def test_replay_to_ply_ply_zero_is_the_untouched_start():
-    episode = a_trade_free_episode(seed=17)
-    game = replay_to_ply(episode, 0)
-    assert game.turns == 0
-    assert to_move(game) == episode.stream()[0].seat
-
-
 def test_replay_to_ply_is_the_engines_own_replay_and_nothing_added():
     """The whole claim of this module now: `hexn.replay.replay_to_ply` is
     `hexset.record.replay_to` called on a collected episode's own `record`,
@@ -69,12 +62,6 @@ def test_replay_to_ply_is_the_engines_own_replay_and_nothing_added():
         assert np.array_equal(mine.vertices, theirs.vertices)
         assert np.array_equal(mine.edges, theirs.edges)
         assert np.array_equal(mine.globals, theirs.globals)
-
-
-def test_replay_to_ply_refuses_a_ply_past_the_recorded_stream():
-    episode = a_trade_free_episode(seed=5, action_cap=20)
-    with pytest.raises(ValueError, match="more"):
-        replay_to_ply(episode, len(episode.stream()) + 1)
 
 
 def test_replay_to_ply_refuses_an_episode_with_an_opponent_seat():

@@ -106,6 +106,12 @@ backwards. `NetworkPolicy` writes `Choice.value` in the **mover's** frame, so
 writes it in **board order**, which is why `distill._value_targets` rotates and
 this file does not.
 
+Every position is one line of `--rows` (a JSONL journal, named from the
+settings when not given) the moment its rollouts are in, and a rerun with
+the same settings probes only the positions the journal does not hold yet.
+Each position draws its rollouts from streams keyed by its own index, as in
+`benchmarks.floor`.
+
     python -m hexn.benchmarks.horizon --checkpoint runs/example/latest.pt \\
         --positions 64 --rollouts 64 --horizon 8
 """
@@ -123,6 +129,7 @@ import numpy as np
 from .floor import Branching, Sampling, collect
 from hexset.bench.throughput import environment
 from hexset.board.board import random_base_board
+from hexn import durable
 from hexn.rewards import reward
 from hexn.selfplay import Collector
 
@@ -233,6 +240,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--action-cap", type=int, default=4000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--rows",
+        default="",
+        help="the journal each position is appended to as it finishes, and "
+        "the one a rerun resumes from; named from the settings when omitted",
+    )
     args = parser.parse_args(argv)
 
     import torch
@@ -260,7 +273,7 @@ def main(argv: list[str] | None = None) -> int:
         players=args.players,
         seed=args.seed + 1,
         action_cap=args.action_cap,
-        max_trades=loaded.max_trades,
+        max_offers=loaded.max_offers,
         deal=args.seed_games,
         board=board,
     )
@@ -273,17 +286,31 @@ def main(argv: list[str] | None = None) -> int:
         )
     chosen = rng.sample(kept, min(args.positions, len(kept)))
 
+    header = {
+        **{k: v for k, v in vars(args).items() if k not in ("json", "rows")},
+        "iteration": loaded.iteration,
+    }
+    journal = durable.Rows(args.rows or durable.rows_path("horizon", header), header)
     rows = []
-    for snapshot, progress in chosen:
+    for index, (snapshot, progress) in enumerate(chosen):
+        fingerprint = durable.fingerprint(snapshot.seat, snapshot.prediction, progress)
+        done = journal.check(index, fingerprint)
+        if done is not None:
+            rows.append(done["row"])
+            continue
+        # This position's own streams, so it reads the same whichever
+        # positions came before it.
+        stream = random.Random(f"{args.seed}:{index}:horizon")
+        generator.manual_seed(stream.getrandbits(63))
         branch = Branching(
             policy,
             snapshot.game,
-            rng=rng,
+            rng=stream,
             lanes=args.rollouts,
             players=args.players,
             seed=args.seed + 3,
             action_cap=args.action_cap,
-            max_trades=loaded.max_trades,
+            max_offers=loaded.max_offers,
             deal=args.rollouts,
             board=board,
         )
@@ -299,31 +326,31 @@ def main(argv: list[str] | None = None) -> int:
         booted = np.asarray([p[0] for p in pairs], dtype=np.float64)
         finals = np.asarray([p[1] for p in pairs], dtype=np.float64)
         reached = float(np.mean([p[2] for p in pairs]))
-        rows.append(
-            {
-                "progress": round(progress, 3),
-                "rollouts": len(pairs),
-                "reached_horizon": round(reached, 3),
-                "terminal_variance": float(finals.var()),
-                "bootstrap_variance": float(booted.var()),
-                "gap": float(booted.mean() - finals.mean()),
-                "head": float(snapshot.prediction),
-                # Disjoint halves: the label and the terminal return of one
-                # rollout share that rollout's dice, so averaging both over the
-                # same games would correlate their errors and flatter the label.
-                "label_mean": float(booted[0::2].mean()),
-                "truth_mean": float(finals[1::2].mean()),
-                # Same disjoint halves for every mixture: a label and a terminal
-                # return off one rollout share that rollout's dice.
-                "mixtures": {
-                    str(lam): {
-                        "label_mean": float(values[0::2].mean()),
-                        "variance": float(values.var()),
-                    }
-                    for lam, values in mixtures.items()
-                },
-            }
-        )
+        row = {
+            "progress": round(progress, 3),
+            "rollouts": len(pairs),
+            "reached_horizon": round(reached, 3),
+            "terminal_variance": float(finals.var()),
+            "bootstrap_variance": float(booted.var()),
+            "gap": float(booted.mean() - finals.mean()),
+            "head": float(snapshot.prediction),
+            # Disjoint halves: the label and the terminal return of one
+            # rollout share that rollout's dice, so averaging both over the
+            # same games would correlate their errors and flatter the label.
+            "label_mean": float(booted[0::2].mean()),
+            "truth_mean": float(finals[1::2].mean()),
+            # Same disjoint halves for every mixture: a label and a terminal
+            # return off one rollout share that rollout's dice.
+            "mixtures": {
+                str(lam): {
+                    "label_mean": float(values[0::2].mean()),
+                    "variance": float(values.var()),
+                }
+                for lam, values in mixtures.items()
+            },
+        }
+        journal.add(index, fingerprint, row=row)
+        rows.append(row)
     elapsed = time.perf_counter() - started
 
     terminal = np.asarray([r["terminal_variance"] for r in rows])

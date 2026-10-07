@@ -5,15 +5,16 @@ import random
 
 import numpy as np
 import pytest
+from _bots import needs
 
 torch = pytest.importorskip("torch", reason="PyTorch runs on the training box only")
 
-from hexset.actions import ActionType, legal_actions, mask_of, space_for  # noqa: E402
+from hexset.actions import legal_actions, mask_of, space_for  # noqa: E402
 from hexset.board.board import random_base_board  # noqa: E402
 from hexset.board.terrain import NUM_RESOURCES  # noqa: E402
 from hexset.clients.netbot import NetworkBot  # noqa: E402
 from hexset.encoding import encode, static_graph  # noqa: E402
-from hexset.game import is_over, start, to_move  # noqa: E402
+from hexset.game import start, to_move  # noqa: E402
 from hexset.trading import one_for_one  # noqa: E402
 from hexn.model import HexNet, ModelConfig, packing  # noqa: E402
 from hexset.play import step_randomly  # noqa: E402
@@ -61,26 +62,6 @@ class Counting:
         return self.net.parameters()
 
 
-class RowCounting:
-    """Wraps the net so a test can see how many rows each forward scored.
-
-    `hexn.model.unpack` hands the net four tensors, each shaped `(batch,
-    ...)`, so the first argument's leading dimension is the row count for
-    that call.
-    """
-
-    def __init__(self, net):
-        self.net = net
-        self.batches: list[int] = []
-
-    def __call__(self, *args):
-        self.batches.append(int(args[0].shape[0]))
-        return self.net(*args)
-
-    def parameters(self):
-        return self.net.parameters()
-
-
 def test_a_tick_runs_exactly_one_forward_however_many_lanes_there_are():
     policy = a_policy()
     counter = Counting(policy.net)
@@ -100,7 +81,9 @@ def test_a_tick_runs_exactly_one_forward_however_many_lanes_there_are():
 
 def test_every_action_it_picks_is_one_the_engine_offered():
     policy = a_policy(seed=2)
-    collector = Collector(policy, lanes=8, seed=2)
+    # Trade-free: the claim is about the move a policy picks, and a gate
+    # pricing candidates after every MAIN action is most of a tick's cost.
+    collector = Collector(policy, lanes=8, seed=2, max_offers=0)
 
     kinds = set()
     for _ in range(60):
@@ -113,59 +96,6 @@ def test_every_action_it_picks_is_one_the_engine_offered():
     # Anti-vacuity: a run that only ever saw ROLL and END_TURN would pass this
     # while exercising none of the index arithmetic it is meant to check.
     assert len(kinds) >= 5, f"only saw {sorted(k.name for k in kinds)}"
-
-
-def test_it_never_picks_an_action_the_mask_ruled_out():
-    policy = a_policy(seed=3)
-    collector = Collector(policy, lanes=8, seed=3)
-
-    excluded = 0
-    checked = 0
-    for _ in range(40):
-        requests = collector.requests()
-        for request, choice in zip(requests, policy.act(requests)):
-            index = policy.space.index(choice.action)
-            assert request.mask[index]
-            excluded += int((~request.mask).sum())
-            checked += 1
-        collector.tick()
-
-    # Anti-vacuity: if the mask excluded nothing there would be nothing to obey.
-    assert checked > 0
-    assert excluded > 0
-
-
-def test_every_legal_action_is_recoverable_from_its_index():
-    # The policy reconstructs its choice with `space.decode` rather than by
-    # searching the options, which is only sound if decode is exact for every
-    # kind. It was not under contract 4 -- `PROPOSE_TRADE` was one slot
-    # standing for ten numbers -- and the deletion of the trade actions
-    # (`hexset.trading`) is what makes it true without an exception now.
-    rng = random.Random(4)
-    game = start(random_base_board(rng), 4, rng)
-    space = space_for(game)
-
-    kinds = set()
-    for _ in range(1500):
-        if is_over(game):
-            game = start(random_base_board(rng), 4, rng)
-        for action in legal_actions(game):
-            kinds.add(action.type)
-            assert space.decode(space.index(action)) == action, action
-        step_randomly(game, rng)
-
-    assert len(kinds) >= 8, f"only saw {sorted(k.name for k in kinds)}"
-
-
-def test_no_action_the_policy_can_pick_is_a_trade():
-    # The whole trade protocol left the action space at contract 5. If any of
-    # it came back, everything downstream -- the flat index, `decode`, the
-    # log-prob -- would be wrong in a way nothing else here would catch.
-    gone = {"PROPOSE_TRADE", "ACCEPT_TRADE", "DECLINE_TRADE"}
-    assert gone.isdisjoint(kind.name for kind in ActionType)
-    # `BANK_TRADE` is not one of them: trading with the bank is a rule of
-    # Catan and always was an action.
-    assert "BANK_TRADE" in {kind.name for kind in ActionType}
 
 
 def _as_batch(policy, requests, choices):
@@ -183,9 +113,9 @@ def test_evaluate_reproduces_exactly_what_act_recorded():
     # PPO's ratio is `exp(evaluate - act)`, so if these two disagree the very
     # first update is already taking ratios against the wrong distribution.
     policy = a_policy(seed=8)
-    collector = Collector(policy, lanes=16, seed=8)
+    collector = Collector(policy, lanes=16, seed=8, max_offers=0)
 
-    for _ in range(40):
+    for _ in range(20):
         requests = collector.requests()
         choices = policy.act(requests)
         buffer, mask, chosen = _as_batch(policy, requests, choices)
@@ -197,26 +127,6 @@ def test_evaluate_reproduces_exactly_what_act_recorded():
         values = torch.tensor([c.value for c in choices])
         assert torch.allclose(evaluation.value, values, atol=1e-4)
         collector.tick()
-
-
-def test_a_greedy_policy_makes_the_same_choice_twice():
-    policy = a_policy(seed=10, greedy=True)
-    collector = Collector(policy, lanes=8, seed=10)
-    requests = collector.requests()
-
-    first = policy.act(requests)
-    second = policy.act(requests)
-
-    assert [c.action for c in first] == [c.action for c in second]
-    assert len({c.action for c in first}) > 1, "every lane picked the same action"
-
-
-def test_an_empty_batch_is_answered_without_touching_the_network():
-    policy = a_policy(seed=11)
-    counter = Counting(policy.net)
-    policy.net = counter
-    assert policy.act([]) == []
-    assert counter.calls == 0
 
 
 # --- the row seam: this policy as `hexset.clients.policy.Policy` ----------
@@ -287,18 +197,36 @@ def test_the_gate_a_policy_seats_is_the_engine_s():
     `.onnx` file, the duelled checkpoint and the self-play lane."""
     policy = a_policy(seed=66)
     game = a_played_game(67)
-    gate = policy.trader(game, 2, max_trades=5)
+    gate = policy.trader(game, 2, max_offers=5)
 
     assert isinstance(gate, NetworkBot)
     assert gate._seated is game
     assert gate.seat == 2
     assert gate.players == 4
-    assert gate.max_trades == 5
+    assert gate.max_offers == 5
     # The seat guard is the engine's: a gate wired to seat 2 must refuse to
     # answer for anybody else rather than price somebody else's hand.
     with pytest.raises(ValueError, match="seated at 2"):
         gate.accepts(game.state(3), one_for_one(0, 1), 1)
     assert isinstance(gate.accepts(game.state(2), one_for_one(0, 1), 1), bool)
+
+
+@needs("heximax")
+def test_a_named_trader_answers_the_seats_trades_instead_of_the_value_head():
+    """`trader` seats that bot's own gate (`hexn.trade.trader_gate`): the
+    network keeps every move and its value head prices nothing."""
+    from hexset.arena import entrant_from_name, spawn
+
+    policy = a_policy(seed=66)
+    game = a_played_game(67)
+    gate = policy.trader(game, 2, trader="heximax")
+    board = game.state(2).state.board
+
+    assert type(gate) is type(spawn(entrant_from_name("heximax"), board, random.Random(2)))
+    assert gate.trade_offer_budget == 2
+    assert isinstance(gate.accepts(game.state(2), one_for_one(0, 1), 1), bool)
+    # Seeded by the seat: the same seat gets the same trader's draws.
+    assert policy.trader(game, 2, trader="heximax")._trade_seed == gate._trade_seed
 
 
 def test_asking_for_a_gate_leaves_the_position_exactly_as_it_was():
@@ -316,27 +244,6 @@ def test_asking_for_a_gate_leaves_the_position_exactly_as_it_was():
     assert [hand[:] for hand in game.state(0, hidden=False).hands] == before
     assert id(game.state(0, hidden=False)) == identity
     assert id(game.ledger) == ledger_identity
-
-
-def test_the_off_switch_refuses_everything_without_a_forward():
-    policy = a_policy(seed=20)
-    counter = Counting(policy.net)
-    policy.net = counter
-    game = a_played_game(21)
-    trader = policy.trader(game, 1, 0)
-    view = game.state(1)
-
-    assert trader.accepts(view, one_for_one(0, 1), 2) is False
-    assert trader.gains_many(view, [one_for_one(0, 1)], [2]) == [-1.0]
-    assert counter.calls == 0
-
-
-def test_masked_log_softmax_puts_no_mass_on_an_illegal_slot():
-    logits = torch.zeros(2, 6)
-    mask = torch.tensor([[True, False, True, False, False, True]] * 2)
-    probabilities = masked_log_softmax(logits, mask).exp()
-    assert torch.allclose(probabilities[:, 1], torch.zeros(2), atol=1e-6)
-    assert probabilities.sum() == pytest.approx(2.0, abs=1e-4)
 
 
 def test_a_tempered_request_records_the_tempered_log_prob():

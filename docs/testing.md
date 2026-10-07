@@ -8,6 +8,21 @@ run from `src/`. `pyproject.toml` sets `pythonpath = ["."]` and
 `testpaths = ["tests"]`, so this works against an editable install with no
 extra configuration.
 
+## Named bots need their runtime
+
+HexSet ships no playing bots. The tests that seat `heximax` or `rehex` by
+name skip unless the module that registers them is loaded:
+
+```bash
+python -m pytest tests -q --runtime <module>
+```
+
+`tests/conftest.py` adds the option and imports each module before the
+tests are collected (`hexset.arena.load_runtime`); `tests/hexn/_bots.py`'s
+`needs(...)` is the skip. The suite's own scripted names (`random-too`)
+come from `tests/hexn/_scripted_runtime.py`, loaded the same way a run
+loads its bots.
+
 ## Torch is optional, and the suite reflects it
 
 `hexn` does not declare `torch` as a dependency (see
@@ -20,16 +35,16 @@ where torch is absent:
 `test_collect.py`, `test_netbot.py`, `test_ddp.py`, `test_widen.py`,
 `test_policy.py`, `test_export_onnx.py`, `test_ppo.py`, `test_ppo_main.py`,
 `test_migrate.py`, `test_exit.py`, `test_league.py`, `test_model.py`,
-`test_reanalyse.py`, `test_expert.py`, and `test_run_manifest.py` (its
+`test_reanalyse.py`, and `test_run_manifest.py` (its
 parsers import torch even though the manifest format itself does not).
 
 The rest of the suite needs only `numpy` and `hexset`, and runs on a machine
 that cannot install torch at all:
 
 `test_head_shape.py`, `test_no_raw_state.py`, `test_rewards.py`,
-`test_schedule.py`, `test_engine_pin.py`, `test_readout.py`,
-`test_replay.py`, `test_store.py`, `test_gate_wiring.py`, and
-`test_selfplay.py`, plus `_mcts_fixtures.py`, a shared fixture module (not a
+`test_schedule.py`, `test_readout.py`,
+`test_replay.py`, `test_store.py`, `test_gate_wiring.py`, `test_expert.py`,
+and `test_selfplay.py`, plus `_mcts_fixtures.py`, a shared fixture module (not a
 test file itself) borrowed from HexSet's own search tests and kept in sync
 by hand rather than imported across the package boundary.
 
@@ -48,14 +63,6 @@ benchmarks that share this property.
 since `hexn.export_onnx` itself needs both, and neither is declared in
 `pyproject.toml` either. Exercising this file requires installing them
 separately.
-
-## What `test_engine_pin.py` checks
-
-It confirms the `hexset` commit pinned in `pyproject.toml`'s git-URL
-dependency matches a `hexset` git submodule at the enclosing repository's
-`HEAD`, when a submodule exists. It skips cleanly otherwise: an installed
-distribution, a source tarball, or any checkout with no `.git` at all. This
-covers every way this published package is normally obtained.
 
 ## What `test_no_raw_state.py` checks
 

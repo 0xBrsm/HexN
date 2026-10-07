@@ -52,6 +52,7 @@ from hexset.clients.netbot import (
 from hexset.encoding import static_graph
 from .model import HexNet, config_from_args, packing
 from .policy import NetworkPolicy
+from .trade import recorded_budget, trade_params as _trade_params
 
 # What this module exports. The three classes are `hexset.clients.netbot`'s
 # now -- re-exported by name so every existing `from hexn.netbot import ...`
@@ -79,8 +80,14 @@ class Loaded:
     policy: NetworkPolicy
     space: ActionSpace
     players: int
-    max_trades: int | None
+    max_offers: int | None
     iteration: int
+
+    @property
+    def trade_params(self):
+        """How this checkpoint's network bargains, as HexSet reads it by name
+        (`hexset.trading.params_of`): the offer budget its run recorded."""
+        return _trade_params(self.max_offers)
 
 
 @lru_cache(maxsize=4)
@@ -125,7 +132,7 @@ def load(
         ),
         space=space,
         players=players,
-        max_trades=args.get("max_trades"),
+        max_offers=recorded_budget(args),
         iteration=int(state.get("iteration", 0)),
     )
 

@@ -94,7 +94,10 @@ class SearchPolicy:
             for request, result in zip(requests, results)
         ]
 
-    def trader(self, game: Game, seat: int | None, max_trades: int | None = None):
+    def trader(
+        self, game: Game, seat: int | None, max_offers: int | None = None,
+        trader: str | None = None,
+    ):
         """What this policy brings to `game`'s trade event at `seat`.
 
         A gate is a pure function of the position (`hexset.trading.valued_many`
@@ -114,7 +117,11 @@ class SearchPolicy:
         if not isinstance(evaluator, LeafEvaluator):
             return None
         make = getattr(evaluator.policy, "trader", None)
-        return None if make is None else make(game, seat, max_trades)
+        if make is None:
+            return None
+        # Only a run that names a trader asks for one, so a policy whose hook
+        # predates it is still asked exactly as it always was.
+        return make(game, seat, max_offers) if trader is None else make(game, seat, max_offers, trader)
 
     def _one(self, request: Request) -> Choice:
         if request.game is None:
@@ -194,8 +201,10 @@ def _means(search: Search, root: Node, visits: np.ndarray) -> np.ndarray | None:
 def _value(root: Node, visits: np.ndarray) -> tuple[float, ...]:
     total = float(visits.sum())
     if not root.expanded or total <= 0:
-        # A forced move: `run` returns without expanding, because there is
-        # nothing to search. Empty means "no estimate", as it does for every
-        # scripted policy.
+        # Nothing was evaluated here. Empty means "no estimate", as it does
+        # for every scripted policy. A forced move is not this case: since
+        # HexSet 1.1 a root with one legal move is evaluated and its only
+        # edge credited with every simulation at that value, so it reads
+        # like any other root (before, it came back unexpanded and empty).
         return ()
     return tuple(root.totals.sum(axis=0) / total)

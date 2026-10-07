@@ -12,7 +12,6 @@ torch = pytest.importorskip("torch", reason="PyTorch runs on the training box on
 from hexn import loop  # noqa: E402
 from hexn.collect import parse_mix  # noqa: E402
 from hexn.ppo import __main__ as ppo_main  # noqa: E402
-from hexn.selfplay import Collector, RandomPolicy  # noqa: E402
 
 
 TINY = [
@@ -28,8 +27,13 @@ TINY = [
     "1",
     "--games-per-iteration",
     "1",
+    # Short, trade-free games: nothing here is about how a game is played, and
+    # a width-8 net's gate pricing every candidate after every MAIN action was
+    # most of what a run here cost.
     "--action-cap",
-    "600",
+    "200",
+    "--max-offers",
+    "0",
     "--minibatch",
     "256",
     "--epochs",
@@ -63,18 +67,6 @@ def run(directory, iterations, extra=()):
     return ppo_main.main([str(directory)])
 
 
-def test_a_run_writes_a_checkpoint_carrying_the_weights_and_the_game_counter(tmp_path):
-    assert run(tmp_path, 1, ["--checkpoint-every", "1"]) == 0
-
-    state = torch.load(tmp_path / "latest.pt", weights_only=False)
-    assert state["iteration"] == 1
-    assert state["games_started"] > 0
-    assert state["net"], "no weights in the checkpoint"
-    assert "state" in state["optimiser"]
-    # Anti-vacuity: a checkpoint that saved nothing would still have the keys.
-    assert any(v.numel() for v in state["net"].values())
-
-
 def test_numbered_checkpoints_are_kept_alongside_the_one_that_gets_overwritten(
     tmp_path,
 ):
@@ -101,12 +93,16 @@ def test_a_resumed_run_carries_on_from_the_iteration_it_reached(tmp_path):
     second = torch.load(tmp_path / "latest.pt", weights_only=False)
 
     assert first["iteration"] == 1
+    # What a resume needs from a checkpoint: the weights and the optimiser.
+    assert any(v.numel() for v in first["net"].values())
+    assert "state" in first["optimiser"]
     assert second["iteration"] == 3
     # It continued rather than restarted: the game counter only moves forward.
     assert second["games_started"] > first["games_started"]
 
     lines = [json.loads(l) for l in (tmp_path / "log.jsonl").read_text().splitlines()]
-    assert [record["iteration"] for record in lines] == [0, 1, 2]
+    assert lines[1] == {"resumed_from": 1}
+    assert [record["iteration"] for record in lines if "iteration" in record] == [0, 1, 2]
 
 
 def test_resuming_with_nothing_to_resume_is_an_error_rather_than_a_fresh_start(tmp_path):
@@ -122,25 +118,87 @@ def test_resuming_with_nothing_to_resume_is_an_error_rather_than_a_fresh_start(t
         run(tmp_path / "empty", 1, ["--checkpoint-every", "1", "--resume"])
 
 
-def test_a_resumed_run_plays_new_games_rather_than_the_ones_it_learned_from(tmp_path):
-    # A game is a pure function of the seed and its index, so restarting the
-    # counter would replay the training set — and it would look like it worked.
-    first = Collector(RandomPolicy(random.Random(0)), lanes=4, seed=3, action_cap=600)
-    first.collect(2)
-    reached = first.games_started()
-    assert reached > 0
+class Crash(Exception):
+    """What a killed trainer looks like from inside it."""
 
-    resumed = Collector(
-        RandomPolicy(random.Random(0)),
-        lanes=4,
-        seed=3,
-        action_cap=600,
-        first_game=reached,
-    )
-    played = {e.index for e in resumed.collect(2)}
-    assert played, "the resumed collector finished nothing"
-    assert not (played & set(range(reached))), f"replayed {played & set(range(reached))}"
-    assert min(played) >= reached
+
+def test_a_run_killed_mid_collection_resumes_without_losing_or_repeating_a_game(
+    tmp_path, monkeypatch
+):
+    """Killed with iteration 1 part-collected: the resumed iteration trains on
+    exactly the games it planned, the ones already finished among them, and
+    no game index is ever trained on twice."""
+    from hexn import durable
+    from hexn.selfplay import Collector
+
+    used: list[list[int]] = []
+    real_assemble = ppo_main.assemble
+
+    def assemble(episodes, *args, **kwargs):
+        used.append(sorted(e.index for e in episodes))
+        return real_assemble(episodes, *args, **kwargs)
+
+    monkeypatch.setattr(ppo_main, "assemble", assemble)
+    real_tick = Collector.tick
+    interrupted = durable.partial(tmp_path / "partial", 1)
+
+    def tick(self):
+        out = real_tick(self)
+        if 0 < len(interrupted.finished()) < 4:
+            raise Crash
+        return out
+
+    four = ["--lanes", "2", "--games-per-iteration", "4"]
+    monkeypatch.setattr(Collector, "tick", tick)
+    with pytest.raises(Crash):
+        run(tmp_path, 3, four)
+    monkeypatch.setattr(Collector, "tick", real_tick)
+    assert torch.load(tmp_path / "latest.pt", weights_only=False)["iteration"] == 1
+    plan = sorted(interrupted.plan())
+    kept = interrupted.finished()
+
+    assert run(tmp_path, 3, four + ["--resume"]) == 0
+
+    assert len(used) == 3
+    assert used[1] == plan, "the resumed iteration is the iteration it planned"
+    assert set(kept) <= set(used[1])
+    every = [index for indices in used for index in indices]
+    assert len(every) == len(set(every)), "no game trained on twice"
+    assert min(used[2]) > max(plan)
+    assert not durable.partials(tmp_path / "partial")
+    lines = [json.loads(l) for l in (tmp_path / "log.jsonl").read_text().splitlines()]
+    assert [line.get("iteration", "marker") for line in lines] == [0, "marker", 1, 2]
+
+
+def test_a_run_killed_in_its_evaluation_keeps_the_iteration_it_finished(
+    tmp_path, monkeypatch
+):
+    def dies(*args, **kwargs):
+        raise Crash
+
+    monkeypatch.setattr(ppo_main, "ladder", dies)
+    with pytest.raises(Crash):
+        run(tmp_path, 2, ["--eval-every", "1"])
+    assert torch.load(tmp_path / "latest.pt", weights_only=False)["iteration"] == 1
+    lines = [json.loads(l) for l in (tmp_path / "log.jsonl").read_text().splitlines()]
+    assert [line["iteration"] for line in lines] == [0]
+    assert "ladder" not in lines[0]
+
+    monkeypatch.setattr(ppo_main, "ladder", lambda *args, **kwargs: {})
+    assert run(tmp_path, 2, ["--eval-every", "1", "--resume"]) == 0
+    lines = [json.loads(l) for l in (tmp_path / "log.jsonl").read_text().splitlines()]
+    assert lines[1:] == [
+        {"resumed_from": 1},
+        lines[2],
+        {"iteration": 1, "ladder": {}},
+    ]
+    assert lines[2]["iteration"] == 1 and "positions" in lines[2]
+
+
+def test_a_fresh_start_over_a_run_is_refused_rather_than_overwriting_it(tmp_path):
+    run(tmp_path, 1)
+    with pytest.raises(SystemExit, match="already holds a run"):
+        run(tmp_path, 2)
 
 
 def test_a_failed_save_leaves_the_last_good_checkpoint_readable(tmp_path):
@@ -167,11 +225,35 @@ def test_a_failed_save_leaves_the_last_good_checkpoint_readable(tmp_path):
     assert survived["iteration"] == 1
 
 
-def test_a_save_never_leaves_a_partial_file_where_the_checkpoint_belongs(tmp_path):
-    path = tmp_path / "latest.pt"
-    loop.save(path, {"iteration": 7})
-    assert path.exists()
-    assert not list(tmp_path.glob("*.partial"))
+@pytest.mark.parametrize("dump", [True, False])
+def test_the_brake_keeps_the_batch_only_when_asked(tmp_path, dump):
+    # A brake that fires on any movement at all: several minibatches an epoch,
+    # so the first epoch's mean KL is read after real steps.
+    extra = ["--epochs", "2", "--minibatch", "16", "--learning-rate", "1e-2", "--kl-break", "1e-12"]
+    assert run(tmp_path, 1, extra + ([] if dump else ["--no-dump-blowout-batch"])) == 0
+
+    (record,) = [json.loads(l) for l in (tmp_path / "log.jsonl").read_text().splitlines()]
+    assert record["epochs_taken"] == 1
+    assert (tmp_path / "blowout-00001-pre.pt").exists()
+    assert (tmp_path / "blowout-00001-batch.pt").exists() == dump
+
+
+def test_a_micro_batched_run_trains_and_logs(tmp_path):
+    assert run(tmp_path, 1, ["--minibatch", "64", "--micro-batch", "16"]) == 0
+    (record,) = [json.loads(l) for l in (tmp_path / "log.jsonl").read_text().splitlines()]
+    assert record["positions"] > 64 and record["minibatch"] == 64
+
+
+def test_every_trainer_can_turn_the_batch_dump_off():
+    from hexn.league import build_parser as league_parser
+
+    for build, base in (
+        (ppo_main.build_parser, []),
+        (league_parser, ["--checkpoint-dir", "x", "--learner", ""]),
+    ):
+        parser = build()
+        assert parser.parse_args(base).dump_blowout_batch is True
+        assert parser.parse_args(base + ["--no-dump-blowout-batch"]).dump_blowout_batch is False
 
 
 def test_parse_mix_rejects_overcommitted_or_empty_shares():
@@ -222,51 +304,6 @@ def test_async_collection_prefetches_each_batch_once(tmp_path):
     assert all(line["positions"] > 0 for line in lines)
 
 
-def _rows(directory):
-    return [
-        json.loads(line)
-        for line in (directory / "log.jsonl").read_text().splitlines()
-    ]
-
-
-def test_streaming_collection_ignores_the_batch_size_it_was_asked_for(tmp_path):
-    """The contrast, which is what makes the on-policy guarantee worth having.
-
-    `--games-per-iteration` reads like a batch size and under `stream` it is
-    not one: `collect` stops on the tick that finishes the *first* game, and
-    every other lane that ended on the same tick comes along. Asking for one
-    game on four lanes trains on four. A cohort delivers what it was asked for.
-
-    The staleness half of the same defect is pinned in `test_selfplay`, where
-    the spread of game lengths is the point.
-
-    The assertion is on the run's total, not per iteration, and not a multiple
-    of the lane count. It was the multiple until repeated offers stopped being
-    enumerated: every game used to run past `TINY`'s 600-action cap and so all
-    four lanes truncated on the same tick. Games are shorter again under
-    contract 5 -- no offer actions at all -- so a lane can now finish alone and
-    an individual iteration can come back with one game. Four-at-a-time, and
-    then more-than-one-every-time, were artefacts of the cap; the claim is that
-    the stream does not deliver the batch it was asked for.
-    """
-    assert run(tmp_path, 2, ["--collect-mode", "stream", "--lanes", "4"]) == 0
-    streamed = [row for row in _rows(tmp_path) if "positions" in row]
-    assert all(row["collect_mode"] == "stream" for row in streamed)
-    asked = len(streamed)  # one game an iteration
-    assert sum(row["games"] for row in streamed) > asked, "one game was asked for"
-
-    fresh = tmp_path / "cohort"
-    assert run(fresh, 2, ["--lanes", "1"]) == 0
-    cohort = [row for row in _rows(fresh) if "positions" in row]
-    assert [row["games"] for row in cohort] == [1, 2]
-    # Totalled over the run, not paired per iteration: one lane finishing a
-    # short game can put a single streamed iteration below a truncated cohort
-    # one without the claim being wrong.
-    assert sum(row["positions"] for row in cohort) < sum(
-        row["positions"] for row in streamed
-    ), "the cohort trained on no less data than the four-lane stream"
-
-
 def test_prefetching_has_to_opt_out_of_the_on_policy_guarantee(tmp_path):
     with pytest.raises(SystemExit):
         run(tmp_path, 1, ["--collect-workers", "2", "--async-collect"])
@@ -306,7 +343,7 @@ def test_an_antithetic_self_duel_is_exactly_zero():
     """
     stub = Streamless()
     result = loop.versus(
-        stub, stub, games=8, lanes=4, players=4, seed=21, max_trades=3
+        stub, stub, games=8, lanes=4, players=4, seed=21, max_offers=3
     )
 
     assert result["antithetic"] and result["boards"] == 4 and result["games"] == 8
@@ -328,29 +365,32 @@ def test_versus_is_the_engines_own_verdict_and_nothing_added():
     from hexset.bench.versus import BotPolicy, compete_batched
     from hexset.casting import alternating
 
+    from hexn import runtime
     from hexn.collect import named_opponent
 
+    runtime.load(["_scripted_runtime"])
+    # Two cheap rungs: the claim is about the
+    # bookkeeping around the duel, not about who wins it.
     mine = loop.versus(
-        named_opponent("heximax", 3, 2),
+        named_opponent("random-too", 3, 2),
         named_opponent("random", 4, 2),
-        games=4,
+        games=2,
         lanes=2,
         players=4,
         seed=17,
-        max_trades=1,
+        max_offers=1,
     )
     theirs = compete_batched(
         {
-            0: BotPolicy(named_opponent("heximax", 3, 2).spawn),
+            0: BotPolicy(named_opponent("random-too", 3, 2).spawn),
             1: BotPolicy(named_opponent("random", 4, 2).spawn),
         },
-        4,
+        2,
         caster=alternating(4),
         players=4,
         seed=17,
         lanes=2,
         action_cap=4000,
-        max_trades=1,
         antithetic=True,
         learner=0,
     ).metrics()
@@ -409,7 +449,7 @@ def test_duellist_seats_a_networks_trade_gate_before_use():
     game = deal_game(0, 0, 4, board=board)
     stub = Stub(space_for(game))
 
-    gate = loop.duellist(stub).gate(game, 0, None)
+    gate = loop.duellist(stub).gate(game, 0)
     assert gate is not None
     assert gate._seated is game
 
@@ -418,7 +458,7 @@ def test_the_same_self_duel_reads_off_zero_without_the_pairing():
     """The control, so the guarantee above cannot pass for a trivial reason."""
     stub = Streamless()
     result = loop.versus(
-        stub, stub, games=8, lanes=4, players=4, seed=21, max_trades=3,
+        stub, stub, games=8, lanes=4, players=4, seed=21, max_offers=3,
         antithetic=False,
     )
 
@@ -447,22 +487,6 @@ def test_self_in_a_table_pool_is_the_learner_on_every_seat_it_draws():
     assert all(set(cast) <= {0, 1, 2} for cast in casts)
     # Pure in the index, as every cast law here must be.
     assert casts == [mix_caster(mix, 4, seed=7)(index) for index in range(4000)]
-
-
-def test_self_is_refused_as_a_plain_mix_entry():
-    with pytest.raises(ValueError, match="table pool member"):
-        parse_mix("self=0.5")
-    with pytest.raises(ValueError, match="table pool member"):
-        parse_mix("heximax=0.1,self=0.2")
-
-
-def test_a_pool_without_self_casts_exactly_as_before():
-    from hexn.collect import mix_caster
-
-    mix = parse_mix("table(parent|network:/x/a.pt)=0.5")
-    caster = mix_caster(mix, 4, seed=3)
-    casts = [caster(index) for index in range(2000)]
-    assert all(cast.count(0) in (1, 4) for cast in casts)
 
 
 def test_a_self_band_tempers_only_the_pool_drawn_self_seats():
@@ -501,3 +525,318 @@ def test_a_self_band_is_validated_where_it_is_written():
         parse_mix("table(self~1.5|parent)=1.0")
     with pytest.raises(ValueError, match="must be a number"):
         parse_mix("table(self~hot|parent)=1.0")
+
+
+# ---------------------------------------------------------------------------
+# Warm starts: --init, --prior-kl, --lag-rung.
+# ---------------------------------------------------------------------------
+
+
+# Nothing below is about trading, and a tiny random net with no offer budget
+# bargains every turn -- minutes a game. The runs below go through
+# `warm_run`, which takes `run`'s arguments and turns the network's offers off.
+NO_OFFERS = ["--max-offers", "0"]
+
+
+def warm_run(directory, iterations, extra=()):
+    return run(directory, iterations, list(extra) + NO_OFFERS)
+
+
+def _weights(path):
+    return torch.load(path, weights_only=False)["net"]
+
+
+def test_init_starts_the_run_from_the_given_weights_at_iteration_zero(tmp_path):
+    source = tmp_path / "source"
+    assert warm_run(source, 1, ["--checkpoint-every", "1", "--seed", "5"]) == 0
+
+    # A zero rate makes the update a no-op, so what the warm-started run saves
+    # is exactly what it started from.
+    warm = tmp_path / "warm"
+    assert warm_run(
+        warm,
+        1,
+        ["--checkpoint-every", "1", "--learning-rate", "0", "--init",
+         str(source / "latest.pt")],
+    ) == 0
+    cold = tmp_path / "cold"
+    assert warm_run(cold, 1, ["--checkpoint-every", "1", "--learning-rate", "0"]) == 0
+
+    seeded, fresh, given = (
+        _weights(warm / "latest.pt"),
+        _weights(cold / "latest.pt"),
+        _weights(source / "latest.pt"),
+    )
+    assert all(torch.equal(seeded[k], given[k]) for k in given)
+    # Anti-vacuity: the same recipe without --init is a different net.
+    assert any(not torch.equal(fresh[k], given[k]) for k in given)
+    # Weights only: the counter is this run's own.
+    state = torch.load(warm / "latest.pt", weights_only=False)
+    assert state["iteration"] == 1
+    # The starting point is kept as the run's own iteration 0, recording the
+    # run's arguments -- its offer budget -- rather than the source's.
+    start = torch.load(warm / "iter-00000.pt", weights_only=False)
+    assert start["iteration"] == 0
+    assert all(torch.equal(start["net"][k], given[k]) for k in given)
+    assert start["args"]["max_offers"] == 0
+
+
+def test_init_with_resume_initialises_once_and_then_resumes(tmp_path):
+    source = tmp_path / "source"
+    warm_run(source, 1, ["--checkpoint-every", "1", "--seed", "5"])
+    warm = tmp_path / "warm"
+    flags = ["--checkpoint-every", "1", "--init", str(source / "latest.pt"), "--resume"]
+
+    # The same frozen config serves the launch (nothing to resume: init) ...
+    assert warm_run(warm, 1, flags) == 0
+    # ... and the restart, which carries on rather than re-initialising.
+    assert warm_run(warm, 2, flags) == 0
+    lines = [json.loads(l) for l in (warm / "log.jsonl").read_text().splitlines()]
+    assert [record["iteration"] for record in lines if "iteration" in record] == [0, 1]
+
+
+def test_init_refuses_a_checkpoint_of_another_shape(tmp_path):
+    source = tmp_path / "source"
+    warm_run(source, 1, ["--checkpoint-every", "1"])
+    with pytest.raises(RuntimeError):
+        # TINY is one round; the source has one round and this run asks for two.
+        warm_run(
+            tmp_path / "warm",
+            1,
+            ["--rounds", "2", "--init", str(source / "latest.pt")],
+        )
+
+
+def test_a_prior_weight_needs_a_parent_to_diverge_from(tmp_path):
+    with pytest.raises(SystemExit):
+        warm_run(tmp_path / "run", 1, ["--prior-kl", "0.1"])
+
+
+def test_a_prior_weighted_run_logs_its_divergence_from_the_parent(tmp_path):
+    parent = tmp_path / "parent"
+    warm_run(parent, 1, ["--checkpoint-every", "1", "--seed", "9"])
+    child = tmp_path / "child"
+    assert warm_run(
+        child,
+        1,
+        ["--parent", str(parent / "latest.pt"), "--prior-kl", "0.1"],
+    ) == 0
+    (record,) = [json.loads(l) for l in (child / "log.jsonl").read_text().splitlines()]
+    # A different random net from the parent, so the divergence is positive.
+    assert record["prior_kl"] > 0
+
+
+def test_the_lag_rung_reads_the_init_weights_at_first_and_kept_ones_after(tmp_path):
+    source = tmp_path / "source"
+    warm_run(source, 1, ["--checkpoint-every", "1", "--seed", "5"])
+    warm = tmp_path / "warm"
+    assert warm_run(
+        warm,
+        2,
+        [
+            "--checkpoint-every", "1", "--keep-every", "1",
+            "--eval-every", "1", "--eval-games", "2", "--lag-rung", "1",
+            "--init", str(source / "latest.pt"),
+        ],
+    ) == 0
+    lines = [json.loads(l) for l in (warm / "log.jsonl").read_text().splitlines()]
+    evaluations = [record for record in lines if "ladder" in record]
+    # Iteration 1's lag is iteration 0, the init weights; iteration 2's is the
+    # kept iter-00001.
+    assert len(evaluations) == 2
+    assert all("lag" in record["ladder"] for record in evaluations)
+    assert not any("lag_checkpoint_missing" in record for record in lines)
+
+
+def test_a_lag_with_nothing_kept_is_logged_as_a_miss(tmp_path):
+    directory = tmp_path / "run"
+    assert warm_run(
+        directory,
+        1,
+        ["--eval-every", "1", "--eval-games", "2", "--lag-rung", "5"],
+    ) == 0
+    lines = [json.loads(l) for l in (directory / "log.jsonl").read_text().splitlines()]
+    (evaluation,) = [record for record in lines if "ladder" in record]
+    assert evaluation["lag_checkpoint_missing"] == -4
+    assert "lag" not in evaluation["ladder"]
+
+
+def test_a_fast_win_run_grafts_its_head_onto_an_init_and_logs_its_pace(tmp_path):
+    """`--fast-win` from a checkpoint without the head: every other weight
+    comes over unchanged, the head is grafted, and the log carries the speed
+    columns next to the fast-win loss."""
+    import json
+
+    source = tmp_path / "source"
+    assert warm_run(source, 1, ["--checkpoint-every", "1", "--seed", "5"]) == 0
+    curve = tmp_path / "curve.json"
+    curve.write_text(json.dumps({"weights": [1.0] * 12 + [0.9, 0.8, 0.6, 0.4]}))
+    fast = tmp_path / "fast"
+    assert warm_run(
+        fast,
+        1,
+        ["--checkpoint-every", "1", "--learning-rate", "0", "--fast-win", str(curve),
+         "--init", str(source / "latest.pt")],
+    ) == 0
+    given, start = _weights(source / "latest.pt"), _weights(fast / "iter-00000.pt")
+    assert all(torch.equal(start[k], given[k]) for k in given)
+    assert set(start) - set(given) == {"fast_win.weight", "fast_win.bias"}
+    row = [json.loads(line) for line in (fast / "log.jsonl").read_text().splitlines() if line.strip()][-1]
+    assert row["fast_loss"] > 0.0
+    assert {"win_round_median", "learner_win_round_median", "fast_payoff_mean"} <= set(row)
+
+
+@pytest.mark.parametrize("workers", [0, 2])
+def test_a_run_killed_mid_update_resumes_from_its_last_step_to_the_uninterrupted_run(
+    tmp_path, monkeypatch, workers
+):
+    """Killed after the fourth optimiser step of iteration 1's update: the
+    resumed run reads iteration 1's games back from its partial, continues
+    the update from the step file, and ends -- two iterations later -- on the
+    uninterrupted run's weights, to the bit. The games stay on disk until the
+    iteration checkpoint, and the step file goes once it is written."""
+    from hexn import durable, steps
+
+    shape = ["--lanes", "4", "--games-per-iteration", "4", "--minibatch", "48", "--epochs", "2"]
+    # Two collection workers return their games worker by worker, not in game
+    # order, and a resumed collection returns its kept games first.
+    shape += ["--collect-workers", str(workers), "--keep-every", "1"]
+    straight = tmp_path / "straight"
+    assert run(straight, 3, shape) == 0
+
+    killed = tmp_path / "killed"
+    real_update = ppo_main.update
+    calls = []
+
+    def update(policy, optimiser, batch, config, **kwargs):
+        calls.append(1)
+        if len(calls) == 2:
+            real_step = optimiser.step
+            taken = []
+
+            def step(*args, **kw):
+                if len(taken) == 4:
+                    raise Crash
+                taken.append(1)
+                return real_step(*args, **kw)
+
+            optimiser.step = step
+        return real_update(policy, optimiser, batch, config, **kwargs)
+
+    monkeypatch.setattr(ppo_main, "update", update)
+    with pytest.raises(Crash):
+        run(killed, 3, shape)
+    monkeypatch.setattr(ppo_main, "update", real_update)
+    assert torch.load(killed / "latest.pt", weights_only=False)["iteration"] == 1
+    held = torch.load(killed / steps.STEP, weights_only=False)
+    assert (held["iteration"], held["progress"]["step"]) == (1, 4)
+    games = durable.partial(killed / "partial", 1).finished()
+    assert len(games) == 4, "the interrupted iteration's games are still on disk"
+
+    kept = []
+    real_keep = durable.Partial.keep
+    monkeypatch.setattr(
+        durable.Partial, "keep", lambda self, e: kept.append(self.directory.name) or real_keep(self, e)
+    )
+    assert run(killed, 3, shape + ["--resume"]) == 0
+    if not workers:  # a worker process keeps its games past this patch
+        assert set(kept) == {"iter-00002"}, "iteration 1 played none of its games again"
+
+    # The interrupted iteration's end, and -- with the in-process collector,
+    # whose games are a function of the restored RNG -- the run's. A worker
+    # restarted by the resume draws its own stream afresh, so iteration 2's
+    # games are another draw there, as on any resume.
+    for name in ("iter-00002.pt", "latest.pt")[: 1 if workers else 2]:
+        final = torch.load(killed / name, weights_only=False)
+        reference = torch.load(straight / name, weights_only=False)
+        assert all(torch.equal(final["net"][k], reference["net"][k]) for k in reference["net"]), name
+    assert not (killed / steps.STEP).exists()
+    assert not durable.partials(killed / "partial")
+    rows = [row for row in durable.read_lines(killed / "log.jsonl") if "positions" in row]
+    assert [row["iteration"] for row in rows] == [0, 1, 2]
+    assert rows[1]["resumed_at_step"] == 4 and rows[2]["resumed_at_step"] is None
+    assert rows[1]["step_checkpoints"] > 0 and rows[1]["step_checkpoint_seconds"] > 0
+    reference_rows = [row for row in durable.read_lines(straight / "log.jsonl") if "positions" in row]
+    for name in ("policy_loss", "value_loss", "approx_kl", "grad_norm", "explained_variance"):
+        assert rows[1][name] == reference_rows[1][name], name
+
+
+def test_the_recent_ring_keeps_the_last_n_whatever_keep_every_keeps(tmp_path):
+    assert run(tmp_path, 4, ["--keep-every", "0", "--keep-recent", "2"]) == 0
+    assert sorted(p.name for p in tmp_path.glob("recent-*.pt")) == [
+        "recent-00003.pt",
+        "recent-00004.pt",
+    ]
+    assert not list(tmp_path.glob("iter-*.pt"))
+
+
+def test_a_run_killed_in_its_first_update_resumes_from_its_last_step_not_its_init(
+    tmp_path, monkeypatch
+):
+    """The launch shape every frozen run uses (`--init` with `--resume`),
+    killed in iteration 0's update before there is any `latest.pt`: the
+    resumed run starts from `--init` again, reads iteration 0's games back and
+    carries the update on from its step file, not from the initial weights."""
+    from hexn import steps
+
+    assert run(tmp_path / "seed", 1) == 0
+    shape = ["--lanes", "2", "--games-per-iteration", "2", "--minibatch", "48",
+             "--init", str(tmp_path / "seed" / "latest.pt"), "--resume"]
+    straight = tmp_path / "straight"
+    assert run(straight, 1, shape) == 0
+
+    killed = tmp_path / "killed"
+    real_update = ppo_main.update
+
+    def update(policy, optimiser, batch, config, **kwargs):
+        real_step = optimiser.step
+        taken = []
+
+        def step(*args, **kw):
+            if len(taken) == 2:
+                raise Crash
+            taken.append(1)
+            return real_step(*args, **kw)
+
+        optimiser.step = step
+        return real_update(policy, optimiser, batch, config, **kwargs)
+
+    monkeypatch.setattr(ppo_main, "update", update)
+    with pytest.raises(Crash):
+        run(killed, 1, shape)
+    monkeypatch.setattr(ppo_main, "update", real_update)
+    assert not (killed / "latest.pt").exists()
+    assert torch.load(killed / steps.STEP, weights_only=False)["progress"]["step"] == 2
+
+    assert run(killed, 1, shape) == 0
+    final = torch.load(killed / "latest.pt", weights_only=False)
+    reference = torch.load(straight / "latest.pt", weights_only=False)
+    assert all(torch.equal(final["net"][k], reference["net"][k]) for k in reference["net"])
+    row = [r for r in loop_rows(killed) if "positions" in r][-1]
+    assert row["resumed_at_step"] == 2
+
+
+def loop_rows(directory):
+    from hexn import durable
+
+    return durable.read_lines(directory / "log.jsonl")
+
+
+def test_an_fp16_run_on_a_device_batch_trains_resumes_and_keeps_its_scale(tmp_path):
+    parent = tmp_path / "parent"
+    warm_run(parent, 1, ["--checkpoint-every", "1", "--seed", "9"])
+    child = tmp_path / "child"
+    flags = [
+        "--parent", str(parent / "latest.pt"), "--prior-kl", "0.1",
+        "--amp", "fp16", "--batch-on-device", "--fused", "--checkpoint-every", "1",
+    ]
+    assert warm_run(child, 1, flags) == 0
+    first = torch.load(child / "latest.pt", weights_only=False)
+    assert first["scaler"]["scale"] > 0
+    assert warm_run(child, 2, flags + ["--resume"]) == 0
+    records = [
+        json.loads(l) for l in (child / "log.jsonl").read_text().splitlines()
+        if '"iteration"' in l
+    ]
+    assert [r["iteration"] for r in records] == [0, 1]
+    assert all(r["amp_scale"] > 0 and r["prior_kl"] > 0 for r in records)

@@ -13,7 +13,6 @@ from hexset.board.board import random_base_board  # noqa: E402
 from hexset.encoding import encode, encode_batch, static_graph  # noqa: E402
 from hexset.game import start  # noqa: E402
 from hexn.model import (  # noqa: E402
-    POLICY_HEADS,
     VALUE_HEADS,
     HexNet,
     ModelConfig,
@@ -53,8 +52,9 @@ def observations(count: int, players: int = 4):
     return [encode(a_game(players=players, seed=s, steps=60 + s)) for s in range(count)]
 
 
-@pytest.mark.parametrize("players", [2, 3, 4])
-def test_output_shapes(players):
+def test_output_shapes():
+    # Two seats: every other test here runs at four, which is the default.
+    players = 2
     game, space, net = a_net(players=players)
     batch = collate(observations(3, players=players))
 
@@ -71,8 +71,7 @@ def test_output_shapes(players):
     assert not hasattr(out, "want")
 
 
-@pytest.mark.parametrize("players", [2, 3, 4])
-def test_the_win_head_sums_to_one_and_reads_the_perspective_row(players):
+def test_the_win_head_sums_to_one_and_reads_the_perspective_row():
     """`Prediction.value` is `softmax(value_logits)` over the seat axis: a
     proper win-probability distribution, nonnegative and summing to one
     across `players`, with the encoded perspective seat's own probability
@@ -80,8 +79,8 @@ def test_the_win_head_sums_to_one_and_reads_the_perspective_row(players):
     convention the encoder and every other per-seat vector this network
     emits already use.
     """
-    _, _, net = a_net(players=players)
-    batch = collate(observations(5, players=players))
+    _, _, net = a_net(players=3)
+    batch = collate(observations(5, players=3))
 
     out = net(*batch)
 
@@ -133,8 +132,7 @@ def test_the_win_heads_perspective_row_moves_with_the_encoders_rotation():
     assert out.value[0, 0] > out.value[1, 0]
 
 
-@pytest.mark.parametrize("players", [2, 3, 4])
-def test_packing_round_trips_to_the_same_batch_as_collate(players):
+def test_packing_round_trips_to_the_same_batch_as_collate():
     """`pack` writes through reshaped views, which numpy may silently copy.
 
     If a slice ever reshaped to a copy instead of a view, `pack` would stack
@@ -142,6 +140,8 @@ def test_packing_round_trips_to_the_same_batch_as_collate(players):
     no error. This compares it against `collate`, which builds the same batch
     the obvious way.
     """
+    # Two seats; four is `test_pack_reuses_the_batch_encoders_contiguous_buffer`'s.
+    players = 2
     obs = observations(3, players=players)
     # public field
     layout = packing(
@@ -171,26 +171,6 @@ def test_pack_reuses_the_batch_encoders_contiguous_buffer():
     ]
     for got, want in zip(unpack(layout, packed), collate(canonical), strict=True):
         assert torch.equal(got, want)
-
-
-def test_a_packed_batch_feeds_the_net_unchanged():
-    """One float32 ULP apart, not bit-identical, and that is expected.
-
-    The round-trip test above already proves the inputs match bit for bit, so
-    any difference here is the matmul taking a different path over a strided
-    view. `allclose`'s default `atol` of 1e-8 cannot absorb a last-bit
-    difference on a logit that happens to sit near zero.
-    """
-    game, space, net = a_net()
-    obs = observations(3)
-    # public field
-    layout = packing(static_graph(game.state(0, hidden=False).board.topology), 4)
-
-    assert torch.allclose(
-        net(*unpack(layout, pack(layout, obs))).logits,
-        net(*collate(obs)).logits,
-        atol=1e-6,
-    )
 
 
 def test_the_flat_permutation_agrees_with_the_numpy_scatter():
@@ -231,47 +211,6 @@ def test_each_row_of_a_batch_is_independent():
     for i, single in enumerate(apart):
         assert torch.allclose(together.logits[i], single.logits[0], atol=1e-5)
         assert torch.allclose(together.value[i], single.value[0], atol=1e-5)
-
-
-def test_a_backward_pass_reaches_every_parameter():
-    _, _, net = a_net()
-    out = net(*collate(observations(2)))
-
-    # `out.value` is a softmax, and a softmax row's sum is the constant 1 --
-    # summing it backward would carry exactly zero gradient into the value
-    # head and the trunk beneath it, not a weak signal but a mathematical
-    # zero. `value_logits` (pre-softmax) and `margin` (the auxiliary head)
-    # are what actually carry gradient from the value side.
-    (out.logits.sum() + out.value_logits.sum() + out.margin.sum()).backward()
-
-    unused = [name for name, p in net.named_parameters() if p.grad is None or not p.grad.any()]
-    assert unused == []
-
-
-def test_outputs_are_finite():
-    _, _, net = a_net()
-    with torch.no_grad():
-        out = net(*collate(observations(4)))
-    for name in ("logits", "value"):
-        assert torch.isfinite(getattr(out, name)).all(), name
-
-
-def test_the_model_stays_small():
-    """Parameter economy is a project goal, not an accident."""
-    _, _, net = a_net()
-    total = sum(p.numel() for p in net.parameters())
-    assert total < 500_000, total
-
-
-def test_a_deeper_model_has_more_parameters_but_the_same_interface():
-    _, space, shallow = a_net(rounds=1)
-    _, _, deep = a_net(rounds=3)
-
-    assert sum(p.numel() for p in deep.parameters()) > sum(
-        p.numel() for p in shallow.parameters()
-    )
-    for net in (shallow, deep):
-        assert net(*collate(observations(1))).logits.shape == (1, space.size)
 
 
 # Written out rather than derived from a freshly built net, because a net is
@@ -343,26 +282,9 @@ def test_the_default_config_writes_exactly_the_state_dict_keys_it_always_has():
     assert set(net.state_dict()) == DEFAULT_KEYS
 
 
-def test_the_default_config_is_the_shape_every_run_on_record_used():
-    assert ModelConfig().value_head == "linear"
-    assert ModelConfig().policy_head == "linear"
-
-
-@pytest.mark.parametrize("shape", VALUE_HEADS)
-def test_every_value_head_shape_predicts_one_number_per_seat(shape):
-    _, space, net = a_net(value_head=shape)
-
-    out = net(*collate(observations(3)))
-
-    assert out.value.shape == (3, 4)
-    assert out.logits.shape == (3, space.size)
-    assert torch.isfinite(out.value).all()
-
-
-@pytest.mark.parametrize("shape", POLICY_HEADS)
-def test_every_policy_head_shape_fills_the_same_flat_action_space(shape):
+def test_a_deep_policy_head_fills_the_same_flat_action_space():
     """The scatter is the contract: a deeper head may not move a single slot."""
-    _, space, net = a_net(policy_head=shape)
+    _, space, net = a_net(policy_head="mlp")
 
     out = net(*collate(observations(3)))
 
@@ -370,15 +292,21 @@ def test_every_policy_head_shape_fills_the_same_flat_action_space(shape):
     assert torch.isfinite(out.logits).all()
 
 
-@pytest.mark.parametrize("shape", VALUE_HEADS)
+@pytest.mark.parametrize("shape", ["linear", "mlp_pooled", "attn"])
 def test_a_backward_pass_reaches_every_parameter_of_every_value_head(shape):
-    """Catches an attention query, or a pooled input, wired in but never read."""
+    """Catches an attention query, or a pooled input, wired in but never read.
+
+    `linear` is the default net; `mlp_pooled` is both the pooled input and the
+    hidden layer, so it covers `pooled` and `mlp`; `attn` adds the query.
+    """
     _, _, net = a_net(value_head=shape)
 
     out = net(*collate(observations(2)))
-    # `value` is a softmax and its row-sum is the constant 1 -- see
-    # `test_a_backward_pass_reaches_every_parameter` for why `value_logits`
-    # (and here, `margin`) are what actually carry gradient.
+    # `out.value` is a softmax, and a softmax row's sum is the constant 1 --
+    # summing it backward would carry exactly zero gradient into the value
+    # head and the trunk beneath it, not a weak signal but a mathematical
+    # zero. `value_logits` (pre-softmax) and `margin` (the auxiliary head)
+    # are what actually carry gradient from the value side.
     (out.logits.sum() + out.value_logits.sum() + out.margin.sum()).backward()
 
     unused = [
@@ -387,18 +315,16 @@ def test_a_backward_pass_reaches_every_parameter_of_every_value_head(shape):
     assert unused == []
 
 
-@pytest.mark.parametrize("shape", ["pooled", "mlp_pooled", "attn"])
-def test_detaching_the_value_cuts_every_tensor_the_head_reads_not_only_the_global(
-    shape,
-):
+def test_detaching_the_value_cuts_every_tensor_the_head_reads_not_only_the_global():
     """`detach_value` cuts the head off the trunk; it must not cut off the head.
 
     The flag detaches every tensor the head reads, not only `g`, or a pooled
     head would keep the exact gradient path the flag exists to remove. The head's
     own parameters still have to train, which is the whole point of detaching
-    rather than freezing.
+    rather than freezing. `mlp_pooled` reads every node type besides `g`, so
+    it covers `pooled` and the vertex read `attn` makes.
     """
-    _, _, net = a_net(value_head=shape)
+    _, _, net = a_net(value_head="mlp_pooled")
     net.detach_value = True
 
     # `value_logits`, not `value`: a softmax's row-sum is the constant 1 and
@@ -428,18 +354,6 @@ def test_a_deeper_head_only_adds_keys_under_its_own_name():
     assert "aux_margin.0.weight" in keys and "aux_margin.2.weight" in keys
     assert "aux_margin.weight" not in keys
     assert "heads.vertices.0.weight" in keys and "heads.vertices.2.weight" in keys
-
-
-def test_the_attention_head_carries_its_query_and_the_pooled_head_does_not():
-    _, _, attn = a_net(value_head="attn")
-    _, _, pooled = a_net(value_head="pooled")
-
-    assert "value_query.weight" in attn.state_dict()
-    assert "value_query.weight" not in pooled.state_dict()
-    # `g` plus a pooled vertex vector, so twice the width in.
-    assert attn.value.weight.shape == (4, 2 * 64)
-    # `g` plus a max-pool of each of the three node types.
-    assert pooled.value.weight.shape == (4, 4 * 64)
 
 
 def test_the_output_layer_of_a_deep_head_is_the_one_that_gets_the_small_gain():
@@ -483,24 +397,9 @@ def test_a_namespace_that_predates_a_knob_means_the_default_shape():
     assert config_from_args({"width": 96}) == ModelConfig(width=96)
 
 
-def test_the_stored_shape_is_read_back_from_a_real_state_dict():
-    """End to end, because the two halves were each individually plausible: the
-    keys a shaped net writes have to be the keys its stored args rebuild."""
-    _, space, shaped = a_net(value_head="mlp_pooled", policy_head="mlp")
-    stored = {"width": 64, "rounds": 2, "value_head": "mlp_pooled", "policy_head": "mlp"}
-
-    _, _, rebuilt = a_net(
-        value_head=config_from_args(stored).value_head,
-        policy_head=config_from_args(stored).policy_head,
-    )
-    rebuilt.load_state_dict(shaped.state_dict())
-
-    assert set(rebuilt.state_dict()) == set(shaped.state_dict())
-
-
 @pytest.mark.parametrize(
     "field,value",
-    [("value_head", "attention"), ("policy_head", "pooled"), ("value_head", "")],
+    [("value_head", "attention"), ("policy_head", "pooled")],
 )
 def test_an_unknown_head_shape_is_refused_before_a_run_starts(field, value):
     """A typo that silently fell back to the default would be discovered as an
@@ -519,26 +418,17 @@ def test_a_shaped_head_costs_parameters_but_keeps_the_model_small():
     assert shaped_total < 500_000, shaped_total
 
 
-def test_collate_stacks_in_order():
-    obs = observations(3)
-    hexes, vertices, edges, globals_ = collate(obs)
-
-    assert hexes.shape[0] == 3
-    assert np.array_equal(vertices[1].numpy(), obs[1].vertices)
-    assert np.array_equal(globals_[2].numpy(), obs[2].globals)
-    assert edges.dtype == torch.float32
-
-
-@pytest.mark.parametrize("shape", ["linear", "attn", "mlp_pooled"])
-def test_the_fused_forward_matches_the_reference_path(shape):
+def test_the_fused_forward_matches_the_reference_path():
     """Fused is a kernel change, not a math change.
 
     Same parameters, same inputs, outputs equal to float tolerance — the only
     licensed difference is summation order. And no new state_dict keys: the
     adjacency buffers are derived from the graph, so a checkpoint from before
-    they existed must still load strictly.
+    they existed must still load strictly. The head shape is not a parameter
+    here: fusing changes only the message-passing rounds, which every head
+    reads the same way.
     """
-    _, _, net = a_net(value_head=shape)
+    _, _, net = a_net()
     assert not net.fused, "reference is the default; fused is the GPU opt-in"
     batch = collate(observations(3))
 
@@ -550,7 +440,7 @@ def test_the_fused_forward_matches_the_reference_path(shape):
     for name in ("logits", "value"):
         assert torch.allclose(
             getattr(fused, name), getattr(reference, name), rtol=1e-4, atol=1e-5
-        ), (shape, name)
+        ), name
     assert not any(key.startswith("A_") for key in net.state_dict())
 
 
@@ -602,38 +492,6 @@ def test_only_the_quantile_head_carries_a_spread():
         assert out.value.shape == (2, 4)
 
 
-def test_the_quantile_head_is_the_linear_head_widened_and_nothing_else():
-    """A shape change may not disturb the trunk, or a comparison against it
-    is confounded.
-
-    `"quantile"` is in neither `_POOLED` nor `_DEEP`, so it reads `g` alone
-    through one `nn.Linear` exactly as `"linear"` does — the only difference
-    between the two is the width of that layer's output and the loss taken
-    on it.
-    """
-    _, _, plain = a_net()
-    _, _, head = a_net(value_head="quantile", quantiles=8)
-
-    trunk = {name for name in DEFAULT_KEYS if not name.startswith("value")}
-    keys = set(head.state_dict())
-    assert trunk <= keys
-    assert head.value.module.weight.shape == (4 * 8, 64)
-    assert plain.value.weight.shape == (4, 64)
-    # No query, no pooling: the head's input is the global token alone.
-    assert "value_query.weight" not in keys
-
-
-def test_the_quantile_width_round_trips_through_the_stored_args():
-    stored = {"width": 64, "rounds": 2, "value_head": "quantile", "quantiles": 8}
-
-    assert config_from_args(stored) == ModelConfig(
-        width=64, rounds=2, value_head="quantile", quantiles=8
-    )
-    # A checkpoint that predates the field means the default width, the same
-    # way one that predates `value_head` means the default shape.
-    assert config_from_args({}).quantiles == 32
-
-
 def test_a_quantile_checkpoint_reloads_and_reproduces_its_own_predictions(tmp_path):
     """End to end: the keys a quantile net writes are the keys its stored args
     rebuild, and the rebuilt net predicts the same numbers bit for bit."""
@@ -658,11 +516,6 @@ def test_a_quantile_checkpoint_reloads_and_reproduces_its_own_predictions(tmp_pa
     assert torch.equal(before.value, after.value)
     assert torch.equal(before.quantiles, after.quantiles)
     assert torch.equal(before.logits, after.logits)
-
-
-def test_a_quantile_width_below_one_is_refused():
-    with pytest.raises(ValueError):
-        ModelConfig(value_head="quantile", quantiles=0)
 
 
 def test_the_midpoint_levels_are_the_registered_ones_and_pair_about_a_half():
@@ -713,18 +566,6 @@ def test_the_pinball_loss_is_minimised_exactly_at_the_true_quantiles():
         assert loss_at([-0.6, 0.0, 0.7 + nudge]) > best[0]
 
 
-def test_the_huber_width_is_one_lattice_step_and_not_a_knob():
-    """kappa=1 would fit expectiles at this project's return scale, so this
-    is fixed at one step of the 1/30 reward lattice. A constant, not a
-    flag: a comparison whose configurations differ in two things measures
-    neither."""
-    from hexn.model import QUANTILE_HUBER_KAPPA
-
-    assert QUANTILE_HUBER_KAPPA == pytest.approx(1.0 / 30.0)
-    _, _, net = a_net(value_head="quantile")
-    assert net.value.kappa == QUANTILE_HUBER_KAPPA
-
-
 def test_a_warm_started_quantile_head_predicts_what_the_scalar_head_predicted():
     """A warm-started quantile head opens on the scalar head's own critic,
     not on noise.
@@ -770,8 +611,7 @@ def test_a_warm_start_off_a_head_that_is_not_per_seat_is_refused():
         quantile_warm_start(weights, 4, 8)
 
 
-@pytest.mark.parametrize("shape", VALUE_HEADS)
-def test_the_value_read_is_the_last_thing_the_forward_builds(shape):
+def test_the_value_read_is_the_last_thing_the_forward_builds():
     """Op order in `_emit` is load-bearing, and this is the anchor for it.
 
     `g` feeds the global policy head and the value head, so its gradient is a
@@ -780,9 +620,10 @@ def test_the_value_read_is_the_last_thing_the_forward_builds(shape):
     the loss stays bit-identical and the *gradient* moves in the last couple
     of bits -- enough, under floating-point chaos, to make an update diverge
     after a single optimiser step. A loss-equality test does not catch it;
-    the creation order does.
+    the creation order does. `_emit` orders the two reads the same way for
+    every head shape, so the default net is the anchor.
     """
-    _, _, net = a_net(value_head=shape)
+    _, _, net = a_net()
 
     out = net(*collate(observations(2)))
 

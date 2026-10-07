@@ -36,8 +36,9 @@ from __future__ import annotations
 
 import math
 import random
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Callable, Iterator, Protocol, Sequence
+from typing import TYPE_CHECKING, Callable, Iterator, Protocol, Sequence
 
 import numpy as np
 
@@ -45,11 +46,20 @@ from hexset.actions import Action, ActionSpace, mask_of, space_for
 from hexset.arena import MAX_ACTIONS, deal_board, deal_game
 from hexset.board.board import Board
 from hexset.encoding import Observation, encode_batch
-from hexset.game import Game
-from hexset.gym.lanes import BoardBots, LaneEnv, Outcome
+from hexset.game import MAX_TURNS, Game
+# `_Lane` is internal to HexSet (an underscore name, outside `__all__`), used
+# knowingly: `RuledLaneEnv` and `_Listed` deal their own games through
+# `LaneEnv`'s `_fresh`, `_next`, `_stop`, `_cast` and `_seat_gates`, which a
+# HexSet release may change without notice. Check them at every repin.
+from hexset.gym.lanes import BoardBots, LaneEnv, Outcome, _Lane
 from hexset.gym.lanes import Episode as LaneEpisode
+from hexset.victory import victory_points
 from hexset.gym.lanes import Request as LaneRequest
-from hexset.record import Record
+from hexset.record import Record, Tape, recording
+from hexset.rules import STANDARD_GAME, GameType
+
+if TYPE_CHECKING:
+    from .durable import Partial
 
 # Re-exported rather than redefined: HexSet's terminal facts are already the
 # ones a trainer wants, `winner` for terminal win/loss and `points` for terminal
@@ -106,6 +116,10 @@ class Request:
     # logits by it and records the log-probability under *that* distribution,
     # which is what keeps the PPO ratio exact; a greedy policy ignores it.
     temperature: float = 1.0
+    # The seat's own victory points at this decision, hidden VP cards included
+    # (its own, so known to it); read by a policy recording a per-VP reward's
+    # value (`hexn.policy.NetworkPolicy.vp_reward`) and kept on the transition.
+    points: int = 0
 
 
 @dataclass(frozen=True)
@@ -181,6 +195,8 @@ class Transition:
     log_prob: float
     value: tuple[float, ...]
     aux: object = None
+    # The seat's own victory points at this decision (`Request.points`).
+    points: int = 0
 
 
 @dataclass(frozen=True)
@@ -270,6 +286,95 @@ def owned(episodes: Sequence[Episode], learner: int) -> list[Episode]:
     return out
 
 
+class RuledLaneEnv(LaneEnv):
+    """A `LaneEnv` whose games are dealt by a law of the game index:
+    `game_law(index) -> (GameType, retired seats)`. HexSet's own lanes deal
+    the standard game at every seat; this deals, say, a duel-variant game on a
+    full table with two seats retired, which the engine then never asks to
+    move. Everything but the deal is `LaneEnv`'s."""
+
+    def __init__(
+        self,
+        *args,
+        game_law: Callable[[int], tuple[GameType, frozenset[int]]],
+        coalition: Callable[[int], object] | None = None,
+        **kwargs,
+    ) -> None:
+        self.game_law = game_law
+        # Game index -> the game's `hexn.collect.CoalitionPlan` or None
+        # (`hexn.collect.mix_coalitions`); a plan is hung on the game as
+        # `Game.coalition`, where its `targeted:` seats read it
+        # (`hexn.coalition.Targeted`).
+        self.coalition = coalition
+        super().__init__(*args, **kwargs)
+
+    def _fresh(self) -> _Lane | None:
+        if self._stop is not None and self._next >= self._stop:
+            return None
+        index = self._next
+        self._next += self.stride
+        cast = self._cast(index)
+        game_type, retired = self.game_law(index)
+        board = self.board(index) if callable(self.board) else self.board
+        rules = game_type.rules
+        game = deal_game(
+            self.seed,
+            index,
+            self.players,
+            board=board,
+            chance=(lambda rng: recording(rng, rules)) if self.records else None,
+            game_type=game_type,
+            locked=retired,
+            turn_cap=self.turn_cap,
+        )
+        game.gates = self._seat_gates(game, cast)
+        plan = None if self.coalition is None else self.coalition(index)
+        if plan is not None:
+            game.coalition = plan
+        return _Lane(
+            index=index,
+            game=game,
+            cast=cast,
+            by_seat=[[] for _ in range(self.players)],
+            tape=Tape() if self.records else None,
+        )
+
+
+def standard_law(index: int) -> tuple[GameType, frozenset[int]]:
+    """The game law every run before `duel(...)` played: the standard game
+    at every seat, nobody retired."""
+    return STANDARD_GAME, frozenset()
+
+
+class _Listed(LaneEnv):
+    """A `LaneEnv` that deals exactly `indices`, in order, and nothing else.
+
+    What a resumed cohort needs: the games a crash interrupted, by index. The
+    pinned engine's `LaneEnv` deals a strided range only, so this points its
+    counter at each listed index in turn and lets `LaneEnv._fresh` deal it --
+    the game, its cast, board, gates and record all come from the engine's
+    own dealing, not a copy of it. `_fresh`, `_next` and `_stop` are the
+    engine's private names; an index list on `LaneEnv` itself retires this.
+    """
+
+    def __init__(self, *args, indices: Sequence[int], **kwargs) -> None:
+        self._listed = deque(indices)
+        kwargs["deal"] = len(self._listed)
+        super().__init__(*args, **kwargs)
+
+    def _fresh(self):
+        if not self._listed:
+            return None
+        self._next = self._listed.popleft()
+        self._stop = self._next + 1
+        return super()._fresh()
+
+
+class _RuledListed(_Listed, RuledLaneEnv):
+    """A resumed cohort of a ruled run: `_Listed` picks the indices,
+    `RuledLaneEnv` deals each one by its law."""
+
+
 class Collector:
     """A `hexset.gym.lanes.LaneEnv` driven by a `BatchPolicy`, one batch a tick.
 
@@ -300,8 +405,10 @@ class Collector:
         players: int = 4,
         seed: int = 0,
         action_cap: int = MAX_ACTIONS,
+        turn_cap: int = MAX_TURNS,
         board: Board | None = None,
-        max_trades: int | None = None,
+        max_offers: int | None = None,
+        trader: str | None = None,
         first_game: int = 0,
         deal: int | None = None,
         fill: bool = True,
@@ -311,6 +418,8 @@ class Collector:
         stride: int = 1,
         pair_boards: bool = False,
         temperatures: Callable[[int], Sequence[float]] | None = None,
+        game_law: Callable[[int], tuple[GameType, frozenset[int]]] | None = None,
+        coalition: Callable[[int], object] | None = None,
     ) -> None:
         """`first_game` is where the game counter starts.
 
@@ -339,6 +448,11 @@ class Collector:
 
         `fill=False` leaves the collector empty until `cohort` deals one, which
         is what a PPO iteration wants; anything else deals its lanes here.
+
+        `sink`, when set, is handed every episode the tick it finishes -- what
+        keeps a game on disk before the batch it belongs to ends
+        (`hexn.durable.Partial.keep`). `beat`, when set, is called once a
+        tick, so a process watching this one can tell slow from wedged.
         """
         if lanes < 1:
             raise ValueError("a collector needs at least one lane")
@@ -360,6 +474,14 @@ class Collector:
         # Game index -> per-seat sampling temperature, pure in the index like
         # the caster it accompanies; None means every seat plays at 1.0.
         self.temperatures = temperatures
+        # Game index -> (game type, retired seats), pure in the index like the
+        # caster (`hexn.collect.mix_deal`); None deals the standard game at
+        # every seat, as every run before `duel(...)` did.
+        self.game_law = game_law
+        # Game index -> the game's coalition plan or None, pure in the index
+        # like the caster (`hexn.collect.mix_coalitions`); None hangs nothing
+        # on any game.
+        self.coalition = coalition
         # Which policy ids record their seats. {0} is every run before gen3 —
         # one learner, opponents as scenery. The table league seats several
         # learners in one game: id 0 is `policy`, id k>0 is `opponents[k-1]`,
@@ -370,7 +492,12 @@ class Collector:
         self.players = players
         self.seed = seed
         self.action_cap = action_cap
-        self.max_trades = max_trades
+        # HexSet's per-run turn cap (0.65): past it a game ends unfinished.
+        # The default is read off agents trying to win; unstructured play
+        # passes `hexset.game.UNSTRUCTURED_TURN_CAP`.
+        self.turn_cap = turn_cap
+        self.max_offers = max_offers
+        self.trader = trader
         self.board = board
         self.pair_boards = pair_boards
         self.stride = stride
@@ -381,6 +508,8 @@ class Collector:
         self._deal = deal
         self._next_game = first_game
         self._stop = None if deal is None else first_game + deal * stride
+        self.sink: Callable[[Episode], None] | None = None
+        self.beat: Callable[[], None] | None = None
 
         # A scripted opponent is played by the environment, which seats it as
         # its own gate too; everything else answers through `act`.
@@ -429,10 +558,14 @@ class Collector:
         """This policy's gate factory in the shape `LaneEnv` seats.
 
         `LaneEnv` asks `gates[pid](game, seat)`; a `BatchPolicy`'s own hook also
-        takes the trade budget, which is the run's and not the seat's.
+        takes the network's offer budget and trader (`hexn.trade`). The table takes none:
+        since HexSet 0.60 every seat declares its own, and a scripted opponent
+        bargains as its own bot does.
         """
         make = self._batched[pid].trader  # type: ignore[attr-defined]
-        return lambda game, seat: make(game, seat, self.max_trades)
+        if self.trader is None:
+            return lambda game, seat: make(game, seat, self.max_offers)
+        return lambda game, seat: make(game, seat, self.max_offers, self.trader)
 
     def _paired_board(self, index: int) -> Board:
         """`LaneEnv`'s board law for `pair_boards`: games `2k` and `2k+1` are
@@ -446,13 +579,25 @@ class Collector:
         """
         return deal_board(self.seed, 2 * (index // 2))
 
-    def _new_env(self, *, deal: int | None, first_game: int) -> LaneEnv:
-        return LaneEnv(
+    def _new_env(
+        self, *, deal: int | None, first_game: int, indices: Sequence[int] = ()
+    ) -> LaneEnv:
+        env, extra = LaneEnv, {}
+        ruled = self.game_law is not None or self.coalition is not None
+        if ruled:
+            env, extra = RuledLaneEnv, {
+                "game_law": self.game_law or standard_law, "coalition": self.coalition,
+            }
+        if indices:
+            env = _RuledListed if ruled else _Listed
+            extra = {**extra, "indices": indices}
+        return env(
             self.players,
             self.seed,
             self.lanes,
             deal=deal,
             action_cap=self.action_cap,
+            turn_cap=self.turn_cap,
             board=self._paired_board if self.pair_boards else self.board,
             caster=None if self.caster is None else self._cast,
             # `bench.bot` rather than `bench.spawn`: the bench a caller built
@@ -467,12 +612,12 @@ class Collector:
             },
             first_game=first_game,
             stride=self.stride,
-            max_trades=self.max_trades,
             # Every episode carries the engine's own `hexset.record.Record`
             # (`hexn.replay.replay_to_ply` reads it) -- a few KB a game
             # against observation arrays already dwarfing it, so there is no
             # cohort this should be switched off for.
             records=True,
+            **extra,
         )
 
     # --- the tick ----------------------------------------------------------
@@ -498,6 +643,7 @@ class Collector:
                 mask=np.asarray(mask_of(self.space, request.options), dtype=bool),
                 options=request.options,
                 game=request.game,
+                points=victory_points(request.game.state(request.seat, hidden=False), request.seat),
                 temperature=(
                     1.0
                     if self.temperatures is None
@@ -561,6 +707,7 @@ class Collector:
                         log_prob=choice.log_prob,
                         value=tuple(choice.value),
                         aux=choice.aux,
+                        points=request.points,
                     )
                 )
             trajectories.append(tuple(row))
@@ -620,7 +767,13 @@ class Collector:
         self.ticks += 1
         self.steps += len(outstanding)
         self.games += len(finished)
-        return [self._episode(played) for played in finished]
+        episodes = [self._episode(played) for played in finished]
+        if self.sink is not None:
+            for episode in episodes:
+                self.sink(episode)
+        if self.beat is not None:
+            self.beat()
+        return episodes
 
     # --- driving -----------------------------------------------------------
 
@@ -647,12 +800,31 @@ class Collector:
             out.extend(self.tick())
         return out
 
-    def collect(self, episodes: int) -> list[Episode]:
+    def collect(
+        self, episodes: int, partial: "Partial | None" = None
+    ) -> list[Episode]:
         """Tick until `episodes` games have finished.
 
         Terminates: the action cap ends every lane within `action_cap` ticks, so
         this cannot spin however badly the policy plays.
+
+        With a `partial`, every game is kept there as it finishes, and the
+        games already there count toward `episodes`: a resumed stream returns
+        them and tops up the rest. The caller deals past them
+        (`hexn.durable.resume_base`), or a top-up could repeat one.
         """
+        if partial is None:
+            return self._collect(episodes)
+        kept = partial.done()
+        if len(kept) >= episodes:
+            return kept
+        held, self.sink = self.sink, partial.keep
+        try:
+            return kept + self._collect(episodes - len(kept))
+        finally:
+            self.sink = held
+
+    def _collect(self, episodes: int) -> list[Episode]:
         if self._stop is not None:
             # A bounded collector stops dealing, so asking for more than it has
             # left would spin on empty ticks rather than block on a slow game.
@@ -666,7 +838,7 @@ class Collector:
             out.extend(self.tick())
         return out
 
-    def cohort(self, games: int) -> list[Episode]:
+    def cohort(self, games: int, partial: "Partial | None" = None) -> list[Episode]:
         """Deal `games` fresh games and play every one of them to completion.
 
         This is what a PPO iteration wants and `collect` is not. `collect`
@@ -687,6 +859,12 @@ class Collector:
         `games` the lanes refill until the cohort is dealt out and only the
         last wave tails off; at `games` every game starts together and the
         longest one ticks alone at the end. That tail is what a cohort costs.
+
+        With a `partial`, every game is kept there as it finishes, and the
+        cohort's indices are written there before the first one is played. A
+        partial that already holds a plan is a cohort a crash interrupted: its
+        finished games are loaded and only its missing indices are dealt
+        (`listed`), so the cohort is the same games it was always going to be.
         """
         if self._deal is not None:
             raise ValueError("a bounded collector deals its one cohort at build time")
@@ -697,6 +875,23 @@ class Collector:
                 "the lanes still hold games; a cohort collector must be built "
                 "with fill=False and is empty again after every cohort"
             )
+        if partial is None:
+            return self._cohort(games)
+        kept = partial.done()
+        plan = partial.plan()
+        if plan is None and kept:
+            raise ValueError(f"{partial.directory} holds games but no plan")
+        held, self.sink = self.sink, partial.keep
+        try:
+            if plan is None:
+                partial.write_plan(self.upcoming(games))
+                return self._cohort(games)
+            finished = {episode.index for episode in kept}
+            return kept + self.listed([i for i in plan if i not in finished])
+        finally:
+            self.sink = held
+
+    def _cohort(self, games: int) -> list[Episode]:
         if self._env is None:
             # Built on the first cohort rather than at construction, because a
             # `fill=False` collector holds nothing until one is asked for; every
@@ -709,6 +904,31 @@ class Collector:
             return self._play_out()
         finally:
             self._next_game = self._env.games_started()
+
+    def upcoming(self, games: int) -> list[int]:
+        """The indices the next `cohort(games)` deals, in the order it deals
+        them -- a cohort's plan, known before any of it is played."""
+        start = self.games_started()
+        return [start + k * self.stride for k in range(games)]
+
+    def listed(self, indices: Sequence[int]) -> list[Episode]:
+        """Play exactly the games `indices` to completion and return them.
+
+        A resumed cohort's missing games. Each is the same pure function of
+        `(seed, index)` it is under any other deal; this collector's own
+        lanes and counter are left as they were, so the caller keeps the
+        counter past `indices` (`hexn.durable.resume_base`).
+        """
+        if not indices:
+            return []
+        held = self._env
+        self._env = self._new_env(
+            deal=len(indices), first_game=indices[0], indices=indices
+        )
+        try:
+            return self._play_out()
+        finally:
+            self._env = held
 
     def in_flight(self) -> Iterator[Game]:
         return iter(()) if self._env is None else self._env.in_flight()

@@ -1,6 +1,6 @@
 [project]
 name = "hexn"
-version = "0.23.5"
+version = "0.38.0"
 description = "PPO/training research on the hexset engine"
 requires-python = ">=3.11"
 license = { text = "GPL-3.0-only" }
@@ -11,24 +11,18 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
 ]
-# `hexset` (the rules engine, bots, ledger and observation encoder) lives in
-# the public HexSet repo, which is a single root distribution named `hexset`
-# and is no longer part of this distribution or this checkout. The private
-# development checkout vendors that repo as a git submodule at `hexset/`
-# pinned to the same commit as the URL below, so development installs the
-# engine straight from the submodule root:
-#     pip install -e hexset
-#     pip install -e src
-# A consumer of the published `hexn` package has no submodule, so it gets
-# `hexset` the normal way, via the git URL dependency pinned below. Keep both
-# pins (this URL and the submodule gitlink under `hexset/`) at the same
-# commit -- `src/tests/hexn/test_engine_pin.py` checks that they agree.
-# `heximax` is a sibling top-level package in that same distribution
-# (its root `pyproject.toml`'s `[tool.setuptools.packages.find]` includes
-# `hexset`, `hexset.*`, `heximax` and `heximax.*`), so this one requirement
-# installs both -- nothing else to add for `heximax`.
+# `hexset` (the rules engine, gym, ledger and observation encoder) is its own
+# distribution, not part of this one. A published `hexn` pins the HexSet
+# release it was released with: the release writes that pin here, by commit.
+# In development the engine is checked out beside this package and installed
+# from there, at the same commit:
+#     pip install --no-deps -e <engine>/src -e .
+# HexSet ships no playing bots, and none is declared here: a bot is a
+# runtime module the caller provisions beside the engine, as torch is, and
+# names with `--runtime <module>` wherever hexn resolves one by name
+# (`hexn.runtime`). The tests that seat one skip without it.
 dependencies = [
-    "hexset @ git+https://github.com/0xBrsm/HexSet.git@b8f63dc42ff6b255c9becc2bd961076126d023d0",
+    "hexset @ git+https://github.com/0xBrsm/HexSet.git@cd9d833f728a380dc9ae42f17b0b2a75472696ed",
     "numpy>=1.26",
 ]
 

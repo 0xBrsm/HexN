@@ -81,8 +81,8 @@ correct on a probability-valued leaf.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Sequence
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Sequence
 
 import numpy as np
 import torch
@@ -103,7 +103,11 @@ from ..selfplay import Episode, Transition
 # saves. The reward rotation is not among them any more: it is
 # `hexset.encoding.to_frame`, the encoder's own.
 from hexset.encoding import to_frame
-from ..ppo import _explained_variance, _minibatches, _stack_mean
+from ..ppo import _explained_variance, _stack_mean, _stack_median
+from ..steps import Cursor
+
+if TYPE_CHECKING:
+    from ..steps import Steps
 
 
 @dataclass(frozen=True)
@@ -186,8 +190,19 @@ class DistillConfig:
     value_coefficient: float = 0.5
     epochs: int = 4
     minibatch: int = 1024
+    # Rows per backward within a minibatch, gradients accumulated: the step is
+    # the whole minibatch's, the device holds one slice. 0 (or anything at or
+    # above `minibatch`) is one backward per minibatch. The batch then stays
+    # on the host and each slice moves to the device as it is used.
+    micro_batch: int = 0
     learning_rate: float = 3e-4
     max_grad_norm: float = 0.5
+    # Weight on KL(policy || start) over every legal action, where `start` is
+    # the policy the update began from -- the net the batch was searched over
+    # (`Batch.prior_log_probs`, `hexn.ppo.attach_prior`). 0 disables. The same
+    # term as `hexn.ppo`'s `prior_kl`, tethered to the round's own start
+    # rather than to a fixed parent.
+    prior_kl: float = 0.0
     # 0 keeps the terminal one-hot target (the eventual winner). Anything
     # higher bootstraps off the search's own backed-up estimate that many of
     # the seat's decisions ahead instead -- see `_value_targets` for exactly
@@ -227,6 +242,10 @@ class Stats:
     # How many rows actually carried policy gradient. Derived from the split
     # gauges before, which needed algebra and an assumption; logged now.
     contested_positions: int = 0
+    # The tether's divergence, averaged over the update's minibatches (0.0
+    # with the tether off), and the median pre-clip gradient norm.
+    prior_kl: float = 0.0
+    grad_norm: float = 0.0
 
 
 @dataclass
@@ -253,6 +272,11 @@ class Batch:
     # becomes a one-hot on whichever option `argmax` reaches first, and
     # `refresh` would call that a disagreement.
     searched: Tensor
+    # The masked log-softmax of the policy the update starts from, over every
+    # slot, one row per position: what `prior_kl` tethers to and what
+    # `measure` reads the update's movement against. Filled by
+    # `hexn.ppo.attach_prior`, after assembly; `None` until then.
+    prior_log_probs: Tensor | None = None
 
     FIELDS = (
         "buffer",
@@ -285,17 +309,22 @@ class Batch:
         )
 
     def nbytes(self) -> int:
-        return sum(
-            getattr(self, name).element_size() * getattr(self, name).nelement()
-            for name in self.FIELDS
-        )
+        held = [getattr(self, name) for name in self.FIELDS]
+        if self.prior_log_probs is not None:
+            held.append(self.prior_log_probs)
+        return sum(t.element_size() * t.nelement() for t in held)
 
     def __len__(self) -> int:
         return self.buffer.shape[0]
 
     def to(self, device: torch.device | str) -> "Batch":
         return Batch(
-            **{name: getattr(self, name).to(device) for name in self.FIELDS}
+            **{name: getattr(self, name).to(device) for name in self.FIELDS},
+            prior_log_probs=(
+                None
+                if self.prior_log_probs is None
+                else self.prior_log_probs.to(device)
+            ),
         )
 
 
@@ -528,9 +557,11 @@ def _value_targets(
     because until now nothing read it. Rotating is not optional; skipping it
     trains without complaint and plays nonsense.
 
-    Falls back to the terminal target at the end of a trajectory, and for a
-    forced move, where the search returns no estimate because there was nothing
-    to search.
+    Falls back to the terminal target at the end of a trajectory, and wherever
+    no estimate was recorded. A forced move records one: since HexSet 1.1 the
+    search evaluates a root with one legal move and returns the evaluator's
+    value for it, where it used to return none, so a horizon that lands on a
+    forced move now bootstraps from that value instead of falling back.
     """
     if horizon <= 0:
         return [terminal] * len(trajectory)
@@ -624,11 +655,12 @@ def refresh(
     else:
         weight = torch.ones(rows, dtype=torch.float32)
 
-    replaced = {name: getattr(batch, name) for name in Batch.FIELDS}
-    replaced["policy_weight"] = weight
-    replaced["anchor_slots"] = current
-    replaced["anchor_weight"] = 1.0 - weight
-    return Batch(**replaced)
+    return replace(
+        batch,
+        policy_weight=weight,
+        anchor_slots=current,
+        anchor_weight=1.0 - weight,
+    )
 
 
 def anchor_losses(slot_log_probs: Tensor, batch: Batch, rows: Tensor) -> Tensor:
@@ -647,6 +679,128 @@ def anchor_losses(slot_log_probs: Tensor, batch: Batch, rows: Tensor) -> Tensor:
     ).sum() / total
 
 
+def _backward(
+    policy: NetworkPolicy,
+    batch: Batch,
+    rows: Tensor,
+    config: DistillConfig,
+    *,
+    with_value: bool,
+    with_policy: bool,
+) -> dict[str, Tensor]:
+    """One minibatch's loss, backpropagated in `config.micro_batch`-row slices.
+
+    Every term is normalised by the *minibatch's* own denominator -- its row
+    count for the value term and the tether, its total weight for the
+    weighted policy and anchor terms -- so the slices' gradients sum to
+    exactly the gradient one backward over the whole minibatch would give,
+    and the gauges returned are the minibatch's own. The caller zeroes the
+    gradients before and steps after. Everything returned is detached.
+
+    `with_value` is the pass that moves the trunk: the value term, and the
+    anchor and the tether, which ride it (see `update`). `with_policy` adds
+    the cross-entropy toward the search.
+    """
+    device = policy.device
+    total = len(rows)
+    step = (
+        config.micro_batch
+        if config.micro_batch and config.micro_batch < total
+        else total
+    )
+    weights = batch.policy_weight[rows]
+    weight_total = weights.sum().clamp(min=1e-8).to(device)
+    anchor_total = batch.anchor_weight[rows].sum().clamp(min=1e-8).to(device)
+    tethered = with_value and config.prior_kl > 0.0
+    anchored = with_value and config.anchor > 0.0
+
+    sums: dict[str, Tensor] = {}
+
+    def add(name: str, value: Tensor) -> None:
+        value = value.detach()
+        sums[name] = value if name not in sums else sums[name] + value
+
+    values: list[Tensor] = []
+    for start in range(0, total, step):
+        piece = rows[start : start + step]
+        share = len(piece) / total
+
+        def take(field: Tensor) -> Tensor:
+            return field[piece].to(device)
+
+        slots, value, value_logits, quantiles = policy.distributions(
+            take(batch.buffer), take(batch.mask)
+        )
+        loss = torch.zeros((), device=device)
+        if with_value:
+            target = take(batch.value_target)
+            if quantiles is None:
+                # Cross-entropy against the one-hot eventual winner, exactly
+                # `hexn.ppo.minibatch_terms`'s win-head term: every seat is a
+                # legal "winner", so there is no mask to apply and this reads
+                # `value_logits` raw rather than through `masked_log_softmax`.
+                value_loss = -(target * torch.log_softmax(value_logits, dim=-1)).sum(-1).mean()
+            else:
+                # `players x Q` predictions against the same one-hot target --
+                # untested under distillation exactly as it is under PPO
+                # (`hexn.ppo`'s module docstring): the quantile shape was
+                # designed for a continuous margin target, not a categorical
+                # one.
+                value_loss = policy.net.value.loss(quantiles, target)
+            loss = loss + config.value_coefficient * share * value_loss
+            add("value_loss", share * value_loss)
+            with torch.no_grad():
+                # Logged, never differentiated: the column comparable across a
+                # value-head ablation, whatever the loss actually differentiated.
+                add("value_mse", share * (value - target).pow(2).mean())
+            values.append(value.detach())
+        if with_policy:
+            # Normalised by the weight, not the row count: a minibatch where
+            # one row in twenty is contested must produce the same gradient
+            # scale as a full one, or the effective learning rate falls with
+            # the filter's selectivity.
+            policy_loss = (
+                take(batch.policy_weight) * -(take(batch.slot_target) * slots).sum(-1)
+            ).sum() / weight_total
+            loss = loss + policy_loss
+            add("policy_loss", policy_loss)
+        if anchored:
+            penalty = (
+                take(batch.anchor_weight) * -(take(batch.anchor_slots) * slots).sum(-1)
+            ).sum() / anchor_total
+            loss = loss + config.anchor * penalty
+            add("anchor", penalty)
+        if tethered:
+            if batch.prior_log_probs is None:
+                raise ValueError("prior_kl is set but the batch carries no start policy (attach_prior)")
+            # Over the legal entries only, as `hexn.ppo.minibatch_terms` does:
+            # the masked ones hold ~NEG in both rows.
+            divergence = torch.where(
+                take(batch.mask), slots.exp() * (slots - take(batch.prior_log_probs)), 0.0
+            ).sum(-1).mean()
+            loss = loss + config.prior_kl * share * divergence
+            add("prior_kl", share * divergence)
+        loss.backward()
+
+        if with_value:
+            with torch.no_grad():
+                add("entropy", share * _entropy(slots).mean())
+                # Top-1 agreement with the search, which is the number to
+                # watch: the cross-entropy falls whenever the policy sharpens
+                # anywhere, and only this says it sharpened toward the right
+                # option. Read off the value pass, the one that sees every row.
+                hit = (slots.argmax(-1) == take(batch.slot_target).argmax(-1)).float()
+                trained = take(batch.policy_weight)
+                add("hits", hit.sum())
+                add("hits_trained", (hit * trained).sum())
+                add("hits_settled", (hit * (1.0 - trained)).sum())
+    if values:
+        sums["value"] = torch.cat(values)
+    sums["rows"] = torch.tensor(float(total), device=device)
+    sums["trained"] = weights.sum().to(device)
+    return sums
+
+
 def update(
     policy: NetworkPolicy,
     optimiser: torch.optim.Optimizer,
@@ -654,6 +808,7 @@ def update(
     config: DistillConfig,
     *,
     generator: torch.Generator | None = None,
+    steps: "Steps | None" = None,
 ) -> Stats:
     """One distillation update: `config.epochs` passes over `batch`.
 
@@ -672,144 +827,104 @@ def update(
     what the anchor is for. The policy pass then walks the contested rows
     densely -- the same rows, seen the same `epochs` times each, at a fraction
     of the per-step variance.
+
+    Either shape steps once per minibatch, whatever `micro_batch` slices it
+    into (`_backward`). The `prior_kl` tether rides the value pass, beside the
+    anchor, for the anchor's reason.
+
+    With `steps` (`hexn.steps.Steps`) the update's progress goes to disk after
+    its optimiser steps, and an update `steps` was opened to resume carries on
+    from the step it holds -- both passes count as steps.
     """
-    batch = batch.to(policy.device)
+    if config.prior_kl > 0.0 and batch.prior_log_probs is None:
+        # A weight with nothing to weigh would train as if it were zero and
+        # log a zero divergence, which reads as "the policy has not moved".
+        raise ValueError("prior_kl is set but the batch carries no start policy (attach_prior)")
+    # A micro-batched update leaves the batch where it is (the host, as
+    # `assemble` builds it) and moves each slice's rows to the device as it
+    # is used, so the device holds one slice rather than the whole batch.
+    if not (config.micro_batch and config.micro_batch < config.minibatch):
+        batch = batch.to(policy.device)
     size = len(batch)
+    home = batch.buffer.device
 
     # Every list below holds device tensors, not Python floats: converting one
-    # with `float(...)` inside the minibatch loop is a device->host sync,
-    # same as the GPU update this module mirrors (`hexn.ppo.Terms`'s
-    # docstring). `_stack_mean` and `_nan_omitting_mean` below do the one
-    # read each of these needs, once per update rather than once per
-    # minibatch.
-    slot_losses: list[Tensor] = []
-    value_losses: list[Tensor] = []
-    agreements: list[Tensor] = []
-    value_mses: list[Tensor] = []
-    anchor_reports: list[Tensor] = []
-    entropies: list[Tensor] = []
-    contested_agreements: list[Tensor] = []
-    settled_agreements: list[Tensor] = []
-    predicted_for_variance = None
+    # with `float(...)` inside the minibatch loop is a device->host sync
+    # (`hexn.ppo.Terms`'s docstring). `_stack_mean` and `_ratio` below do the
+    # one read each needs, once per update rather than once per minibatch.
+    # One dict, so a step file can carry them (`hexn.steps`).
+    g: dict = {
+        name: []
+        for name in (
+            "slot_losses", "value_losses", "value_mses", "anchor_reports",
+            "prior_kls", "entropies", "agreements", "contested_hits",
+            "contested_rows_seen", "settled_hits", "settled_rows_seen",
+            "grad_norms",
+        )
+    }
+    g["variance"] = None
+    cursor = Cursor(generator, steps, policy, optimiser, lambda: g)
+    held = cursor.restored(policy.device)
+    if held is not None:
+        g = held
+        if g["variance"] is not None:
+            value, rows = g["variance"]
+            g["variance"] = (value, rows.to(home))
 
     contested_rows = torch.nonzero(batch.policy_weight > 0.0).squeeze(-1)
     packed = config.pack_contested and len(contested_rows) > 0
 
-    def step(loss: Tensor) -> None:
+    def step(rows: Tensor, *, with_value: bool, with_policy: bool) -> dict[str, Tensor]:
         optimiser.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(policy.net.parameters(), config.max_grad_norm)
+        sums = _backward(
+            policy, batch, rows, config, with_value=with_value, with_policy=with_policy
+        )
+        g["grad_norms"].append(
+            torch.nn.utils.clip_grad_norm_(policy.net.parameters(), config.max_grad_norm).detach()
+        )
         optimiser.step()
+        return sums
 
     for _ in range(config.epochs):
         # The value pass. Every row, unbiased -- restricting it to contested rows
         # would train the value head on a biased slice of the state distribution,
         # which is a different experiment.
-        for rows in _minibatches(size, config.minibatch, generator):
-            rows = rows.to(policy.device)
-            slots, value, value_logits, quantiles = policy.distributions(
-                batch.buffer[rows], batch.mask[rows]
-            )
-
-            if quantiles is None:
-                # Cross-entropy against the one-hot eventual winner, exactly
-                # `hexn.ppo.minibatch_terms`'s win-head term: every seat is a
-                # legal "winner", so there is no mask to apply and this reads
-                # `value_logits` raw rather than through `masked_log_softmax`.
-                log_probs_win = torch.log_softmax(value_logits, dim=-1)
-                value_loss = -(batch.value_target[rows] * log_probs_win).sum(-1).mean()
-            else:
-                # `players x Q` predictions against the same one-hot target --
-                # untested under distillation exactly as it is under PPO
-                # (`hexn.ppo`'s module docstring): the quantile shape was
-                # designed for a continuous margin target, not a categorical
-                # one.
-                value_loss = policy.net.value.loss(quantiles, batch.value_target[rows])
-            with torch.no_grad():
-                # Logged, never differentiated: the column comparable across a
-                # value-head ablation, whatever the loss actually differentiated.
-                value_mse = (value - batch.value_target[rows]).pow(2).mean()
-            loss = config.value_coefficient * value_loss
-
-            slot_loss = None
+        for rows in cursor.passes(size, config.minibatch):
+            rows = rows.to(home)
+            sums = step(rows, with_value=True, with_policy=not packed)
             if not packed:
-                slot_loss = losses(slots, batch, rows)
-                loss = loss + slot_loss
-
-            # 0.0 at the off default, matching what the old `anchored = 0.0`
-            # Python float did -- but as a tensor, so every epoch's list is the
-            # same type whether or not the anchor is active.
-            anchored = torch.zeros((), device=policy.device)
-            if config.anchor > 0.0:
-                penalty = anchor_losses(slots, batch, rows)
-                loss = loss + config.anchor * penalty
-                anchored = penalty.detach()
-
-            step(loss)
-
-            with torch.no_grad():
-                if slot_loss is not None:
-                    slot_losses.append(slot_loss.detach())
-                value_losses.append(value_loss.detach())
-                value_mses.append(value_mse.detach())
-                anchor_reports.append(anchored)
-                entropies.append(_entropy(slots).mean())
-                # Top-1 agreement with the search, which is the number to watch:
-                # the cross-entropy falls whenever the policy sharpens anywhere,
-                # and only this says it sharpened toward the right option. Read
-                # off the value pass in both shapes, because only that pass sees
-                # every row.
-                #
-                # Slot-space, which under contract 5 is option-space: every
-                # option has its own slot again. Read it as a trend against
-                # other runs; `contested_positions` reports the filter's own
-                # density directly.
-                hit = (slots.argmax(-1) == batch.slot_target[rows].argmax(-1)).float()
-                agreements.append(hit.mean())
-                # Split by which side of the filter the row fell on. Pooled, a
-                # fall cannot be read: the contested rows are being pulled
-                # toward the search while the settled ones are held by nothing,
-                # and those move opposite ways.
-                #
-                # Whether a minibatch counts at all (its split is non-empty)
-                # used to gate the append with a Python `if`, which needed the
-                # sum read back to a float right there. `torch.where` makes the
-                # same decision on the device instead, tagging an empty split
-                # with NaN; `_nan_omitting_mean` below drops those minibatches
-                # from the mean in one read at the end, exactly as the `if`
-                # dropped them from the list before.
-                trained = batch.policy_weight[rows]
-                settled = 1.0 - trained
-                trained_total = trained.sum()
-                settled_total = settled.sum()
-                contested_agreements.append(
-                    torch.where(
-                        trained_total > 0.0,
-                        (hit * trained).sum() / trained_total.clamp(min=1e-12),
-                        trained_total.new_full((), float("nan")),
-                    )
-                )
-                settled_agreements.append(
-                    torch.where(
-                        settled_total > 0.0,
-                        (hit * settled).sum() / settled_total.clamp(min=1e-12),
-                        settled_total.new_full((), float("nan")),
-                    )
-                )
-                predicted_for_variance = (value.detach(), rows)
+                g["slot_losses"].append(sums["policy_loss"])
+            g["value_losses"].append(sums["value_loss"])
+            g["value_mses"].append(sums["value_mse"])
+            g["anchor_reports"].append(sums.get("anchor", torch.zeros_like(sums["rows"])))
+            if "prior_kl" in sums:
+                g["prior_kls"].append(sums["prior_kl"])
+            g["entropies"].append(sums["entropy"])
+            g["agreements"].append(sums["hits"] / sums["rows"])
+            # Split by which side of the filter the row fell on. Pooled, a
+            # fall cannot be read: the contested rows are being pulled toward
+            # the search while the settled ones are held by nothing, and those
+            # move opposite ways. Weighted by rows, so an empty split simply
+            # contributes nothing.
+            g["contested_hits"].append(sums["hits_trained"])
+            g["contested_rows_seen"].append(sums["trained"])
+            g["settled_hits"].append(sums["hits_settled"])
+            g["settled_rows_seen"].append(sums["rows"] - sums["trained"])
+            g["variance"] = (sums["value"], rows)
+            cursor.stepped()
 
         if not packed:
             continue
 
         # The policy pass. Dense contested rows, one visit each per epoch, so a
         # row is trained on exactly as often as it would be unpacked.
-        for chosen in _minibatches(len(contested_rows), config.minibatch, generator):
+        for chosen in cursor.passes(len(contested_rows), config.minibatch):
             rows = contested_rows[chosen.to(contested_rows.device)]
-            slots, _, _, _ = policy.distributions(batch.buffer[rows], batch.mask[rows])
-            slot_loss = losses(slots, batch, rows)
-            step(slot_loss)
-            with torch.no_grad():
-                slot_losses.append(slot_loss.detach())
+            sums = step(rows, with_value=False, with_policy=True)
+            g["slot_losses"].append(sums["policy_loss"])
+            cursor.stepped()
+    cursor.finish()
+    predicted_for_variance = g["variance"]
 
     with torch.no_grad():
         if predicted_for_variance is None:
@@ -817,33 +932,91 @@ def update(
         else:
             predicted, rows = predicted_for_variance
             variance = _explained_variance(
-                predicted[:, 0], batch.value_target[rows][:, 0]
+                predicted[:, 0], batch.value_target[rows][:, 0].to(predicted.device)
             )
 
-    def _nan_omitting_mean(values: list[Tensor]) -> float:
-        """Mean over the per-minibatch tensors that are not NaN, read back
-        once. A minibatch contributes NaN wherever its split of the filter was
-        empty -- the device-side stand-in for the old per-minibatch `if
-        total > 0` gate -- so those minibatches are excluded here exactly as
-        they were excluded from the list before."""
-        if not values:
+    def _ratio(hits: list[Tensor], seen: list[Tensor]) -> float:
+        """Hits over rows across the whole update, read back once; 0.0 when
+        the split never held a row."""
+        if not seen:
             return 0.0
-        stacked = torch.stack(values).double()
-        valid = ~torch.isnan(stacked)
-        if not bool(valid.any()):
-            return 0.0
-        return float(stacked[valid].mean())
+        rows = float(torch.stack(seen).double().sum())
+        return float(torch.stack(hits).double().sum()) / rows if rows > 0 else 0.0
 
     return Stats(
         positions=size,
-        policy_loss=_stack_mean(slot_losses),
-        value_loss=_stack_mean(value_losses),
-        value_mse=_stack_mean(value_mses),
-        agreement=_stack_mean(agreements),
+        policy_loss=_stack_mean(g["slot_losses"]),
+        value_loss=_stack_mean(g["value_losses"]),
+        value_mse=_stack_mean(g["value_mses"]),
+        agreement=_stack_mean(g["agreements"]),
         explained_variance=variance,
-        anchor_loss=_stack_mean(anchor_reports),
-        entropy=_stack_mean(entropies),
-        agreement_contested=_nan_omitting_mean(contested_agreements),
-        agreement_settled=_nan_omitting_mean(settled_agreements),
+        anchor_loss=_stack_mean(g["anchor_reports"]),
+        entropy=_stack_mean(g["entropies"]),
+        agreement_contested=_ratio(g["contested_hits"], g["contested_rows_seen"]),
+        agreement_settled=_ratio(g["settled_hits"], g["settled_rows_seen"]),
         contested_positions=int(len(contested_rows)),
+        prior_kl=_stack_mean(g["prior_kls"]),
+        grad_norm=_stack_median(g["grad_norms"]),
     )
+
+
+def measure(policy: NetworkPolicy, batch: Batch, *, chunk: int = 4096) -> dict[str, float]:
+    """How far an update moved the policy, read over the batch it trained on.
+
+    Compares the live policy with the one the update started from
+    (`Batch.prior_log_probs`, which `hexn.ppo.attach_prior` filled before the
+    update) without a gradient, in chunks:
+
+    - `kl_to_start`: the mean over rows of KL(live || start), over legal
+      actions, the divergence `prior_kl` penalises;
+    - `agreement_start` / `agreement_end`: the share of decision rows (more
+      than one legal option, searched) where the policy's argmax is the
+      search's -- before and after;
+    - `target_ce_start` / `target_ce_end`: the cross-entropy of the search's
+      target under each policy on the same rows;
+    - `entropy_start` / `entropy_end`: the policies' mean entropy there.
+
+    Forced moves are left out of the agreement, the cross-entropy and the
+    entropy: a one-option row agrees with any search and would read as
+    agreement that nothing earned.
+    """
+    if batch.prior_log_probs is None:
+        raise ValueError("measure needs the start policy on the batch (attach_prior)")
+    device = policy.device
+    totals = {
+        "kl": 0.0, "rows": 0.0, "decisions": 0.0,
+        "hit_start": 0.0, "hit_end": 0.0, "ce_start": 0.0, "ce_end": 0.0,
+        "entropy_start": 0.0, "entropy_end": 0.0,
+    }
+    with torch.no_grad():
+        for start in range(0, len(batch), chunk):
+            stop = min(start + chunk, len(batch))
+            mask = batch.mask[start:stop].to(device)
+            target = batch.slot_target[start:stop].to(device)
+            before = batch.prior_log_probs[start:stop].to(device)
+            after, _, _, _ = policy.distributions(batch.buffer[start:stop].to(device), mask)
+            decision = (mask.sum(-1) > 1) & (batch.searched[start:stop].to(device) > 0)
+            pick = target.argmax(-1)
+            kl = torch.where(mask, after.exp() * (after - before), 0.0).sum(-1)
+            totals["kl"] += float(kl.double().sum())
+            totals["rows"] += stop - start
+            totals["decisions"] += float(decision.sum())
+            for name, rows in (("start", before), ("end", after)):
+                totals[f"hit_{name}"] += float(((rows.argmax(-1) == pick) & decision).sum())
+                totals[f"ce_{name}"] += float(
+                    torch.where(decision, -(target * rows).sum(-1), 0.0).double().sum()
+                )
+                totals[f"entropy_{name}"] += float(
+                    torch.where(decision, _entropy(rows), 0.0).double().sum()
+                )
+    decisions = max(totals["decisions"], 1.0)
+    return {
+        "kl_to_start": totals["kl"] / max(totals["rows"], 1.0),
+        "decision_positions": int(totals["decisions"]),
+        "agreement_start": totals["hit_start"] / decisions,
+        "agreement_end": totals["hit_end"] / decisions,
+        "target_ce_start": totals["ce_start"] / decisions,
+        "target_ce_end": totals["ce_end"] / decisions,
+        "entropy_start": totals["entropy_start"] / decisions,
+        "entropy_end": totals["entropy_end"] / decisions,
+    }

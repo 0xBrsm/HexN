@@ -451,7 +451,7 @@ def recover(
         players=players,
         seed=seed + 1,
         action_cap=action_cap,
-        max_trades=loaded.max_trades,
+        max_offers=loaded.max_offers,
         deal=seed_games,
         board=board,
     )
@@ -678,7 +678,7 @@ def main(argv: list[str] | None = None) -> int:
         players=args.players,
         seed=cohort_seed,
         action_cap=args.action_cap,
-        max_trades=loaded.max_trades,
+        max_offers=loaded.max_offers,
         deal=args.games,
         board=None if args.random_boards else board,
     )

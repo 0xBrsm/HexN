@@ -31,9 +31,36 @@ simulations of noise is a slow uniform search.
 
 ## The trade switch is set in two places and they must agree
 
-`Collector` plays its lanes under `--max-trades`; `Search` roots its tree under
+`Collector` plays its lanes under `--max-offers`; `Search` roots its tree under
 its own. One flag feeds both, which is why it is passed to `Search` explicitly
 here.
+
+## A crash loses at most the games in flight
+
+Each game is kept on disk as it finishes (`<checkpoint-dir>/partial/`), and
+an iteration's collection becomes its replay shard the moment it is whole; a
+shard written before a crash that came ahead of its checkpoint is that
+iteration's collection on resume (`hexn.store.EpisodeStore.adopt`), never
+collected twice. The log row and the checkpoint come before the evaluation,
+which is logged as its own row, and a resumed run marks the log with
+`{"resumed_from": N}` so a reader keeps the last row per iteration.
+With `--replay-positions 0` there is no store: an iteration trains on its own
+games only, and they stay in its partial until its checkpoint is written, so
+a resumed iteration plays only the games it is missing, as `hexn.ppo` does.
+The distillation writes its progress after every `--step-checkpoint-every`
+optimiser steps (`latest-step.pt`, `hexn.steps`); a round killed there
+rebuilds its batch from its games and carries the update on from the last
+step file. A batch that cannot rebuild the same -- reanalysis re-searches
+with a search whose state is not kept -- has its step file refused, and the
+update starts again from the round's start.
+
+## What an iteration logs about its own movement
+
+Before the update, the starting policy's log-probs are attached to the batch
+(`hexn.ppo.attach_prior`, the policy itself as the prior): `--prior-kl`
+tethers to them, and after the update `hexn.exit.measure` reads KL(new ||
+start), the agreement of each policy's argmax with the search's, and the
+search target's cross-entropy under each, over the batch's decision rows.
 
 ## Scaling collection
 
@@ -44,7 +71,6 @@ on its own; run more of them for more throughput.
 from __future__ import annotations
 
 import argparse
-import json
 import pickle
 import random
 import sys
@@ -55,15 +81,18 @@ from typing import Sequence
 
 import torch
 
-from . import DistillConfig, assemble, refresh, update
+from . import DistillConfig, assemble, measure, refresh, update
+from .. import durable
 from ..expert import SearchPolicy
 from hexset.mcts import Search
 from ..netbot import LeafEvaluator
-from ..collect import ParallelCollector, WorkerSpec
+from ..collect import ParallelCollector, WorkerSpec, release_memory
+from ..ppo import attach_prior
 from ..reanalyse import reanalyse
 from ..selfplay import Collector
 from ..store import EpisodeStore
-from ..loop import add_head_flags, build, duel, save, summarise
+from ..loop import add_head_flags, build, duel, prune_recent, save, summarise
+from ..steps import Steps, by_index, fingerprint, remove as remove_steps
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -77,15 +106,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--games-per-iteration", type=int, default=16)
     parser.add_argument("--action-cap", type=int, default=4000)
     parser.add_argument(
+        "--max-offers",
         "--max-trades",
         type=int,
         default=None,
-        help="the trade switch every seat plays under: 0 for the no-trade referent, omitted for the engine's own default of one broadcast round a turn (`Game.trade_mode='round'`), -1 to leave a turn's rounds uncapped (`hexset.trading`)",
+        help="the network's own offer budget a turn (hexn.trade): 0 for the no-trade network, omitted for HexSet's default (unlimited); -1 also reads as unlimited. Opponents bargain as their own bots do",
     )
     parser.add_argument("--seed", type=int, default=0)
 
     parser.add_argument("--simulations", type=int, default=256)
     parser.add_argument("--wave", type=int, default=16)
+    parser.add_argument(
+        "--k",
+        type=int,
+        default=1,
+        help="determinized worlds each searched decision is rooted in, drawn "
+        "from the mover's own belief (hexset.mcts.Search.worlds); each world "
+        "gets the full --simulations",
+    )
     parser.add_argument("--exploration", type=float, default=1.25)
     # Left at "relative", unchanged by contract 6's win head. `stance` is how
     # `hexset.mcts.Search` reduces a node's per-seat backed-up vector to the
@@ -138,7 +176,9 @@ def build_parser() -> argparse.ArgumentParser:
         "iterations oldest-first once the newer ones already cover the budget; "
         "the freshest iteration is never evicted on its own arrival. Replaces "
         "--buffer-iterations: sized in positions, which stays meaningful across "
-        "--games-per-iteration, where a fixed iteration count did not.",
+        "--games-per-iteration, where a fixed iteration count did not. 0 keeps "
+        "no store: each iteration trains on its own games only, which stay in "
+        "<checkpoint-dir>/partial/ until its checkpoint is written",
     )
     parser.add_argument(
         "--reanalyse-samples",
@@ -217,10 +257,43 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--epochs", type=int, default=4)
     parser.add_argument("--minibatch", type=int, default=1024)
+    parser.add_argument(
+        "--micro-batch",
+        type=int,
+        default=0,
+        help="rows per backward within a minibatch, gradients accumulated "
+        "(DistillConfig.micro_batch); the step is still the minibatch's. "
+        "0 disables",
+    )
+    parser.add_argument(
+        "--prior-kl",
+        type=float,
+        default=0.0,
+        help="weight on KL(policy || the iteration's starting policy) over "
+        "every legal action, added to the loss (DistillConfig.prior_kl). "
+        "0 disables",
+    )
 
     parser.add_argument("--checkpoint-dir", default="runs/distill")
     parser.add_argument("--checkpoint-every", type=int, default=1)
+    parser.add_argument(
+        "--step-checkpoint-every",
+        type=int,
+        default=1,
+        help="write the distillation's progress (latest-step.pt: weights, "
+        "optimiser, position, gauges) after every K-th optimiser step and "
+        "after the last, so a resumed run continues the interrupted update "
+        "from its last such step rather than from the round's start "
+        "(hexn.steps). 0 disables",
+    )
     parser.add_argument("--keep-every", type=int, default=10, help="0 disables")
+    parser.add_argument(
+        "--keep-recent",
+        type=int,
+        default=5,
+        help="rolling ring of the last N checkpoints (recent-XXXXX.pt), kept "
+        "whatever --keep-every keeps; 0 disables",
+    )
     parser.add_argument("--eval-every", type=int, default=0, help="0 disables")
     parser.add_argument("--eval-games", type=int, default=200)
     parser.add_argument("--eval-at-start", action="store_true")
@@ -228,7 +301,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--init",
         default=None,
-        help="checkpoint to start the student from; ignored when resuming",
+        help="checkpoint to start the student from; ignored when resuming a "
+        "run that has a latest.pt, so one frozen config with --resume both "
+        "starts and restarts the run",
     )
     return parser
 
@@ -285,12 +360,33 @@ def main(argv: Sequence[str] | None = None) -> int:
             "--reanalyse-samples needs a growing replay store, which --corpus "
             "never builds: it replays one fixed collection every iteration"
         )
+    if args.replay_positions <= 0 and args.reanalyse_samples:
+        parser.error(
+            "--reanalyse-samples re-searches stored positions; --replay-positions 0 "
+            "keeps no store"
+        )
+
+    # A manifest frozen before these flags existed has neither: no step file,
+    # no ring.
+    step_every = getattr(args, "step_checkpoint_every", 0)
+    keep_recent = getattr(args, "keep_recent", 0)
+    if step_every < 0:
+        parser.error("--step-checkpoint-every cannot be negative")
+    if step_every and args.checkpoint_every > 1:
+        print(
+            f"WARNING: --checkpoint-every {args.checkpoint_every}: a step "
+            "checkpoint resumes only the round right after latest.pt, so a "
+            "kill in any other round still goes back to latest.pt",
+            file=sys.stderr,
+        )
 
     config = DistillConfig(
         temperature=args.target_temperature,
         value_coefficient=args.value_coefficient,
         epochs=args.epochs,
         minibatch=args.minibatch,
+        micro_batch=args.micro_batch,
+        prior_kl=args.prior_kl,
         learning_rate=args.learning_rate,
         value_horizon=args.value_horizon,
         contested_only=args.contested_only,
@@ -308,10 +404,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     latest = directory / "latest.pt"
     log = directory / "log.jsonl"
     replay_dir = directory / "replay"
+    collecting = directory / "partial"
 
     start_iteration = 0
     first_game = 0
-    if args.resume and latest.exists():
+    if args.resume and not latest.exists() and not args.init:
+        # It used to fall through and start fresh, silently: the same refusal
+        # `hexn.ppo` makes, for the same reason. With `--init` it is a fresh
+        # start from those weights, as in `hexn.ppo`.
+        raise SystemExit(
+            f"--resume was given but {latest} does not exist; "
+            "seed the directory with the checkpoint to continue from, "
+            "or drop --resume to start a fresh run"
+        )
+    if not args.resume and latest.exists():
+        raise SystemExit(
+            f"{latest} already holds a run; resume it with --resume, or start "
+            "the fresh run in an empty --checkpoint-dir"
+        )
+    resuming = args.resume and latest.exists()
+    if resuming:
         state = torch.load(latest, map_location=args.device, weights_only=False)
         policy.net.load_state_dict(state["net"])
         optimiser.load_state_dict(state["optimiser"])
@@ -325,23 +437,64 @@ def main(argv: Sequence[str] | None = None) -> int:
         # A CPU ByteTensor is required whatever `map_location` moved it to.
         torch.set_rng_state(state["torch_rng"].cpu())
         print(f"resumed at iteration {start_iteration}, game {first_game}", file=sys.stderr)
-        store = EpisodeStore.resume(replay_dir, args.replay_positions)
+    # A fresh start reads the store too: a crash before the first checkpoint
+    # can leave iteration 0's shard, collected by the same starting weights.
+    store = (
+        EpisodeStore.resume(replay_dir, args.replay_positions, before=start_iteration)
+        if args.replay_positions > 0
+        else None
+    )
+    if store is not None and (resuming or store.ahead):
         print(
             f"resumed the replay store: {len(store.iterations())} iterations, "
-            f"{store.positions()} positions",
+            f"{store.positions()} positions, "
+            f"{len(store.ahead)} collected ahead of the checkpoint",
             file=sys.stderr,
         )
-    else:
-        store = EpisodeStore(replay_dir, args.replay_positions)
-        if args.init:
-            # Weights only. The optimiser state belongs to a different
-            # objective — Adam's second moments were accumulated against a
-            # PPO gradient, and carrying them into a cross-entropy would
-            # scale the first steps by a history that no longer describes
-            # the loss.
-            state = torch.load(args.init, map_location=args.device, weights_only=False)
-            policy.net.load_state_dict(state["net"])
-            print(f"initialised from {args.init}", file=sys.stderr)
+    corpus_games = (
+        durable.Partial(Path(args.corpus + ".partial")) if args.corpus else None
+    )
+    # Past every game already dealt by a collection the crash interrupted, a
+    # shard written ahead of the checkpoint, or a corpus half-collected.
+    first_game = durable.resume_base(
+        first_game,
+        *(
+            held.indices()
+            for iteration, held in durable.partials(collecting).items()
+            if iteration >= start_iteration
+        ),
+        *(
+            [episode.index for episode in episodes]
+            for episodes in (store.ahead.values() if store is not None else ())
+        ),
+        corpus_games.indices() if corpus_games is not None else (),
+    )
+    durable.prune(collecting, start_iteration - 1)
+    if not resuming and args.init:
+        # Weights only. The optimiser state belongs to a different
+        # objective — Adam's second moments were accumulated against a
+        # PPO gradient, and carrying them into a cross-entropy would
+        # scale the first steps by a history that no longer describes
+        # the loss.
+        state = torch.load(args.init, map_location=args.device, weights_only=False)
+        policy.net.load_state_dict(state["net"])
+        print(f"initialised from {args.init}", file=sys.stderr)
+        # Kept as this run's own iteration 0, as `hexn.ppo` does: the same
+        # weights, recording this run's arguments, so the starting point is
+        # an ordinary checkpoint of the run beside the ones it produces.
+        if args.keep_every:
+            save(
+                directory / "iter-00000.pt",
+                {
+                    "iteration": 0,
+                    "games_started": 0,
+                    "net": policy.net.state_dict(),
+                    "optimiser": optimiser.state_dict(),
+                    "torch_rng": torch.get_rng_state(),
+                    "args": vars(args),
+                    "config": asdict(config),
+                },
+            )
 
     search = Search(
         LeafEvaluator(policy=policy),
@@ -349,9 +502,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         wave=args.wave,
         exploration=args.exploration,
         stance=args.stance,
-        max_trades=args.max_trades,
         root_noise=args.root_noise,
         noise_fraction=args.noise_fraction,
+        k=args.k,
         rng=random.Random(args.seed),
     )
     expert = SearchPolicy(
@@ -372,7 +525,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     players=args.players,
                     lanes=shard,
                     action_cap=args.action_cap,
-                    max_trades=args.max_trades,
+                    max_offers=args.max_offers,
                     first_game=first_game + worker,
                     stride=args.collect_workers,
                     width=args.width,
@@ -388,9 +541,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     root_noise=args.root_noise,
                     noise_fraction=args.noise_fraction,
                     play_temperature=args.play_temperature,
+                    k=args.k,
                 )
                 for worker in range(args.collect_workers)
-            ]
+            ],
+            heartbeat=directory / "heartbeat.json",
         )
     else:
         collector = Collector(
@@ -400,11 +555,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             seed=args.seed,
             action_cap=args.action_cap,
             first_game=first_game,
-            max_trades=args.max_trades,
+            max_offers=args.max_offers,
         )
 
     directory.mkdir(parents=True, exist_ok=True)
     began = time.perf_counter()
+    if resuming or log.exists():
+        # Rows past this marker supersede any earlier row for the same
+        # iteration: the checkpoint resumed from predates them.
+        durable.append_line(log, {"resumed_from": start_iteration})
 
     if args.eval_at_start:
         baseline = duel(
@@ -414,12 +573,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             players=args.players,
             seed=args.seed + 9_000,
             network_seats=(0, 2),
-            max_trades=args.max_trades,
+            max_offers=args.max_offers,
         )
-        line = json.dumps({"iteration": -1, "duel": baseline})
-        print(line, flush=True)
-        with log.open("a") as handle:
-            handle.write(line + "\n")
+        print(durable.append_line(log, {"iteration": -1, "duel": baseline}), flush=True)
 
     corpus: list | None = None
     if args.corpus:
@@ -428,8 +584,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             if isinstance(collector, ParallelCollector):
                 collector.sync(policy.net)
             cache.parent.mkdir(parents=True, exist_ok=True)
-            episodes = collector.collect(args.corpus_games or args.games_per_iteration)
-            cache.write_bytes(pickle.dumps(episodes))
+            # Game by game into `<corpus>.partial/` as they finish, then the
+            # whole file at once: a crash part-way keeps the games played.
+            episodes = collector.collect(
+                args.corpus_games or args.games_per_iteration, partial=corpus_games
+            )
+            durable.write_atomic(cache, pickle.dumps(episodes))
+            corpus_games.remove()
             print(f"wrote {len(episodes)} episodes to {cache}", file=sys.stderr)
         corpus = pickle.loads(cache.read_bytes())
         print(f"replaying {len(corpus)} episodes from {cache}", file=sys.stderr)
@@ -444,71 +605,99 @@ def main(argv: Sequence[str] | None = None) -> int:
         started = time.perf_counter()
         reanalysis = None
         if corpus is None:
-            if isinstance(collector, ParallelCollector):
-                # The single-process collector shares the learner's policy
-                # object, so its search always sees the current weights. Workers
-                # hold their own copies and do not: without this the whole run
-                # would distil a frozen teacher into a moving student and look
-                # perfectly healthy doing it.
-                collector.sync(policy.net)
-            episodes = collector.collect(args.games_per_iteration)
-            store.append(iteration, episodes)
-            if args.reanalyse_samples:
-                # Over the current net -- the same `search` the collector
-                # itself just used, so a reanalysed row is searched exactly
-                # the way a freshly collected one would be.
-                reanalysis = reanalyse(
-                    store,
-                    search,
-                    args.reanalyse_samples,
-                    random.Random(args.seed + 500_000 + iteration),
-                )
-            batch = store.batch(space, policy.layout, config)
+            if store is not None and iteration in store.ahead:
+                # Collected, shard written, then the crash, all before this
+                # iteration's checkpoint: the collection is done already.
+                episodes = by_index(store.adopt(iteration))
+            else:
+                if isinstance(collector, ParallelCollector):
+                    # The single-process collector shares the learner's policy
+                    # object, so its search always sees the current weights.
+                    # Workers hold their own copies and do not: without this
+                    # the whole run would distil a frozen teacher into a
+                    # moving student and look perfectly healthy doing it.
+                    collector.sync(policy.net)
+                games = durable.partial(collecting, iteration)
+                episodes = by_index(collector.collect(args.games_per_iteration, partial=games))
+                if store is not None:
+                    store.append(iteration, episodes)
+                    games.remove()
+            collected = time.perf_counter() - started
+            started = time.perf_counter()
+            if store is None:
+                batch = assemble(episodes, space, policy.layout, config)
+            else:
+                if args.reanalyse_samples:
+                    # Over the current net -- the same `search` the collector
+                    # itself just used, so a reanalysed row is searched exactly
+                    # the way a freshly collected one would be.
+                    reanalysis = reanalyse(
+                        store,
+                        search,
+                        args.reanalyse_samples,
+                        random.Random(args.seed + 500_000 + iteration),
+                    )
+                batch = store.batch(space, policy.layout, config)
         else:
             episodes = corpus
             if fixed_batch is None:
                 fixed_batch = assemble(episodes, space, policy.layout, config)
             batch = fixed_batch
-        collected = time.perf_counter() - started
-        started = time.perf_counter()
+            collected = time.perf_counter() - started
+            started = time.perf_counter()
+        # The start policy over every row, before anything steps: the tether's
+        # target, and what `measure` reads the update's movement against. One
+        # no-grad forward; the policy here is the net the games were searched
+        # over.
+        batch = attach_prior(batch, policy, policy.layout)
         if config.refresh_prior:
             # Before the update, not per epoch: this is the prior the whole
             # update is filtered and anchored against, the way PPO snapshots
             # `pi_old` once.
             batch = refresh(policy, batch, config)
-        stats = update(policy, optimiser, batch, config)
+        assembled = time.perf_counter() - started
+        # After the start policy is on the batch and the filter refreshed,
+        # both of which read the round's starting weights: a step file of
+        # this round's update replaces them with its own.
+        stepper = (
+            Steps.open(directory, iteration, fingerprint(batch), step_every, policy, optimiser)
+            if step_every
+            else None
+        )
+        started = time.perf_counter()
+        stats = update(policy, optimiser, batch, config, steps=stepper)
         updated = time.perf_counter() - started
+        started = time.perf_counter()
+        moved = measure(policy, batch)
+        measured = time.perf_counter() - started
 
         progress = summarise(
-            episodes, iteration, len(batch), collected, updated, collector.games
+            episodes,
+            iteration,
+            len(batch),
+            collected,
+            updated,
+            collector.games,
+            assemble_seconds=assembled,
         )
         record = {
             **asdict(progress),
             **asdict(stats),
-            "replay_iterations": len(store.iterations()) if corpus is None else 0,
-            "replay_positions": store.positions() if corpus is None else 0,
+            **moved,
+            "measure_seconds": measured,
+            "replay_iterations": len(store.iterations()) if store is not None and corpus is None else 0,
+            "replay_positions": store.positions() if store is not None and corpus is None else 0,
             "buffer_mib": round(batch.nbytes() / 1024 / 1024, 1),
+            **(stepper.log() if stepper is not None else {}),
             "elapsed": time.perf_counter() - began,
         }
         if reanalysis is not None:
             record["reanalysed_positions"] = reanalysis.reanalysed
             record["reanalyse_kl"] = round(reanalysis.mean_kl, 6)
 
-        if args.eval_every and (iteration + 1) % args.eval_every == 0:
-            record["duel"] = duel(
-                policy,
-                games=args.eval_games,
-                lanes=max(args.lanes, 64),
-                players=args.players,
-                seed=args.seed + 10_000 + iteration,
-                network_seats=(0, 2),
-                max_trades=args.max_trades,
-            )
-
-        line = json.dumps(record)
-        print(line, flush=True)
-        with log.open("a") as handle:
-            handle.write(line + "\n")
+        # The iteration's row and checkpoint first, the evaluation after: an
+        # evaluation that crashes must not take the iteration with it.
+        print(durable.append_line(log, record), flush=True)
 
         if (iteration + 1) % args.checkpoint_every == 0 or iteration + 1 == args.iterations:
             state = {
@@ -521,9 +710,40 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "config": asdict(config),
             }
             save(latest, state)
+            # The step file was this round's update; latest.pt holds it now.
+            remove_steps(directory)
+            if keep_recent:
+                save(directory / f"recent-{iteration + 1:05d}.pt", state)
+                prune_recent(directory, keep_recent)
             if args.keep_every and (iteration + 1) % args.keep_every == 0:
                 save(directory / f"iter-{iteration + 1:05d}.pt", state)
+            # Only now is this iteration's collection held elsewhere -- in the
+            # checkpoint's weights, when there is no store to hold the games.
+            durable.prune(collecting, iteration)
 
+        if args.eval_every and (iteration + 1) % args.eval_every == 0:
+            evaluation = duel(
+                policy,
+                games=args.eval_games,
+                lanes=max(args.lanes, 64),
+                players=args.players,
+                seed=args.seed + 10_000 + iteration,
+                network_seats=(0, 2),
+                max_offers=args.max_offers,
+            )
+            print(
+                durable.append_line(log, {"iteration": iteration, "duel": evaluation}),
+                flush=True,
+            )
+
+        # Nothing of this iteration is read past here. Let the batch and the
+        # episodes go now, or the next collection runs with them still held.
+        if corpus is None:
+            batch = episodes = None
+            release_memory()
+
+    if isinstance(collector, ParallelCollector):
+        collector.close()
     return 0
 
 

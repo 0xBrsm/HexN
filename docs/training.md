@@ -55,7 +55,10 @@ where a single-device GPU update is not the bottleneck.
 arena entrant instead of self-play, on alternating seat pairs whose seats
 are never trained on. `parent` (the checkpoint named by `--parent`) and any
 `hexset` arena entrant spec both work, so a held-out opponent can be
-collected against as well as evaluated on.
+collected against as well as evaluated on. A bot HexSet does not ship
+resolves only once its runtime is loaded: name the module with `--runtime`
+(repeatable; frozen into the config), and the trainer loads it before it
+resolves anything and hands it to every collector worker.
 
 **The learning rate follows a schedule** (`hexn.schedule`, `--lr-schedule`):
 `constant` keeps `--learning-rate` fixed; `linear` anneals it to
@@ -88,10 +91,12 @@ the search improves along with the policy it is rooted on; the mechanism is
 closed-loop rather than a fixed target to converge toward. `--init` names a
 starting checkpoint (ignored when `--resume`ing) rather than a teacher.
 
-**The trade switch is one flag feeding two places.** `--max-trades` bounds
-both the collector's lanes and the search's own tree root. Playing under one
-switch and searching under another would measure a different game than the
-one the run is meant to improve.
+**The trade budget is the network's own.** `--max-offers` is how many
+offers the network makes a turn, declared on its trade gate as HexSet's
+`TradeParams` (`hexn.trade`) and recorded in its checkpoints: `0` does not
+trade, and leaving it out is HexSet's default, which is unlimited. The table
+caps nothing, so opponents bargain as their own bots do, and the search
+takes no budget of its own. `--max-trades` is accepted as the old spelling.
 
 **The replay store** (`hexn.store.EpisodeStore`, `--replay-positions`)
 retains searched episodes on disk under `<checkpoint-dir>/replay/`, one
@@ -144,7 +149,8 @@ scores every learner. Checkpoints land one directory per learner:
 `<checkpoint-dir>/learner<k>/latest.pt`.
 
 Collection knobs (`--lanes`, `--games-per-iteration`, `--collect-workers`,
-`--action-cap`, `--max-trades`) are table properties every seat shares.
+`--action-cap`) are table properties every seat shares, and `--max-offers`
+is the one budget every learner's network declares.
 There is no per-learner override for them: varying one would make the arms
 a sequential comparison rather than a shared-table league.
 
@@ -162,7 +168,17 @@ counter would replay games it has already trained on while looking healthy.
 `--keep-every N` additionally keeps `iter-NNNNN.pt` every N iterations, so
 earlier iterations remain available for comparison after `latest.pt` has
 moved on; `--keep-recent N` keeps a rolling ring of the last N periodic
-saves.
+saves. `--checkpoint-every` defaults to 1 in every mode.
+
+**Nothing waits for the end of a batch to reach the disk** (`hexn.durable`).
+Each game is written to `<checkpoint-dir>/partial/iter-NNNNN/` the moment it
+finishes, the log row and the checkpoint precede an iteration's evaluation,
+and a log line is flushed and fsynced as it is written. `docs/runs.md`
+covers what a resume does with them. A `ParallelCollector` polls its
+workers rather than blocking on them: a worker that dies, or goes
+`hexn.collect.STALL_SECONDS` without a tick, fails the run with a sentence,
+and `<checkpoint-dir>/heartbeat.json` says what each worker is doing while
+the learner waits.
 
 **Evaluation.** `hexn.loop.duel` plays the current policy against uniform
 random opponents (`hexset.bots.RandomBot`) and reports a win-rate interval.

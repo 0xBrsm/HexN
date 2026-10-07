@@ -109,6 +109,9 @@ class ModelConfig:
     # under every other shape, so the default is behaviour-neutral there.
     # 32 is QR-DQN's own N.
     quantiles: int = 32
+    # Build the fast-win head (`HexNet.fast_win`, `Prediction.fast`). Off by
+    # default, so every checkpoint written before it keeps its exact key set.
+    fast_win: bool = False
 
     def __post_init__(self) -> None:
         # A mistyped shape has to fail before a run starts, not silently fall
@@ -141,6 +144,7 @@ def config_from_args(args: Mapping[str, object]) -> ModelConfig:
         value_head=str(args.get("value_head", "linear")),
         policy_head=str(args.get("policy_head", "linear")),
         quantiles=int(args.get("quantiles", 32)),  # type: ignore[arg-type]
+        fast_win=bool(args.get("fast_win", False)),
     )
 
 
@@ -169,6 +173,15 @@ class Prediction:
     eventual winner. It is never read by a gate, an advantage or a search --
     `hexn.ppo` is its only reader, and only for its own loss term.
 
+    `fast` is the fast-win head, `None` unless the net was built with
+    `ModelConfig.fast_win`: a softmax over `players + 1` slots, the seats in
+    the mover's frame and then "not won in time". Its target puts the round
+    weight `w(r)` of the game's winning round on the winner and `1 - w(r)` on
+    the last slot (`hexn.ppo`), so `fast[..., :players]` is each seat's
+    expected time-weighted win. A PPO run that pays for fast wins reads its
+    advantage off it; the win head, which every gate and search reads, is
+    trained exactly as before.
+
     `quantiles` is `None` for every head shape but `"quantile"`, where it is
     the `(B, players, Q)` tensor whose last-axis mean *is* `value_logits`
     (the win head's raw output, before the softmax). It exists so
@@ -182,6 +195,8 @@ class Prediction:
     value_logits: Tensor
     margin: Tensor
     quantiles: Tensor | None = None
+    fast: Tensor | None = None
+    fast_logits: Tensor | None = None
 
 
 def _mlp(in_dim: int, width: int) -> nn.Sequential:
@@ -484,6 +499,11 @@ class HexNet(nn.Module):
         # this module's existence. Never a `QuantileValueHead`: the margin
         # target is a plain regression and has no shape ablation of its own.
         self.aux_margin = _head(value_in, players, width, deep=shape in _DEEP)
+        # The fast-win head, a third read of the same features: one slot per
+        # seat plus "not won in time" (`Prediction.fast`). Only built when
+        # asked for, so no existing checkpoint gains keys.
+        if self.config.fast_win:
+            self.fast_win = _head(value_in, players + 1, width, deep=shape in _DEEP)
         # Plain attribute, not a buffer or a config field: it changes which
         # gradients flow, never a parameter or a shape, so a checkpoint written
         # with it on loads identically with it off.
@@ -584,6 +604,8 @@ class HexNet(nn.Module):
             nn.init.orthogonal_(_output(head).weight, gain=0.01)
         nn.init.orthogonal_(_output(self.value).weight, gain=1.0)
         nn.init.orthogonal_(_output(self.aux_margin).weight, gain=1.0)
+        if self.config.fast_win:
+            nn.init.orthogonal_(_output(self.fast_win).weight, gain=1.0)
 
     def _pass(
         self,
@@ -632,24 +654,26 @@ class HexNet(nn.Module):
 
     def _read_value(
         self, g: Tensor, h: Tensor, v: Tensor, e: Tensor
-    ) -> tuple[Tensor, Tensor | None, Tensor]:
-        """`(value_logits, spread, margin)`.
+    ) -> tuple[Tensor, Tensor | None, Tensor, Tensor | None]:
+        """`(value_logits, spread, margin, fast_logits)`.
 
         `value_logits` is the win head's raw, pre-softmax output — `forward`
         turns it into `Prediction.value` with one `softmax`. `spread` is
         `None` for every shape but `"quantile"`, where `value_logits` is its
         mean. `margin` is the auxiliary VP-margin head, read off the same
         assembled features so the two heads pay the trunk's cost once.
+        `fast_logits` is the fast-win head's, `None` when it is not built.
         """
         features = self._value_features(g, h, v, e)
         margin = self.aux_margin(features)
+        fast = self.fast_win(features) if self.config.fast_win else None
         if isinstance(self.value, QuantileValueHead):
             spread = self.value.spread(features)
             # The mean the rest of the system reads as `value_logits`, taken
             # here rather than through `forward` so the spread is not
             # recomputed.
-            return spread.mean(-1), spread, margin
-        return self.value(features), None, margin
+            return spread.mean(-1), spread, margin, fast
+        return self.value(features), None, margin, fast
 
     def forward(
         self, hexes: Tensor, vertices: Tensor, edges: Tensor, globals_: Tensor
@@ -768,7 +792,7 @@ class HexNet(nn.Module):
         # theorised — and the reason the logits read stays first now that the
         # deleted trade heads no longer sit between them.
         logits = stacked.index_select(1, self.flat_gather)
-        value_logits, quantiles, margin = self._read_value(
+        value_logits, quantiles, margin, fast_logits = self._read_value(
             g.detach() if cut else g,
             h.detach() if cut else h,
             v.detach() if cut else v,
@@ -783,7 +807,34 @@ class HexNet(nn.Module):
             value_logits=value_logits,
             margin=margin,
             quantiles=quantiles,
+            fast=None if fast_logits is None else torch.softmax(fast_logits, dim=-1),
+            fast_logits=fast_logits,
         )
+
+
+def graft_fast_win(net: "HexNet") -> None:
+    """Warm-start a freshly built fast-win head from the net's win head.
+
+    The seat rows copy the win head's output layer (and any hidden layer),
+    so before any update the fast head ranks seats exactly as the win head
+    does. The "not won in time" row starts at zero weight and zero bias, so
+    it takes a share of the mass that the first updates fit. A quantile win
+    head has no single output layer to copy and is refused.
+    """
+    if not net.config.fast_win:
+        raise ValueError("the net has no fast-win head to graft")
+    if isinstance(net.value, QuantileValueHead):
+        raise ValueError("a quantile win head cannot seed the fast-win head")
+    seats = net.players
+    with torch.no_grad():
+        if isinstance(net.value, nn.Sequential):
+            for source, target in zip(list(net.value)[:-1], list(net.fast_win)[:-1]):
+                target.load_state_dict(source.state_dict())
+        source, target = _output(net.value), _output(net.fast_win)
+        target.weight[:seats].copy_(source.weight)
+        target.bias[:seats].copy_(source.bias)
+        target.weight[seats:].zero_()
+        target.bias[seats:].zero_()
 
 
 def collate(observations: list[Observation]) -> tuple[Tensor, Tensor, Tensor, Tensor]:

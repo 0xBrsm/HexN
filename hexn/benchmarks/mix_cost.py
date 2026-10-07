@@ -224,7 +224,7 @@ def shard(
     seed: int,
     width: int,
     rounds: int,
-    max_trades: int | None,
+    max_offers: int | None,
     action_cap: int,
     parent: str,
     learner: str = "",
@@ -271,7 +271,7 @@ def shard(
         players=players,
         seed=seed,
         action_cap=action_cap,
-        max_trades=max_trades,
+        max_offers=max_offers,
         opponents=opponents,
         caster=mix_caster(parsed, players, seed) if parsed else None,
     )
@@ -309,7 +309,7 @@ def sharded(
     seed: int,
     width: int,
     rounds: int,
-    max_trades: int | None,
+    max_offers: int | None,
     action_cap: int,
     parent: str,
 ) -> Point:
@@ -328,7 +328,7 @@ def sharded(
             players=players,
             lanes=shard_lanes,
             action_cap=action_cap,
-            max_trades=max_trades,
+            max_offers=max_offers,
             first_game=worker,
             stride=workers,
             width=width,
@@ -389,10 +389,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--width", type=int, default=64)
     parser.add_argument("--rounds", type=int, default=2)
     parser.add_argument(
+        "--max-offers",
         "--max-trades",
         type=int,
         default=None,
-        help="the trade switch every seat plays under: 0 for the no-trade referent, omitted for the engine's own default of one broadcast round a turn, -1 to leave a turn's rounds uncapped",
+        help="the network's own offer budget a turn (hexn.trade): 0 for the no-trade network, omitted for HexSet's default (unlimited); -1 also reads as unlimited. Opponents bargain as their own bots do",
     )
     parser.add_argument("--action-cap", type=int, default=4000)
     parser.add_argument("--parent", default="", help="the 'parent' mix opponent")
@@ -417,7 +418,7 @@ def main(argv: list[str] | None = None) -> int:
             seed=args.seed,
             width=args.width,
             rounds=args.rounds,
-            max_trades=args.max_trades,
+            max_offers=args.max_offers,
             action_cap=args.action_cap,
             parent=args.parent,
         )

@@ -36,6 +36,7 @@ from dataclasses import asdict, dataclass
 from hexset.bench.throughput import environment
 from hexset.board.board import random_base_board
 from hexn.expert import SearchPolicy
+from hexn.trade import trade_params
 from hexn.netbot import load, searcher_for
 from hexn.selfplay import Collector
 
@@ -93,7 +94,7 @@ def measure(
     device: str,
     compile_mode: str,
     inference_batch: int | None,
-    max_trades: int | None,
+    max_offers: int | None,
     actions_per_game: int,
     profile: bool = False,
     barrier=None,
@@ -104,7 +105,9 @@ def measure(
         load(checkpoint, board.topology, device, compile_mode),
         simulations=simulations,
         wave=wave,
-        max_trades=max_trades,
+        # `None` is the budget the checkpoint trained under, which `Loaded`
+        # declares as its own `trade_params`.
+        trade=None if max_offers is None else trade_params(max_offers),
         inference_batch=inference_batch,
         rng=random.Random(seed),
     )
@@ -117,7 +120,7 @@ def measure(
         seed=seed,
         players=players,
         board=board,
-        max_trades=search.max_trades,
+        max_offers=search.max_offers,
     )
 
     # One move first, so a compiled forward's warm-up is not billed to the run.
@@ -183,6 +186,7 @@ def main() -> int:
         help="pad leaf evaluations to this fixed batch size",
     )
     parser.add_argument(
+        "--max-offers",
         "--max-trades",
         type=int,
         default=None,
@@ -214,7 +218,7 @@ def main() -> int:
             device=args.device,
             compile_mode=args.compile_mode,
             inference_batch=args.inference_batch,
-            max_trades=args.max_trades,
+            max_offers=args.max_offers,
             actions_per_game=args.actions_per_game,
             profile=args.profile,
         )

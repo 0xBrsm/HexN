@@ -57,10 +57,10 @@ seven already uses), 550 -> 456. `globals` is 67.
   probability, nonnegative and summing to one across the row, not a points
   margin. One forward serves both callers:
   `NetworkBot` reads the index, a search reads the two distributions.
-* **Metadata props** (`hexset.clients.modelmeta` and `onnxbot._load_cached`):
+* **Metadata props** (`hexset.clients._modelmeta` and `onnxbot._load_cached`):
   `contract` is `hexset.onnx_record.CONTRACT_VERSION` (`"6"`); `players` and the
   `num_hexes`/`num_vertices`/
-  `num_edges` fingerprint are required; `max_trades` (`""` for none) and
+  `num_edges` fingerprint are required; `max_offers` (`""` for none) and
   `iteration` are read with defaults; and only when asked for on the command
   line, `search=mcts` with `simulations`/`wave`, and `gate_plies` (the trade
   gate's own continuation budget, independent of `search`). Inference device
@@ -142,6 +142,8 @@ _BATCH = "batch"
 # trading redesign shares the same contract), so importing it is what keeps a
 # deployed file's number equal to the record it speaks.
 from hexset.onnx_record import CONTRACT_VERSION as _CONTRACT_VERSION
+from . import runtime
+from .trade import recorded_budget
 
 # `action_mask` is the only bool input; every other input is int64 -- there
 # is no float input left now that contract 6 deleted the public valuation
@@ -151,7 +153,7 @@ _BOOL_INPUTS = frozenset({"action_mask"})
 _FLOAT_INPUTS: frozenset[str] = frozenset()
 _INT_OUTPUTS = frozenset({"action_index"})
 
-# The only value `hexset.clients.modelmeta.search_config` acts on; anything else in
+# The only value `hexset.clients._modelmeta.search_config` acts on; anything else in
 # the `search` key is read as "no search", so writing anything else would be
 # a silent no-op rather than a setting.
 _SEARCHES = ("none", "mcts")
@@ -536,8 +538,10 @@ def _load_checkpoint(
     net.fused = True
     return net, space, {
         "players": players,
-        "max_trades": args.get("max_trades"),
+        "max_offers": recorded_budget(args),
         "iteration": int(state.get("iteration", 0)),
+        # The trader the run trained with (`hexn.trade`), `None` for its own gate.
+        "trader": args.get("trader") or None,
     }
 
 
@@ -610,13 +614,14 @@ def _embed_metadata(
     *,
     topology: Topology,
     players: int,
-    max_trades: int | None,
+    max_offers: int | None,
     iteration: int,
     source_checkpoint: str,
     search: str,
     simulations: int | None,
     wave: int | None,
     gate_plies: int | None,
+    trader: str | None = None,
 ) -> None:
     """The facts `hexset.clients.onnxbot.load()` needs back at runtime: which
     contract the graph speaks, enough to build an `ActionSpace`, enough to
@@ -626,13 +631,13 @@ def _embed_metadata(
     reconstructing the torch module, and tracing already baked them in.
 
     `search`/`simulations`/`wave` are written only when a search was asked
-    for. `hexset.clients.modelmeta` would ignore a stray budget anyway ("a stale
+    for. `hexset.clients._modelmeta` would ignore a stray budget anyway ("a stale
     `simulations` left behind by an export cannot quietly turn a policy
     checkpoint into a search"), so leaving the keys out keeps the file's
     metadata saying exactly what it does. `gate_plies` -- the trade gate's
     own continuation budget, unrelated to `search` -- follows the same rule
     for the same reason: written only when this export was asked for one,
-    so a file that never asked reads at `hexset.clients.modelmeta`'s unmeasured
+    so a file that never asked reads at `hexset.clients._modelmeta`'s unmeasured
     default (no rollout) rather than whatever the exporter's own default
     happens to be."""
     import onnx
@@ -643,7 +648,7 @@ def _embed_metadata(
         "num_hexes": str(topology.num_hexes),
         "num_vertices": str(topology.num_vertices),
         "num_edges": str(topology.num_edges),
-        "max_trades": "" if max_trades is None else str(max_trades),
+        "max_offers": "" if max_offers is None else str(max_offers),
         "iteration": str(iteration),
         **_provenance(source_checkpoint),
     }
@@ -655,6 +660,10 @@ def _embed_metadata(
             props["wave"] = str(wave)
     if gate_plies is not None:
         props["gate_plies"] = str(gate_plies)
+    # Written only when there is one, like `gate_plies`: a file naming no
+    # trader trades through its own gate (`hexset.clients._modelmeta`).
+    if trader is not None:
+        props["trader"] = trader
 
     model = onnx.load(str(path))
     onnx.helper.set_model_props(model, props)
@@ -772,6 +781,7 @@ def export(
     simulations: int | None = None,
     wave: int | None = None,
     gate_plies: int | None = None,
+    trader: str | None = None,
 ) -> Path:
     """Load `checkpoint`, trace it to `out`, verify contract and parity, return `out`.
 
@@ -786,8 +796,12 @@ def export(
     Independent of `search` -- a plain policy file
     can still ask its gate to roll forward. `None`, the default, writes
     nothing, so training collection's own exports (which never pass this
-    flag) leave the served file to `hexset.clients.modelmeta`'s unmeasured
+    flag) leave the served file to `hexset.clients._modelmeta`'s unmeasured
     default of no rollout.
+
+    `trader` names a HexSet bot, as a lineup names it, to answer the served
+    file's trades while the network plays every move (`hexset.arena.traded`).
+    `None` writes the trader the run trained with, if it had one.
     """
     if search not in _SEARCHES:
         raise ValueError(f"search must be one of {_SEARCHES}, not {search!r}")
@@ -796,6 +810,11 @@ def export(
 
     topology = topology or _base_topology()
     net, space, meta = _load_checkpoint(checkpoint, topology)
+    if trader is not None:
+        from hexset.arena import entrant_from_name
+
+        entrant_from_name(trader)  # refuse a name HexSet cannot seat, here
+        meta["trader"] = trader
     players = meta["players"]
     graph = static_graph(topology)
     shapes = _shapes(graph, players, space)
@@ -877,7 +896,17 @@ def main(argv: list[str] | None = None) -> None:
         "mover's greedy policy rolls forward before an exchange is valued "
         "(hexset defaults to 0, no rollout, caps at 16). Independent of --search.",
     )
+    parser.add_argument(
+        "--trader",
+        default=None,
+        help="A bot, as a lineup names it (e.g. 'heximax', registered by a "
+        "--runtime), that answers the served file's trades while the network "
+        "plays every move. Default: the trader the run trained with, if any. "
+        "Written as metadata; the server that loads the file needs the same runtime.",
+    )
+    runtime.add_argument(parser)
     args = parser.parse_args(argv)
+    runtime.load(args.runtime)
     if args.search == "none" and (args.simulations is not None or args.wave is not None):
         parser.error("--simulations/--wave need --search mcts")
 
@@ -891,6 +920,7 @@ def main(argv: list[str] | None = None) -> None:
         simulations=args.simulations,
         wave=args.wave,
         gate_plies=args.gate_plies,
+        trader=args.trader,
     )
     print(f"wrote {path}")
 

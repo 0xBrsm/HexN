@@ -5,7 +5,7 @@ import pytest
 
 torch = pytest.importorskip("torch", reason="PyTorch runs on the training box only")
 
-from hexn.league import OVERRIDES, nudged, parse_learner, standings  # noqa: E402
+from hexn.league import nudged, parse_learner, standings  # noqa: E402
 from hexn.ppo import PPOConfig  # noqa: E402
 from hexn.selfplay import Episode, Outcome  # noqa: E402
 
@@ -57,14 +57,69 @@ def test_standings_count_wins_and_vp_by_cast():
     assert vp[0] == pytest.approx(vp[1]), "symmetric fixtures score level"
 
 
-def test_every_override_key_names_a_real_config_field():
-    fields = set(PPOConfig().__dataclass_fields__)
-    assert all(name in fields for name, _ in OVERRIDES.values())
 
+def test_a_relaunched_heat_resumes_each_seat_from_its_own_state(tmp_path, monkeypatch):
+    """The heat's own manifest launched again over its checkpoints resumes,
+    with no `--resume`: each seat from its own config -- the controller's
+    moved coefficient, not the override re-parsed -- and the standings summed
+    once over the iterations the checkpoints hold."""
+    import json
+    import pathlib
+    import random
 
-def test_both_head_knobs_are_frozen_into_a_league_manifest():
-    """`hexn.run.init` freezes whatever the parser defines, so a heat that
-    ran the quantile head cannot be reconstructed as one that did not."""
-    from hexn.run import parameters
+    from hexset.actions import build_space
+    from hexset.board.board import random_base_board
+    from hexset.encoding import static_graph
 
-    assert {"value_head", "quantiles"} <= parameters("league")
+    from hexn import league
+    from hexn.model import HexNet, ModelConfig
+    from hexn.run import freeze
+
+    board = random_base_board(random.Random(0))
+    topology = board.topology
+    space = build_space(
+        topology.num_vertices, topology.num_edges, topology.num_hexes, 4
+    )
+    net = HexNet(space, static_graph(topology), 4, ModelConfig(width=8, rounds=1))
+    base = tmp_path / "base.pt"
+    torch.save({"net": net.state_dict(), "args": {"width": 8, "rounds": 1}}, base)
+    heat = tmp_path / "heat"
+
+    def launch(iterations):
+        argv = [
+            "--base", str(base),
+            "--learner", "epochs=1,minibatch=256",
+            "--learner", "epochs=1,minibatch=256,target_entropy=5.0",
+            "--iterations", str(iterations), "--games-per-iteration", "2",
+            "--lanes", "2", "--collect-workers", "1", "--device", "cpu",
+            "--action-cap", "100", "--max-offers", "0",
+            "--checkpoint-dir", str(heat),
+        ]
+        freeze("league", "heat", heat, argv, repo=pathlib.Path(tmp_path),
+               description="test heat")
+        return league.main([str(heat)])
+
+    assert launch(1) == 0
+    moved = torch.load(heat / "learner1" / "latest.pt", weights_only=False)
+    coefficient = moved["config"]["entropy_coefficient"]
+    assert coefficient != PPOConfig().entropy_coefficient, "the controller moved it"
+    assert "torch_rng" in moved
+
+    seen = []
+    real_update = league.update
+
+    def update(policy, optimiser, batch, config):
+        seen.append(config.entropy_coefficient)
+        return real_update(policy, optimiser, batch, config)
+
+    monkeypatch.setattr(league, "update", update)
+    assert launch(2) == 0
+
+    assert seen[1] == coefficient, "learner 1 carried on from its own coefficient"
+    rows = [json.loads(line) for line in (heat / "log.jsonl").read_text().splitlines()]
+    assert rows[1] == {"resumed_from": 1}
+    first, second = rows[0], rows[2]
+    assert second["iteration"] == 1
+    assert second["standings"] == [
+        a["wins"] + b["wins"] for a, b in zip(first["learners"], second["learners"])
+    ]

@@ -23,13 +23,14 @@ import pytest
 
 from hexset.actions import ActionSpace, build_space
 from hexset.board.board import random_base_board
+from hexset.economy import hand_size
 from hexset.clients.netbot import (
     GatedSearch,
     LeafEvaluator,
     NetworkBot,
-    bot_for,
     register_entrants,
 )
+from hexn.trade import trade_params
 from hexset.game import start
 from hexset.mcts import Search
 from hexset.trading import one_for_one
@@ -60,14 +61,17 @@ class StubPolicy:
         ]
 
     def _value(self, game):
-        hands = game.state(0, hidden=False).hands
-        return tuple(float(sum(hand)) for hand in hands)
+        # By size: the gate values the position an exchange leaves from its
+        # own seat's frame, where the other seats' hands are hidden piles
+        # (HexSet 1.1), so their composition cannot be read.
+        state = game.state(0, hidden=False)
+        return tuple(float(hand_size(state, seat)) for seat in range(state.num_players))
 
-    def trader(self, game, seat, max_trades=None):
+    def trader(self, game, seat, max_offers=None):
         gate = NetworkBot(
             policy=self,
             players=PLAYERS,
-            max_trades=max_trades,
+            trade=trade_params(max_offers),
             seat=seat,
         )
         gate.seat_at(game)
@@ -82,7 +86,7 @@ class StubCheckpoint:
     policy: StubPolicy
     space: ActionSpace
     players: int = PLAYERS
-    max_trades: int | None = None
+    max_offers: int | None = None
 
 
 @pytest.fixture
@@ -108,9 +112,12 @@ def test_a_searched_seat_trades_through_the_same_gate_its_policy_would(board):
     position, not a second implementation."""
     checkpoint = a_checkpoint(board)
     game = start(board, PLAYERS, random.Random(2))
-    # A hand, so the candidate below is coverable: an uncoverable one is
-    # refused before the value head sees it and would pass this vacuously.
+    # Hands on both sides, so the candidate below is coverable: an
+    # uncoverable one -- this seat's hand short, or the counterparty's public
+    # hand with no room for its side -- is refused before the value head sees
+    # it and would pass this vacuously.
     game.state(0, hidden=False).hands[1] = [3] * 5
+    game.state(0, hidden=False).hands[2] = [3] * 5
     search = Search(
         LeafEvaluator(policy=checkpoint.policy),
         simulations=4,
@@ -170,11 +177,6 @@ def test_the_entrant_kinds_a_runtime_registers_come_out_in_the_right_shape(
     assert isinstance(plain, NetworkBot)
     assert isinstance(searched, GatedSearch)
     assert isinstance(searched.gate, NetworkBot)
-
-
-def test_a_bot_built_from_a_checkpoint_is_the_engine_s(board):
-    """`bot_for` is the only construction path left on this side."""
-    assert isinstance(bot_for(a_checkpoint(board)), NetworkBot)
 
 
 @pytest.fixture

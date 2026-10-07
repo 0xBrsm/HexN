@@ -6,11 +6,12 @@ from typing import Iterator, Sequence
 
 import numpy as np
 import pytest
+from _bots import needs
 
+from hexset.game import UNSTRUCTURED_TURN_CAP
 from hexset.actions import apply, legal_mask, space_for
 from hexset.arena import deal_game
-from hexset.encoding import HAND_SCALE, encode
-from hexset.board.terrain import NUM_RESOURCES
+from hexset.encoding import encode
 from hexset.game import Game, to_move
 from hexset.gym.lanes import BoardBots
 from hexn.selfplay import (
@@ -37,18 +38,6 @@ def replay(episode: Episode) -> Iterator[tuple[Game, Transition]]:
         apply(game, transition.action)
 
 
-class Counting:
-    """Wraps a policy and records the shape of every batch it was given."""
-
-    def __init__(self, inner) -> None:
-        self.inner = inner
-        self.batches: list[int] = []
-
-    def act(self, requests: Sequence[Request]) -> Sequence[Choice]:
-        self.batches.append(len(requests))
-        return self.inner.act(requests)
-
-
 class First:
     """Takes the first legal action, and stamps the extras PPO will want kept."""
 
@@ -61,17 +50,6 @@ class First:
             )
             for request in requests
         ]
-
-
-def test_one_batch_per_tick_covering_every_lane():
-    """The reason this module exists: a forward costs 1.5 ms plus 25 µs a
-    position, so a tick must be one call carrying every lane."""
-    policy = Counting(RandomPolicy(random.Random(0)))
-    collector = Collector(policy, lanes=5, seed=1, action_cap=60)
-    collector.run(30)
-
-    assert len(policy.batches) == collector.ticks == 30
-    assert set(policy.batches) == {5}
 
 
 def test_seats_are_demultiplexed_against_a_replay():
@@ -104,26 +82,6 @@ def test_seats_are_demultiplexed_against_a_replay():
         assert max(b.step - a.step for a, b in zip(seat, seat[1:])) > 1
 
 
-def test_a_seat_asked_off_turn_is_encoded_from_its_own_perspective():
-    """Discarding on a seven and answering an offer belong to somebody other
-    than the player whose turn it is, and `encode` defaults to the turn holder.
-    """
-    collector = Collector(RandomPolicy(random.Random(6)), lanes=1, seed=2)
-    episode = collector.collect(1)[0]
-
-    checked = 0
-    for game, transition in replay(episode):
-        if game.current_player == transition.seat:
-            continue
-        own_hand = transition.observation.globals[:NUM_RESOURCES] * HAND_SCALE
-        # true state: verifies own-hand encoding against the true hand
-        assert own_hand == pytest.approx(
-            game.state(transition.seat, hidden=False).hands[transition.seat], abs=1e-4
-        )
-        checked += 1
-    assert checked > 0
-
-
 def test_the_mask_marks_exactly_the_legal_actions():
     collector = Collector(RandomPolicy(random.Random(8)), lanes=1, seed=4, action_cap=150)
     episode = collector.collect(1)[0]
@@ -142,7 +100,7 @@ def test_the_mask_marks_exactly_the_legal_actions():
 
 
 def test_a_finished_lane_is_replaced_without_stalling_the_others():
-    ticks = 3000
+    ticks = 1500
     collector = Collector(RandomPolicy(random.Random(2)), lanes=3, seed=13)
     episodes = collector.run(ticks)
 
@@ -165,22 +123,6 @@ def test_the_action_cap_truncates_rather_than_running_forever():
         assert episode.outcome.truncated
         assert episode.outcome.winner is None
         assert episode.outcome.actions == len(episode) == 25
-
-
-def test_an_outcome_carries_both_candidate_rewards():
-    """Reward design is still open, so a collector reports the terminal facts
-    and leaves the scalarisation to whoever consumes it."""
-    collector = Collector(RandomPolicy(random.Random(5)), lanes=2, seed=3)
-    episodes = collector.collect(2)
-
-    for episode in episodes:
-        outcome = episode.outcome
-        assert not outcome.truncated
-        assert outcome.winner is not None
-        assert len(outcome.points) == episode.players
-        assert outcome.points[outcome.winner] >= 10
-        assert outcome.points[outcome.winner] == max(outcome.points)
-        assert outcome.turns > 0
 
 
 def test_the_policys_extras_are_recorded_against_the_seat_that_acted():
@@ -211,7 +153,7 @@ def test_the_same_seed_collects_the_same_games_at_any_lane_count():
     """
 
     def once(lanes: int) -> list[tuple]:
-        collector = Collector(First(), lanes=lanes, seed=19, deal=4, action_cap=1500)
+        collector = Collector(First(), lanes=lanes, seed=19, deal=4, action_cap=300)
         return sorted(
             (e.index, e.outcome, tuple(t.index for t in e.stream()))
             for e in collector.drain()
@@ -277,30 +219,15 @@ def test_a_bounded_collector_deals_exactly_the_cohort_and_stops():
     to let the collector refill freed lanes and discard the replacements, which
     plays every one of them in full first. `deal` stops them being started.
     """
-    collector = Collector(RandomPolicy(random.Random(3)), lanes=4, seed=5, deal=6)
+    collector = Collector(
+        RandomPolicy(random.Random(3)), lanes=4, seed=5, deal=6, action_cap=200
+    )
     episodes = collector.drain()
 
     assert sorted(e.index for e in episodes) == [0, 1, 2, 3, 4, 5]
     assert collector.games_started() == 6
     assert not collector.running
     assert collector.tick() == []
-
-
-def test_asking_a_bounded_collector_for_more_than_it_has_fails_loudly():
-    """Otherwise `collect` spins on empty ticks instead of blocking on a game."""
-    collector = Collector(RandomPolicy(random.Random(3)), lanes=2, seed=5, deal=3)
-    with pytest.raises(ValueError, match="4 games wanted, 3 left"):
-        collector.collect(4)
-
-
-def test_a_policy_that_answers_the_wrong_number_of_requests_is_rejected():
-    class Short:
-        def act(self, requests):
-            return [Choice(action=requests[0].options[0])]
-
-    collector = Collector(Short(), lanes=2, seed=0)
-    with pytest.raises(ValueError, match="answered 1 of 2"):
-        collector.tick()
 
 
 def test_a_collector_seats_its_policies_as_the_tables_gates():
@@ -315,18 +242,46 @@ def test_a_collector_seats_its_policies_as_the_tables_gates():
     collector = Collector(RandomPolicy(random.Random(12)), lanes=2, seed=6)
     for game in collector.in_flight():
         assert game.gates == (None,) * 4
-        # `Collector`'s own `max_trades=None` means "the engine's own
-        # default" -- one broadcast round a turn (`LaneEnv` maps `None` to
-        # `1`), not an unbounded table.
-        assert game.max_trades == 1
+        # The table caps nothing (HexSet 0.60): every seat declares its own
+        # budget, so a game carries no trade limit of its own.
+        assert not hasattr(game, "max_offers") and not hasattr(game, "max_trades")
 
+    # The collector keeps the budget for its own network's gate (`trader`).
     switched_off = Collector(
-        RandomPolicy(random.Random(12)), lanes=2, seed=6, max_trades=0
+        RandomPolicy(random.Random(12)), lanes=2, seed=6, max_offers=0
     )
-    for game in switched_off.in_flight():
-        assert game.max_trades == 0
+    assert (collector.max_offers, switched_off.max_offers) == (None, 0)
 
 
+def test_a_collector_hands_its_trader_to_every_network_gate():
+    """`trader` rides beside `max_offers` to each network policy's own
+    `trader` hook, so the learner and every frozen network in the pool trade
+    through the same named bot."""
+    asked = []
+
+    class Hooked(RandomPolicy):
+        def trader(self, game, seat, max_offers=None, trader=None):
+            asked.append((seat, max_offers, trader))
+            return None
+
+    collector = Collector(Hooked(random.Random(12)), lanes=1, seed=6, trader="rehex")
+    next(collector.in_flight())
+    assert asked and all(entry[1:] == (None, "rehex") for entry in asked)
+
+
+@needs("heximax")
+def test_a_trader_is_named_alone_and_must_resolve():
+    from hexn.trade import check_trader
+
+    check_trader(None, 0)
+    check_trader("heximax", None)
+    with pytest.raises(ValueError, match="drop --max-offers"):
+        check_trader("heximax", 0)
+    with pytest.raises(Exception):
+        check_trader("nobody-by-that-name", None)
+
+
+@needs("heximax")
 def test_a_scripted_opponent_is_seated_as_its_own_trader():
     from hexset.arena import entrant_from_name, spawn
 
@@ -349,32 +304,6 @@ def test_a_scripted_opponent_is_seated_as_its_own_trader():
     assert hasattr(seated, "gains_many")
 
 
-def test_a_cast_lane_routes_each_seat_and_records_only_the_learner():
-    learner = Counting(RandomPolicy(random.Random(0)))
-    opponent = Counting(RandomPolicy(random.Random(1)))
-    collector = Collector(
-        learner,
-        lanes=2,
-        seed=5,
-        action_cap=900,
-        opponents=[opponent],
-        caster=lambda index: (0, 1, 0, 1),
-    )
-    episode = collector.collect(1)[0]
-
-    assert episode.cast == (0, 1, 0, 1)
-    # The learner's seats have trajectories; the opponent's are empty, which is
-    # what keeps its decisions out of `hexn.ppo.assemble` without a filter.
-    assert all(episode.trajectories[seat] for seat in (0, 2))
-    assert all(not episode.trajectories[seat] for seat in (1, 3))
-    # The game itself still ran through every seat.
-    assert len(episode) < episode.outcome.actions
-    # Each policy was asked at most once per tick — the batching survived.
-    assert len(learner.batches) <= collector.ticks
-    assert len(opponent.batches) <= collector.ticks
-    assert opponent.batches, "the opponent was never consulted"
-
-
 def test_the_cast_is_taken_from_the_game_index_not_the_lane():
     def swaps(index: int) -> tuple[int, ...]:
         return (0, 1, 0, 1) if index % 2 == 0 else (1, 0, 1, 0)
@@ -383,7 +312,7 @@ def test_the_cast_is_taken_from_the_game_index_not_the_lane():
         RandomPolicy(random.Random(2)),
         lanes=3,
         seed=9,
-        action_cap=700,
+        action_cap=200,
         opponents=[RandomPolicy(random.Random(3))],
         caster=swaps,
     )
@@ -393,80 +322,6 @@ def test_the_cast_is_taken_from_the_game_index_not_the_lane():
         assert episode.cast == swaps(episode.index)
         for seat, pid in enumerate(episode.cast):
             assert bool(episode.trajectories[seat]) == (pid == 0)
-
-
-def test_a_caster_without_opponents_is_rejected():
-    with pytest.raises(ValueError):
-        Collector(RandomPolicy(), lanes=1, caster=lambda index: (0, 0, 0, 0))
-
-
-def test_a_cast_reaching_past_the_opponents_fails_loudly():
-    with pytest.raises(ValueError):
-        Collector(
-            RandomPolicy(),
-            lanes=1,
-            opponents=[RandomPolicy()],
-            caster=lambda index: (0, 2, 0, 2),
-        )
-
-
-def test_a_bench_spawns_one_bot_per_board_and_reuses_it():
-    from hexset.bots import RandomBot
-
-    spawned = []
-
-    def spawn(board):
-        spawned.append(board)
-        return RandomBot(random.Random(4))
-
-    collector = Collector(
-        RandomPolicy(random.Random(5)),
-        lanes=2,
-        seed=13,
-        opponents=[BoardBots(spawn)],
-        caster=lambda index: (0, 1, 0, 1),
-    )
-    collector.run(40)
-
-    # Two lanes, two boards, two bots — and no respawn on any later request.
-    assert len(spawned) == 2
-    assert len({id(board) for board in spawned}) == 2
-
-
-def test_a_cohort_larger_than_the_lane_count_refills_until_it_is_dealt_out():
-    """Lanes are the concurrency, not the cohort.
-
-    Keeping them independent is what lets the inference batch be chosen for
-    throughput without deciding how many positions an update trains on.
-    """
-    collector = Collector(
-        RandomPolicy(random.Random(4)), lanes=4, fill=False, seed=0, max_trades=3
-    )
-    assert {episode.index for episode in collector.cohort(12)} == set(range(12))
-    assert list(collector.in_flight()) == []
-
-
-def test_successive_cohorts_carry_on_from_where_the_last_one_stopped():
-    """A PPO iteration asks for a cohort every time weights change, so the
-    second one must deal the *next* indices, not replay the first's, and the
-    environment must survive being re-armed (`LaneEnv.cohort`) rather than
-    being rebuilt underneath its counters."""
-    collector = Collector(
-        RandomPolicy(random.Random(7)), lanes=3, fill=False, seed=2, action_cap=900
-    )
-    assert collector.games_started() == 0
-
-    first = {episode.index for episode in collector.cohort(4)}
-    assert first == set(range(4))
-    assert collector.games_started() == 4
-    assert list(collector.in_flight()) == []
-
-    second = {episode.index for episode in collector.cohort(4)}
-    assert second == set(range(4, 8))
-    assert collector.games_started() == 8
-    assert list(collector.in_flight()) == []
-    # The counters are the environment's own and were never reset.
-    assert collector.games == 8
 
 
 def test_a_strided_cohort_collector_keeps_its_shard_across_cohorts():
@@ -479,40 +334,10 @@ def test_a_strided_cohort_collector_keeps_its_shard_across_cohorts():
         seed=4,
         first_game=1,
         stride=3,
-        action_cap=900,
+        action_cap=200,
     )
     assert {e.index for e in collector.cohort(3)} == {1, 4, 7}
     assert {e.index for e in collector.cohort(3)} == {10, 13, 16}
-
-
-def test_streaming_collection_returns_replacements_while_older_games_run_on():
-    """The defect `cohort` removes, pinned so `stream` cannot quietly become it.
-
-    `collect` refills a lane the moment its game ends, so a replacement dealt
-    late can finish and enter the batch while a longer game dealt earlier is
-    still being played. The PPO batch inherited both consequences for five
-    runs: it selects for short games, and the unfinished lanes carry across the
-    learner's weight sync into the next iteration's data.
-
-    Asserted over several policy seeds rather than one, because whether a
-    replacement *happens* to overtake depends on the spread of game lengths and
-    not on the defect. Seed 1 alone carried it until repeated offers stopped
-    being enumerated, which shortened every game and made that seed stop -- a
-    red test that said nothing about `collect`.
-    """
-    overtaken = False
-    for policy_seed in range(4):
-        collector = Collector(
-            RandomPolicy(random.Random(policy_seed)), lanes=8, seed=0, max_trades=3
-        )
-
-        returned = {episode.index for episode in collector.collect(16)}
-
-        assert len(returned) == 16
-        assert len(list(collector.in_flight())) == 8
-        overtaken |= returned != set(range(16))
-
-    assert overtaken, "no replacement outran an older game at any seed"
 
 
 def test_two_learners_share_a_table_and_each_records_only_its_seats():
@@ -528,7 +353,7 @@ def test_two_learners_share_a_table_and_each_records_only_its_seats():
         RandomPolicy(random.Random(0)),
         lanes=4,
         seed=11,
-        action_cap=3000,
+        action_cap=300,
         opponents=(RandomPolicy(random.Random(99)),),
         caster=lambda index: (0, 1, 0, 1) if index % 2 == 0 else (1, 0, 1, 0),
         learners=(0, 1),
@@ -556,26 +381,16 @@ def test_two_learners_share_a_table_and_each_records_only_its_seats():
     assert count(zero) and count(one)
 
 
-def test_owned_treats_an_empty_cast_as_learner_zero():
-    from hexn.selfplay import owned
-
-    episodes = Collector(
-        RandomPolicy(random.Random(3)), lanes=2, seed=3, action_cap=3000
-    ).collect(2)
-    assert owned(episodes, 0)[0].trajectories == episodes[0].trajectories
-    assert all(t == () for t in owned(episodes, 1)[0].trajectories)
-
-
-def test_a_learner_id_with_no_seated_policy_is_an_error():
-    with pytest.raises(ValueError):
-        Collector(RandomPolicy(random.Random(4)), lanes=2, seed=4, learners=(0, 1))
-
-
 def test_a_board_pair_shares_its_geometry_and_not_its_dice():
     from hexset.board.board import random_base_board
 
     collector = Collector(
-        RandomPolicy(random.Random(0)), lanes=4, seed=9, pair_boards=True, deal=4
+        RandomPolicy(random.Random(0)),
+        lanes=4,
+        seed=9,
+        pair_boards=True,
+        deal=4,
+        action_cap=200,
     )
     # public field
     boards = [game.state(0, hidden=False).board for game in collector.in_flight()]

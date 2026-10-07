@@ -29,10 +29,22 @@ On a resume, `games_started()` reports the *max* over the workers' counters.
 Indices between the slowest and fastest worker's next deal are skipped rather
 than replayed — unused seeds, not lost games — and the same rule makes a
 resume safe across a change in worker count.
+
+**A worker keeps each game on disk the moment it finishes.** Handed a
+`hexn.durable.Partial`, it writes every finished episode there before the
+cohort is done, so a crash mid-iteration loses only the games still in
+flight; the resumed iteration loads the rest and deals only the missing
+indices. The parent never waits on a pipe blindly: it polls, and a worker
+that has died, or has gone `STALL_SECONDS` without a tick, fails the run
+with a sentence rather than hanging it. While it waits it writes a
+`heartbeat.json` saying what each worker is doing.
 """
 
 from __future__ import annotations
 
+import ctypes
+import gc
+import json
 import multiprocessing as mp
 import random
 import time
@@ -47,26 +59,43 @@ import numpy as np
 
 from hexset.actions import build_space
 from hexset.board.board import Board, random_base_board
-import hexset.bots  # noqa: F401  -- see `named_opponent`
 from hexset.encoding import Observation, static_graph
 # Re-exported under its own name: `hexn.loop` and the run configs say
 # `collect.alternating`, and the law itself is HexSet's.
 from hexset.casting import alternating  # noqa: F401
 from hexset.casting import league_rotation, paired
 from hexset.gym.lanes import BoardBots
+from . import runtime
+from .durable import Partial, write_atomic
 from .model import HexNet, ModelConfig, Packing, packing
 from .policy import NetworkPolicy
 from .selfplay import BatchPolicy, Collector, Episode, Transition
 
+# How long a busy worker may go without a tick before it counts as wedged. A
+# tick is one decision per lane, searched or not, so this is generous: what it
+# catches is a game stuck inside one engine step, which no action cap ends.
+STALL_SECONDS = 1800.0
+# How often the parent looks up from a pipe to check on its workers.
+POLL_SECONDS = 5.0
 
-def frozen(path: str, device: str, board: Board, players: int) -> NetworkPolicy:
-    """A checkpoint as a fixed greedy policy — a ladder rung or a lane opponent.
 
-    Greedy argmax rather than sampling, so these numbers stay comparable with
-    the arena's `network:` entrants, and `.eval()` with no optimiser anywhere
-    means nothing here can train. Width, rounds and the head shapes come from
-    the checkpoint's own recorded args, not the run's, so a differently-sized or
-    differently-shaped parent still loads.
+def frozen(
+    path: str,
+    device: str,
+    board: Board,
+    players: int,
+    *,
+    greedy: bool = True,
+    generator: torch.Generator | None = None,
+) -> NetworkPolicy:
+    """A checkpoint as a fixed policy — a ladder rung or a lane opponent.
+
+    Greedy argmax by default, so these numbers stay comparable with the
+    arena's `network:` entrants; `greedy=False` is a `sampled:` pool member
+    (`SAMPLED`), drawing from its own `generator`. Either way `.eval()` with
+    no optimiser anywhere means nothing here can train. Width, rounds and the
+    head shapes come from the checkpoint's own recorded args, not the run's,
+    so a differently-sized or differently-shaped parent still loads.
     """
     state = torch.load(path, map_location=device, weights_only=False)
     stored = state.get("args", {})
@@ -85,12 +114,18 @@ def frozen(path: str, device: str, board: Board, players: int) -> NetworkPolicy:
             value_head=str(stored.get("value_head", "linear")),
             policy_head=str(stored.get("policy_head", "linear")),
             quantiles=int(stored.get("quantiles", 32)),
+            fast_win=bool(stored.get("fast_win")),
         ),
     ).to(device)
     net.load_state_dict(state["net"])
     net.eval()
     return NetworkPolicy(
-        net, space, packing(graph, players), device=device, greedy=True
+        net,
+        space,
+        packing(graph, players),
+        device=device,
+        greedy=greedy,
+        generator=generator,
     )
 
 
@@ -101,17 +136,14 @@ def named_opponent(name: str, seed: int, lanes: int) -> BoardBots:
     a rung is *literally* the entrant the arena scores, not a fresh
     reimplementation that happens to share a name.
 
-    **`heximax` resolves here because this module imports `hexset.bots`.**
-    `"heximax"` is not built into `hexset.arena.PRESETS`:
-    `hexset.bots.heximax` registers it at import (`register_preset`), so a
-    collector that never imported the package would fail `--mix heximax=...`
-    at launch with `unknown entrant`. The separate adaptive/balanced/notrade
-    presets (`"heximax-notrade"` among them) are gone -- one policy now
-    covers what they used to split, with `heximax:pin-weights=1` still an
-    endpoint for testing. The module-level `import hexset.bots` above is
-    what makes the registration happen in every
-    process that builds a lane opponent, and
-    `test_heximax_resolves_as_a_mix_opponent` pins it.
+    **A bot resolves here only once its runtime is loaded.** HexSet ships
+    no playing bots: `heximax` and `rehex` are registered with `hexset.arena`
+    by the runtime module that carries them (`register_preset`), so a
+    process that never loaded it fails `--mix heximax=...` with `unknown
+    entrant`. The trainers load their `--runtime` at start, and every worker
+    loads `WorkerSpec.runtime` before it builds a lane opponent
+    (`hexn.runtime`); `test_heximax_resolves_as_a_mix_opponent` pins the
+    resolution.
 
     The import is function-scoped because `hexset.arena` reaches for torch on some
     entrant kinds and `hexn.selfplay` imports this module; the collector is
@@ -168,6 +200,36 @@ SELF = "self"
 # a pool without a band draws no extra randomness, so its casts are unchanged.
 SELF_BAND = "~"
 
+# `sampled:network:<path>` is a bare `network:` member that samples its
+# policy at temperature 1.0 instead of taking the argmax -- the distribution
+# it was trained on, which for an RL net is its own behaviour policy. A
+# greedy checkpoint answers a position the same way every time, which the
+# learner can memorise and exploit; a sampled one cannot be read that way. Its sampling stream is
+# seeded per worker and per entry (`mix_opponents`). Only a bare
+# `network:` spec qualifies: a scripted bot or an `@trades` override has no
+# policy to sample.
+SAMPLED = "sampled:"
+
+
+def sampled_spec(name: str) -> str | None:
+    """The `network:` spec a `sampled:` member plays, None for any other
+    name."""
+    return name[len(SAMPLED):] if name.startswith(SAMPLED) else None
+
+
+def _bare_network(name: str):
+    """The entrant a bare `network:<path>` names -- one `frozen` can play --
+    or None for any other name."""
+    from hexset.arena import entrant_from_name
+
+    try:
+        entrant = entrant_from_name(name)
+    except (KeyError, ValueError):
+        return None
+    if entrant.kind == "network" and entrant.trade is None and isinstance(entrant.weights, str):
+        return entrant
+    return None
+
 
 def self_band(member: str) -> float | None:
     """The temperature half-width of a `self` pool member, None for any other
@@ -203,6 +265,7 @@ def mix_opponents(
     board: Board | None = None,
     players: int = 4,
     device: str = "cpu",
+    torch_seed: int | None = None,
 ) -> list[BatchPolicy | BoardBots]:
     """The `--mix` names as lane opponents, in caster id order.
 
@@ -216,11 +279,10 @@ def mix_opponents(
     than `named_opponent`'s `hexset.arena.spawn`, whose `NetworkBot` answers
     one position at a time: a batch-of-one pays the network's whole dispatch
     toll per lane per tick, exactly the per-iteration GPU cost batching
-    through `frozen` exists to avoid. `network:<path>@<trades>` keeps a fixed trade
-    switch regardless of the run's own `--max-trades` (the entrant's own
-    override, applied at `hexset.arena.spawn` time) — `frozen`'s policy has
-    no such override and would silently lose it, so only the bare form
-    qualifies. Every other name is an arena entrant spec resolved by
+    through `frozen` exists to avoid. `network:<path>@0`, HexSet's no-trade
+    spelling, carries its own `TradeParams` (`Entrant.trade`, applied at
+    `hexset.arena.spawn` time) — `frozen`'s policy has no such override and
+    would silently lose it, so only the bare form qualifies. Every other name is an arena entrant spec resolved by
     `named_opponent`, which is what makes `heximax` or `mcts:<ckpt>@64` a
     training opponent without a branch here per bot, and makes the opponent
     a run trained against *literally* the entrant the arena scores.
@@ -236,9 +298,11 @@ def mix_opponents(
     spawn time, one bot per lane's own board). A bare entry with no `board`
     falls back to `named_opponent` too, so a caller that never passes one
     (there are none left in this tree) keeps today's behaviour.
-    """
-    from hexset.arena import entrant_from_name
 
+    `torch_seed`, a worker's own, seeds a `sampled:` member's stream, so two
+    workers sharing the board seed do not sample in lockstep; without it the
+    stream falls back to the entry's `seed`.
+    """
     out: list[BatchPolicy | BoardBots] = []
     for k, name in enumerate(mix_names(mix)):
         if name == "parent":
@@ -246,24 +310,59 @@ def mix_opponents(
                 raise ValueError("the 'parent' mix opponent needs a parent checkpoint")
             out.append(parent())
         else:
-            entrant = None
-            try:
-                entrant = entrant_from_name(name)
-            except (KeyError, ValueError):
-                pass
-            if (
-                entrant is not None
-                and entrant.kind == "network"
-                and entrant.max_trades is None
-                and board is not None
-                and isinstance(entrant.weights, str)
-            ):
-                out.append(frozen(entrant.weights, device, board, players))
-            else:
-                # A stream per entry, so two entrants in one mix do not break
-                # their tie-breaks in lockstep. 77 stays where it was.
-                out.append(named_opponent(name, seed + 700 + k, lanes))
+            # A stream per entry, so two entrants in one mix do not break
+            # their tie-breaks in lockstep. 77 stays where it was.
+            out.append(
+                rung_opponent(
+                    name,
+                    seed=seed + 700 + k,
+                    lanes=lanes,
+                    board=board,
+                    players=players,
+                    device=device,
+                    sample_seed=None if torch_seed is None else torch_seed + 700 + k,
+                )
+            )
     return out
+
+
+def rung_opponent(
+    name: str,
+    *,
+    seed: int,
+    lanes: int,
+    board: Board | None,
+    players: int,
+    device: str,
+    sample_seed: int | None = None,
+) -> BatchPolicy | BoardBots:
+    """One named opponent, batched when it can be: a bare `network:<path>`
+    is `frozen` -- one forward per tick for every lane, and bargaining under
+    the run's own offer budget like every other network seat -- and every
+    other name is `named_opponent`'s arena entrant. A `sampled:` member
+    (`SAMPLED`) is the same `frozen` policy sampling from a generator seeded
+    by `sample_seed`, or `seed` without one. Shared by `mix_opponents` and
+    the PPO ladder's `--search-rung`, so a network means the same thing as a
+    lane opponent and as a rung."""
+    inner = sampled_spec(name)
+    if inner is not None:
+        entrant = _bare_network(inner)
+        if entrant is None or board is None:
+            raise ValueError(f"{SAMPLED} needs a bare network:<path> and a board: {name}")
+        return frozen(
+            entrant.weights,
+            device,
+            board,
+            players,
+            greedy=False,
+            generator=torch.Generator().manual_seed(
+                seed if sample_seed is None else sample_seed
+            ),
+        )
+    entrant = _bare_network(name)
+    if entrant is not None and board is not None:
+        return frozen(entrant.weights, device, board, players)
+    return named_opponent(name, seed, lanes)
 
 
 def check_mix(mix: Sequence[tuple[str, float]], *, have_parent: bool) -> None:
@@ -286,10 +385,19 @@ def check_mix(mix: Sequence[tuple[str, float]], *, have_parent: bool) -> None:
             if not have_parent:
                 raise SystemExit("--mix parent needs --parent <checkpoint>")
             continue
+        inner = sampled_spec(name)
+        if inner is not None and _bare_network(inner) is None:
+            raise SystemExit(
+                f"--mix {name}: {SAMPLED} takes a bare network:<path>, nothing else"
+            )
+        spec = name if inner is None else inner
         try:
-            entrant = entrant_from_name(name)
+            entrant = entrant_from_name(spec)
         except (KeyError, ValueError):
-            raise SystemExit(f"unknown mix opponent: {name}") from None
+            hint = f" (a `{TARGETED}` member needs --runtime hexn.coalition)" if spec.startswith(TARGETED) else ""
+            raise SystemExit(f"unknown mix opponent: {name}{hint}") from None
+        if spec.startswith(TARGETED):
+            entrant = entrant_from_name(spec[len(TARGETED):])
         if isinstance(entrant.weights, str) and not Path(entrant.weights).exists():
             raise SystemExit(
                 f"--mix {name} names a checkpoint that is not there: {entrant.weights}"
@@ -330,17 +438,183 @@ def paired_caster(caster):
 # table; `table(...)` is what makes a fully heterogeneous table expressible.
 TABLE = "table("
 
+# A mix entry whose name reads `duel(a|b|c)` casts a *duel*: a two-seat game
+# under HexSet's duel-variant rules (`DUEL_VARIANT_GAME`), dealt as a full
+# table with two seats retired. The learner takes a drawn seat, its opponent
+# one of the other three -- so the opponent sits one, two or three seats
+# round from it, uniformly -- drawn from the pool with replacement (`self` is
+# the learner again), and the two seats left over are retired and never move.
+# Seats and pool members are drawn per game index like a table's.
+DUEL = "duel("
 
-def table_pool(name: str) -> list[str] | None:
-    """The pool a `table(...)` entry draws from, or None for a plain entry."""
-    if not name.startswith(TABLE):
+# A mix entry whose name reads `coalition(a|b|c;size=1-3;lead=0-2;...)` casts
+# a *table with a coalition in it*: the learner in one drawn seat, a target
+# seat, one to three frozen seats that gang up on that target
+# (`hexn.coalition.Targeted`: the robber on its best hex, no trade with it,
+# from the plan's trigger on), and every other seat drawn from the pool as a
+# `table(...)` draws them. Everything about the coalition is drawn per game
+# off the same per-index stream as the cast, so a game stays a pure function
+# of `(seed, index)`:
+#
+# - `targeted=0.5`: the share of these games whose target is the learner's
+#   own seat; otherwise the target is another seat and the learner watches a
+#   coalition work on someone else.
+# - `size=1-3`: how many members, drawn uniformly, capped by the seats left
+#   once the learner and the target are placed (two, when they differ).
+# - `start=0.25`: the share of these games hostile from the first move;
+#   the rest wait on `lead`.
+# - `lead=0-2`: the margin, drawn uniformly, by which the target must lead
+#   the table in public points -- and have built past its setup -- before
+#   the coalition turns on it. Once on, it stays on (`CoalitionPlan`).
+# - `members=<spec>|<spec>`: the frozen checkpoints a member seat draws
+#   from, each seated as `targeted:<spec>`; absent, the pool's non-`self`
+#   names. A member is never `self`: its seat is never trained on, and it
+#   has a stance of its own to play.
+#
+# The learner's rows are the only ones trained on, as at every table: a
+# member is a pool checkpoint, cast under its own id.
+COALITION = "coalition("
+
+#: `targeted:<entrant>`, the spec a coalition member is seated under
+#: (`hexn.coalition`, loaded as a runtime).
+TARGETED = "targeted:"
+
+
+@dataclass(frozen=True)
+class CoalitionTerm:
+    """A `coalition(...)` entry, parsed: its pool, its member specs and the
+    draw's parameters (see `COALITION`)."""
+
+    pool: tuple[str, ...]
+    members: tuple[str, ...]
+    size: tuple[int, int] = (1, 3)
+    lead: tuple[int, int] = (0, 2)
+    start: float = 0.25
+    targeted: float = 0.5
+
+
+@dataclass
+class CoalitionPlan:
+    """One game's coalition: who it is against, who is in it, and when it
+    turns -- `lead` None from the first move, else once the target leads
+    the table's public points by that margin having built past its setup.
+    `hostile` latches: a coalition that has turned does not turn back."""
+
+    target: int
+    members: frozenset[int]
+    lead: int | None
+    triggered: bool = False
+
+    def hostile(self, game) -> bool:
+        if self.lead is None or self.triggered:
+            return True
+        from hexset.game import to_move
+        from hexset.victory import public_victory_points
+
+        # A seat's own view: public points read nothing hidden.
+        state = game.state(to_move(game)).state
+        mine = public_victory_points(state, self.target)
+        others = max(
+            public_victory_points(state, s) for s in range(state.num_players) if s != self.target
+        )
+        if mine > SETUP_POINTS and mine - others >= self.lead:
+            self.triggered = True
+        return self.triggered
+
+
+# Every seat holds two settlements after setup; a lead counts only once the
+# target has built past them.
+SETUP_POINTS = 2
+
+
+def _range(text: str, what: str, low: int) -> tuple[int, int]:
+    a, sep, b = text.partition("-")
+    try:
+        lo, hi = int(a), int(b if sep else a)
+    except ValueError:
+        raise ValueError(f"a coalition {what} is `n` or `lo-hi`: {text!r}") from None
+    if lo < low or hi < lo:
+        raise ValueError(f"a coalition {what} needs {low} <= lo <= hi: {text!r}")
+    return lo, hi
+
+
+def _share(text: str, what: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise ValueError(f"a coalition {what} is a share in [0, 1]: {text!r}") from None
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(f"a coalition {what} is a share in [0, 1]: {text!r}")
+    return value
+
+
+def coalition_term(name: str) -> CoalitionTerm | None:
+    """The `coalition(...)` entry `name` spells, or None for any other entry."""
+    if not name.startswith(COALITION):
         return None
     if not name.endswith(")"):
-        raise ValueError(f"unclosed table entry: {name}")
-    pool = [member.strip() for member in name[len(TABLE) : -1].split("|")]
+        raise ValueError(f"unclosed coalition entry: {name}")
+    parts = [part.strip() for part in name[len(COALITION) : -1].split(";")]
+    pool = tuple(member.strip() for member in parts[0].split("|"))
     if not pool or any(not member for member in pool):
-        raise ValueError(f"a table entry needs at least one opponent: {name}")
+        raise ValueError(f"a coalition entry needs at least one pool member: {name}")
+    options: dict[str, str | None] = {
+        "members": None, "size": "1-3", "lead": "0-2", "start": "0.25", "targeted": "0.5",
+    }
+    for part in parts[1:]:
+        key, sep, value = part.partition("=")
+        if not sep or key.strip() not in options:
+            raise ValueError(
+                f"a coalition option is one of {sorted(options)}, as `key=value`: {part!r} in {name}"
+            )
+        options[key.strip()] = value.strip()
+    spelled = options["members"]
+    members = (
+        tuple(member.strip() for member in spelled.split("|"))
+        if spelled
+        else tuple(member for member in pool if self_band(member) is None)
+    )
+    if not members or any(not member for member in members) or any(
+        self_band(member) is not None for member in members
+    ):
+        raise ValueError(
+            f"a coalition needs a frozen member: name one with `members=`, or put a "
+            f"non-self name in the pool: {name}"
+        )
+    return CoalitionTerm(
+        pool=pool,
+        members=members,
+        size=_range(options["size"], "size", 1),
+        lead=_range(options["lead"], "lead", 0),
+        start=_share(options["start"], "start"),
+        targeted=_share(options["targeted"], "targeted"),
+    )
+
+
+def _pool(name: str, prefix: str, kind: str) -> list[str] | None:
+    if not name.startswith(prefix):
+        return None
+    if not name.endswith(")"):
+        raise ValueError(f"unclosed {kind} entry: {name}")
+    pool = [member.strip() for member in name[len(prefix) : -1].split("|")]
+    if not pool or any(not member for member in pool):
+        raise ValueError(f"a {kind} entry needs at least one opponent: {name}")
     return pool
+
+
+def table_pool(name: str) -> list[str] | None:
+    """The pool a `table(...)` or `duel(...)` entry draws from, or None for a
+    plain entry."""
+    pool = _pool(name, TABLE, "table")
+    if pool is not None:
+        return pool
+    term = coalition_term(name)
+    return list(term.pool) if term is not None else duel_pool(name)
+
+
+def duel_pool(name: str) -> list[str] | None:
+    """The pool a `duel(...)` entry draws from, or None for any other entry."""
+    return _pool(name, DUEL, "duel")
 
 
 def parse_mix(spec: str) -> list[tuple[str, float]]:
@@ -393,6 +667,10 @@ def mix_names(mix: Sequence[tuple[str, float]]) -> list[str]:
         for member in table_pool(name) or [name]:
             if self_band(member) is None and member not in out:
                 out.append(member)
+        term = coalition_term(name)
+        for member in term.members if term is not None else ():
+            if TARGETED + member not in out:
+                out.append(TARGETED + member)
     return out
 
 
@@ -406,13 +684,30 @@ def mix_table(mix: Sequence[tuple[str, float]], players: int, seed: int):
     stream *after* every seat is cast, so a pool with no band consumes nothing
     extra and every cast law on record is byte-identical.
     """
+    draw = _mix_draw(mix, players, seed)
+
+    def table(index: int) -> tuple[tuple[int, ...], tuple[float, ...]]:
+        cast, temperatures, _, _ = draw(index)
+        return cast, temperatures
+
+    return table
+
+
+def _mix_draw(mix: Sequence[tuple[str, float]], players: int, seed: int):
+    """`mix_table`'s whole verdict per game index: `(cast, temperatures,
+    retired, coalition)`, where `retired` is the seats a `duel(...)` draw
+    leaves empty and None for every other game, and `coalition` is the
+    `CoalitionPlan` a `coalition(...)` draw made, a fresh one each call, and
+    None for every other game. `mix_deal` reads the third part,
+    `mix_coalitions` the fourth."""
     names = mix_names(mix)
-    plan: list[tuple[float, int | tuple[tuple[int, float], ...]]] = []
+    plan: list[tuple[float, int | tuple[tuple[int, float], ...], bool, object]] = []
     for name, fraction in mix:
         pool = table_pool(name)
         if pool is None:
-            plan.append((fraction, names.index(name) + 1))
+            plan.append((fraction, names.index(name) + 1, False, None))
         else:
+            term = coalition_term(name)
             plan.append((
                 fraction,
                 tuple(
@@ -420,21 +715,68 @@ def mix_table(mix: Sequence[tuple[str, float]], players: int, seed: int):
                     else (names.index(member) + 1, 0.0)
                     for member in pool
                 ),
+                duel_pool(name) is not None,
+                None if term is None else (
+                    term, tuple(names.index(TARGETED + member) + 1 for member in term.members)
+                ),
             ))
     ones = (1.0,) * players
 
-    def table(index: int) -> tuple[tuple[int, ...], tuple[float, ...]]:
+    def table(index: int) -> tuple[
+        tuple[int, ...], tuple[float, ...], frozenset[int] | None, CoalitionPlan | None
+    ]:
         rng = random.Random(f"{seed}:{index}:cast")
         draw = rng.random()
         cumulative = 0.0
-        for fraction, who in plan:
+        for fraction, who, duel, coalition in plan:
             cumulative += fraction
             if draw < cumulative:
                 if isinstance(who, int):
                     cast = [0] * players
                     for seat in range(1 - index % 2, players, 2):
                         cast[seat] = who
-                    return tuple(cast), ones
+                    return tuple(cast), ones, None, None
+                if coalition is not None:
+                    # The draw order is the contract: learner seat, target,
+                    # member count, members, trigger, then the seats' pool
+                    # draws in seat order, then the temperatures.
+                    term, member_ids = coalition
+                    learner = rng.randrange(players)
+                    others = [s for s in range(players) if s != learner]
+                    target = learner if rng.random() < term.targeted else rng.choice(others)
+                    candidates = [s for s in others if s != target]
+                    size = min(rng.randint(*term.size), len(candidates))
+                    members = frozenset(rng.sample(candidates, size))
+                    lead = None if rng.random() < term.start else rng.randint(*term.lead)
+                    drawn = [
+                        (0, 0.0) if seat == learner
+                        else (rng.choice(member_ids), 0.0) if seat in members
+                        else rng.choice(who)
+                        for seat in range(players)
+                    ]
+                    temperatures = [
+                        1.0 + rng.uniform(-band, band) if band > 0.0 else 1.0
+                        for _, band in drawn
+                    ]
+                    return (
+                        tuple(pid for pid, _ in drawn), tuple(temperatures), None,
+                        CoalitionPlan(target, members, lead),
+                    )
+                if duel:
+                    learner = rng.randrange(players)
+                    partner = rng.choice([s for s in range(players) if s != learner])
+                    pid, band = rng.choice(who)
+                    temperature = 1.0 + rng.uniform(-band, band) if band > 0.0 else 1.0
+                    retired = frozenset(range(players)) - {learner, partner}
+                    # A retired seat never moves; it carries the opponent's id
+                    # only so every seat names a policy that exists.
+                    cast = tuple(
+                        0 if seat == learner else pid for seat in range(players)
+                    )
+                    temps = tuple(
+                        temperature if seat == partner else 1.0 for seat in range(players)
+                    )
+                    return cast, temps, retired, None
                 learner = rng.randrange(players)
                 drawn = [
                     (0, 0.0) if seat == learner else rng.choice(who)
@@ -444,10 +786,48 @@ def mix_table(mix: Sequence[tuple[str, float]], players: int, seed: int):
                     1.0 + rng.uniform(-band, band) if band > 0.0 else 1.0
                     for _, band in drawn
                 ]
-                return tuple(pid for pid, _ in drawn), tuple(temperatures)
-        return (0,) * players, ones
+                return tuple(pid for pid, _ in drawn), tuple(temperatures), None, None
+        return (0,) * players, ones, None, None
 
     return table
+
+
+def mix_coalitions(mix: Sequence[tuple[str, float]], players: int, seed: int, *, pair_boards: bool = False):
+    """Game index -> this game's `CoalitionPlan`, or None for a game cast
+    from any other entry; None altogether when `mix` holds no
+    `coalition(...)` entry, so a collector hangs nothing on its games unless
+    asked. A fresh plan each call: its trigger latches, and the latch is the
+    game's. The fourth part of `_mix_draw`'s verdict, off the same per-index
+    stream as the cast. `pair_boards` mirrors `paired_caster`: games `2k` and
+    `2k+1` share one draw."""
+    if not any(coalition_term(name) is not None for name, _ in mix):
+        return None
+    draw = _mix_draw(mix, players, seed)
+
+    def plan(index: int) -> CoalitionPlan | None:
+        return draw(index // 2 if pair_boards else index)[3]
+
+    return plan
+
+
+def mix_deal(mix: Sequence[tuple[str, float]], players: int, seed: int, *, pair_boards: bool = False):
+    """Game index -> `(game_type, retired seats)` for a mix holding a
+    `duel(...)` entry, or None when it holds none -- so a collector deals the
+    standard game exactly as before unless asked. A game the walk casts from
+    any other entry is `(STANDARD_GAME, frozenset())`. The third part of
+    `mix_table`'s verdict, off the same per-index stream as the cast.
+    `pair_boards` mirrors `paired_caster`: games `2k` and `2k+1` share one draw."""
+    if not any(duel_pool(name) is not None for name, _ in mix):
+        return None
+    from hexset.rules import DUEL_VARIANT_GAME, STANDARD_GAME
+
+    draw = _mix_draw(mix, players, seed)
+
+    def deal(index: int):
+        retired = draw(index // 2 if pair_boards else index)[2]
+        return (STANDARD_GAME, frozenset()) if retired is None else (DUEL_VARIANT_GAME, retired)
+
+    return deal
 
 
 def mix_caster(mix: Sequence[tuple[str, float]], players: int, seed: int):
@@ -551,7 +931,7 @@ class WorkerSpec:
     players: int
     lanes: int
     action_cap: int
-    max_trades: int | None
+    max_offers: int | None
     first_game: int
     stride: int
     width: int
@@ -564,6 +944,18 @@ class WorkerSpec:
     policy_head: str = "linear"
     # Inert unless `value_head == "quantile"`; see `ModelConfig.quantiles`.
     quantiles: int = 32
+    # The learner's net carries the fast-win head and records its values
+    # (`hexn.ppo.PPOConfig.fast_win`).
+    fast_win: bool = False
+    # The per-VP reward the learner's value is recorded under
+    # (`hexn.ppo.PPOConfig.vp_reward`); 0 records the plain value.
+    vp_reward: float = 0.0
+    # A bot that answers the networks' trades (`hexn.trade.trader_gate`).
+    trader: str | None = None
+    # The runtime modules providing the bots this shard names -- `mix`,
+    # `trader` -- loaded before anything is built (`hexn.runtime`): a spawned
+    # worker inherits none of its parent's registrations.
+    runtime: tuple[str, ...] = ()
     mix: tuple[tuple[str, float], ...] = ()
     parent: str = ""
     cohort: bool = True
@@ -599,6 +991,10 @@ class WorkerSpec:
     root_noise: float = 0.0
     noise_fraction: float = 0.25
     play_temperature: float = 1.0
+    # Determinized worlds a searched decision is rooted in, each drawn from
+    # the mover's own belief (`hexset.mcts.Search.worlds`); the tree never
+    # roots on the true state here.
+    k: int = 1
 
 
 def _build(spec: WorkerSpec) -> tuple[list[NetworkPolicy], Collector]:
@@ -606,6 +1002,7 @@ def _build(spec: WorkerSpec) -> tuple[list[NetworkPolicy], Collector]:
     # default of one thread per core would have them fighting for the box.
     torch.set_num_threads(1)
     torch.manual_seed(spec.torch_seed)
+    runtime.load(spec.runtime)
 
     board = random_base_board(random.Random(spec.seed))
     topology = board.topology
@@ -623,6 +1020,7 @@ def _build(spec: WorkerSpec) -> tuple[list[NetworkPolicy], Collector]:
             value_head=spec.value_head,
             policy_head=spec.policy_head,
             quantiles=spec.quantiles,
+            fast_win=spec.fast_win,
         ),
     )
     policy = NetworkPolicy(
@@ -632,6 +1030,8 @@ def _build(spec: WorkerSpec) -> tuple[list[NetworkPolicy], Collector]:
         device="cpu",
         generator=torch.Generator().manual_seed(spec.torch_seed),
     )
+    policy.record_fast = spec.fast_win
+    policy.vp_reward = spec.vp_reward
 
     if spec.learners > 1 and spec.mix:
         # Two separate blockers, and the id space is only the first.
@@ -689,6 +1089,7 @@ def _build(spec: WorkerSpec) -> tuple[list[NetworkPolicy], Collector]:
             board=board,
             players=spec.players,
             device="cpu",
+            torch_seed=spec.torch_seed,
         )
     )
     if spec.learners > 1:
@@ -715,13 +1116,15 @@ def _build(spec: WorkerSpec) -> tuple[list[NetworkPolicy], Collector]:
                 wave=spec.wave,
                 exploration=spec.exploration,
                 stance=spec.stance,
-                max_trades=spec.max_trades,
                 root_noise=spec.root_noise,
                 noise_fraction=spec.noise_fraction,
-                rng=random.Random(spec.seed + 991),
+                k=spec.k,
+                # Per worker (`torch_seed` is), so the workers' searches do
+                # not draw the same worlds and rolls in lockstep.
+                rng=random.Random(spec.torch_seed + 991),
             ),
             temperature=spec.play_temperature,
-            rng=random.Random(spec.seed + 992),
+            rng=random.Random(spec.torch_seed + 992),
         )
 
     collector = Collector(
@@ -731,7 +1134,8 @@ def _build(spec: WorkerSpec) -> tuple[list[NetworkPolicy], Collector]:
         players=spec.players,
         seed=spec.seed,
         action_cap=spec.action_cap,
-        max_trades=spec.max_trades,
+        max_offers=spec.max_offers,
+        trader=spec.trader,
         first_game=spec.first_game,
         stride=spec.stride,
         opponents=opponents,
@@ -745,6 +1149,16 @@ def _build(spec: WorkerSpec) -> tuple[list[NetworkPolicy], Collector]:
         ),
         learners=tuple(range(spec.learners)),
         pair_boards=spec.pair_boards,
+        game_law=(
+            mix_deal(spec.mix, spec.players, spec.seed, pair_boards=spec.pair_boards)
+            if spec.learners <= 1 and spec.mix
+            else None
+        ),
+        coalition=(
+            mix_coalitions(spec.mix, spec.players, spec.seed, pair_boards=spec.pair_boards)
+            if spec.learners <= 1 and spec.mix
+            else None
+        ),
     )
     return [policy, *fellow_learners], collector
 
@@ -769,7 +1183,7 @@ class Flattened:
 
     `action`, `aux` and `value` stay object lists: actions carry structured
     trade bundles, `aux` is whatever the policy attached, and a search policy
-    may record `()` for a forced move's value — a ragged column cannot be an
+    may record `()` where it evaluated nothing — a ragged column cannot be an
     array without changing what it holds.
     """
 
@@ -814,6 +1228,7 @@ class Flattened:
         self.action = [t.action for t in transitions]
         self.value = [t.value for t in transitions]
         self.aux = [t.aux for t in transitions]
+        self.points = np.array([t.points for t in transitions], dtype=np.int64)
 
     def episodes(self) -> list[Episode]:
         """The identical episodes back, observations as views into one buffer."""
@@ -847,6 +1262,7 @@ class Flattened:
                             log_prob=float(self.log_prob[k]),
                             value=self.value[k],
                             aux=self.aux[k],
+                            points=int(self.points[k]),
                         )
                     )
                 trajectories.append(tuple(seat_transitions))
@@ -874,13 +1290,40 @@ def _flat(episodes: list[Episode], policy) -> object:
     return Flattened(episodes, layout)
 
 
-def _serve(spec: WorkerSpec, connection) -> None:
-    """The worker loop: build once, then answer commands until told to stop."""
+def release_memory() -> None:
+    """Hand freed memory back: collect cycles, then ask glibc to return free
+    heap to the system (a cohort is millions of small allocations, which
+    `free` alone leaves mapped). The trainer calls it between iterations and
+    each collector worker after sending a cohort. A no-op off glibc."""
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
+def _serve(spec: WorkerSpec, connection, beat=None) -> None:
+    """The worker loop: build once, then answer commands until told to stop.
+
+    `beat` is a shared double the worker stamps with the wall clock on every
+    command and every tick, which is how the parent tells a slow worker from
+    a wedged one. A collection command's payload is `(count, partial)`: a
+    `Partial` to keep each finished game in, or None. A bare count is the
+    same with no partial.
+    """
+
+    def stamp() -> None:
+        beat.value = time.time()
+
     try:
         policies, collector = _build(spec)
         policy = policies[0]
+        if beat is not None:
+            collector.beat = stamp
         while True:
             kind, payload = connection.recv()
+            if beat is not None:
+                stamp()
             if kind == "weights":
                 # `policy` is the `NetworkPolicy`, which is what a `SearchPolicy`
                 # wraps and what its evaluator holds — so syncing here reaches
@@ -895,10 +1338,30 @@ def _serve(spec: WorkerSpec, connection) -> None:
                 for learner, state in zip(policies, states):
                     learner.net.load_state_dict(state)
                 connection.send(("ok", None))
-            elif kind == "collect":
-                connection.send(("episodes", _flat(collector.collect(payload), policy)))
-            elif kind == "cohort":
-                connection.send(("episodes", _flat(collector.cohort(payload), policy)))
+            elif kind in ("collect", "cohort", "listed"):
+                count, partial = payload if isinstance(payload, tuple) else (payload, None)
+                # The plain calls with the sink set by hand: the parent owns the
+                # plan (`ParallelCollector.start_collect`), so a worker keeps
+                # its games and never writes one of its own.
+                play = {
+                    "collect": collector.collect,
+                    "cohort": collector.cohort,
+                    "listed": collector.listed,
+                }[kind]
+                collector.sink = None if partial is None else partial.keep
+                try:
+                    episodes = play(count)
+                finally:
+                    collector.sink = None
+                # The games are on disk (the partial) and, once sent, the
+                # parent's: none of them is held between commands.
+                flat = _flat(episodes, policy)
+                del episodes
+                connection.send(("episodes", flat))
+                del flat
+                release_memory()
+            elif kind == "upcoming":
+                connection.send(("upcoming", collector.upcoming(payload)))
             elif kind == "counter":
                 connection.send(("counter", collector.games_started()))
             elif kind == "stop":
@@ -923,29 +1386,126 @@ class ParallelCollector:
     `collect` forwards to each worker's `Collector.cohort` unless the specs ask
     for streaming, so the on-policy guarantee holds per worker: a worker deals
     its own quota, plays all of it out, and ends with empty lanes. The cost is
-    that the iteration waits on the slowest game of the slowest worker."""
+    that the iteration waits on the slowest game of the slowest worker.
 
-    def __init__(self, specs: Sequence[WorkerSpec]) -> None:
+    `heartbeat`, when given, is a JSON file rewritten every `POLL_SECONDS`
+    while the parent waits on its workers: each one's pid, whether it is
+    alive, busy and how long since it last ticked, and how many games the
+    collection in flight has kept so far."""
+
+    def __init__(
+        self,
+        specs: Sequence[WorkerSpec],
+        *,
+        heartbeat: Path | None = None,
+        stall_seconds: float = STALL_SECONDS,
+    ) -> None:
         if not specs:
             raise ValueError("a parallel collector needs at least one worker")
         context = mp.get_context("spawn")
         self._command = "cohort" if all(spec.cohort for spec in specs) else "collect"
         self.games = 0
         self.last_collect_seconds = 0.0
-        self._pending_quotas: list[int] | None = None
+        self.heartbeat = heartbeat
+        self.stall_seconds = stall_seconds
+        self._pending: list[bool] | None = None
+        self._kept: list[Episode] = []
+        self._partial: Partial | None = None
         self._collect_started = 0.0
         self._connections = []
         self._processes = []
+        self._beats = []
+        self._sent: list[float] = []
+        self._busy: set[int] = set()
         for spec in specs:
             ours, theirs = context.Pipe()
-            process = context.Process(target=_serve, args=(spec, theirs), daemon=True)
+            beat = context.RawValue("d", time.time())
+            process = context.Process(
+                target=_serve, args=(spec, theirs, beat), daemon=True
+            )
             process.start()
             theirs.close()
             self._connections.append(ours)
             self._processes.append(process)
+            self._beats.append(beat)
+            self._sent.append(time.time())
 
-    def _hear(self, connection, wanted: str):
-        kind, payload = connection.recv()
+    def _send(self, worker: int, message) -> None:
+        self._sent[worker] = time.time()
+        self._busy.add(worker)
+        self._connections[worker].send(message)
+
+    def _check(self) -> None:
+        """Fail on any busy worker that died or stopped ticking.
+
+        A live worker whose answer is already waiting is fine however long
+        ago it last ticked. A dead one is fine only if it exited cleanly with
+        something waiting: that is its traceback, which `_hear` raises with
+        the text. Killed by a signal -- the OOM killer, a segfault, a kill --
+        it sent nothing worth waiting for, and a closed pipe polls readable
+        exactly like one with an answer in it, so the exit code decides.
+        """
+        now = time.time()
+        for worker in sorted(self._busy):
+            process = self._processes[worker]
+            waiting = self._connections[worker].poll(0)
+            if process.is_alive():
+                idle = now - max(self._beats[worker].value, self._sent[worker])
+                if not waiting and idle > self.stall_seconds:
+                    raise RuntimeError(
+                        f"collector worker {worker} (pid {process.pid}) has not "
+                        f"ticked for {idle:.0f}s; treating it as wedged"
+                    )
+            elif process.exitcode != 0 or not waiting:
+                raise RuntimeError(
+                    f"collector worker {worker} (pid {process.pid}) died with "
+                    f"exit code {process.exitcode}"
+                )
+
+    def _beat(self) -> None:
+        if self.heartbeat is None:
+            return
+        now = time.time()
+        state = {
+            "time": now,
+            "kept": len(self._partial.finished()) if self._partial else None,
+            "partial": str(self._partial.directory) if self._partial else None,
+            "workers": [
+                {
+                    "worker": worker,
+                    "pid": process.pid,
+                    "alive": process.is_alive(),
+                    "busy": worker in self._busy,
+                    "idle_seconds": round(
+                        now - max(self._beats[worker].value, self._sent[worker]), 1
+                    ),
+                }
+                for worker, process in enumerate(self._processes)
+            ],
+        }
+        try:
+            write_atomic(self.heartbeat, json.dumps(state).encode())
+        except OSError:
+            pass  # a status file must never be what stops a run
+
+    def _hear(self, worker: int, wanted: str, timeout: float | None = None):
+        connection = self._connections[worker]
+        deadline = None if timeout is None else time.time() + timeout
+        wait = POLL_SECONDS if timeout is None else min(POLL_SECONDS, timeout)
+        while not connection.poll(wait):
+            self._check()
+            self._beat()
+            if deadline is not None and time.time() > deadline:
+                raise RuntimeError(f"collector worker {worker} did not answer in {timeout}s")
+        try:
+            kind, payload = connection.recv()
+        except (EOFError, ConnectionResetError):
+            process = self._processes[worker]
+            raise RuntimeError(
+                f"collector worker {worker} (pid {process.pid}) closed its pipe; "
+                f"exit code {process.exitcode}"
+            ) from None
+        self._busy.discard(worker)
         if kind == "error":
             raise RuntimeError(f"a collector worker failed:\n{payload}")
         if kind != wanted:
@@ -957,16 +1517,16 @@ class ParallelCollector:
 
     def sync_many(self, nets: Sequence[torch.nn.Module]) -> None:
         """Ship every learner's weights, in id order — the league's sync."""
-        if self._pending_quotas is not None:
+        if self._pending is not None:
             raise RuntimeError("cannot sync while collection is in flight")
         states = [
             {k: v.detach().cpu() for k, v in net.state_dict().items()} for net in nets
         ]
         payload = states if len(states) > 1 else states[0]
-        for connection in self._connections:
-            connection.send(("weights", payload))
-        for connection in self._connections:
-            self._hear(connection, "ok")
+        for worker in range(len(self._connections)):
+            self._send(worker, ("weights", payload))
+        for worker in range(len(self._connections)):
+            self._hear(worker, "ok")
 
     def _quotas(self, episodes: int) -> list[int]:
         share, extra = divmod(episodes, len(self._connections))
@@ -975,35 +1535,90 @@ class ParallelCollector:
             for worker in range(len(self._connections))
         ]
 
-    def start_collect(self, episodes: int) -> None:
-        """Dispatch a fixed cohort without waiting for workers to finish it."""
-        if self._pending_quotas is not None:
+    def start_collect(self, episodes: int, partial: Partial | None = None) -> None:
+        """Dispatch a fixed cohort without waiting for workers to finish it.
+
+        With a `partial`, every worker keeps each game there as it finishes.
+        A cohort's plan -- every index its workers will deal, asked of them
+        first -- is written before any game is played; a partial that already
+        holds one is a cohort a crash interrupted, and only its missing
+        indices are dealt, spread over whichever workers there are now. A
+        stream only tops up the games already kept. Either way the workers'
+        counters must already be past the partial's indices
+        (`hexn.durable.resume_base`), or a later deal could repeat one.
+        """
+        if self._pending is not None:
             raise RuntimeError("collection is already in flight")
-        quotas = self._quotas(episodes)
-        for connection, quota in zip(self._connections, quotas):
-            if quota:
-                connection.send((self._command, quota))
-        self._pending_quotas = quotas
+        workers = len(self._connections)
+        kept: list[Episode] = []
+        if partial is None:
+            commands = [
+                (self._command, quota) if quota else None
+                for quota in self._quotas(episodes)
+            ]
+        elif self._command == "cohort":
+            kept = partial.done()
+            plan = partial.plan()
+            if plan is None and kept:
+                raise ValueError(f"{partial.directory} holds games but no plan")
+            if plan is None:
+                quotas = self._quotas(episodes)
+                partial.write_plan(self._upcoming(quotas))
+                commands = [("cohort", (q, partial)) if q else None for q in quotas]
+            else:
+                finished = {episode.index for episode in kept}
+                missing = [index for index in plan if index not in finished]
+                commands = [
+                    ("listed", (share, partial)) if share else None
+                    for share in (missing[w::workers] for w in range(workers))
+                ]
+        else:
+            kept = partial.done()
+            commands = [
+                ("collect", (q, partial)) if q else None
+                for q in self._quotas(max(0, episodes - len(kept)))
+            ]
+        for worker, command in enumerate(commands):
+            if command is not None:
+                self._send(worker, command)
+        self._pending = [command is not None for command in commands]
+        self._kept = kept
+        self._partial = partial
         self._collect_started = time.perf_counter()
+
+    def _upcoming(self, quotas: Sequence[int]) -> list[int]:
+        """Every index the workers' next cohorts would deal, worker by worker."""
+        for worker, quota in enumerate(quotas):
+            if quota:
+                self._send(worker, ("upcoming", quota))
+        plan: list[int] = []
+        for worker, quota in enumerate(quotas):
+            if quota:
+                plan.extend(self._hear(worker, "upcoming"))
+        return plan
 
     def finish_collect(self) -> list[Episode]:
         """Wait for the cohort dispatched by `start_collect`."""
-        if self._pending_quotas is None:
+        if self._pending is None:
             raise RuntimeError("there is nothing in flight to finish")
-        quotas = self._pending_quotas
-        self._pending_quotas = None
-        out: list[Episode] = []
-        for connection, quota in zip(self._connections, quotas):
-            if quota:
-                payload = self._hear(connection, "episodes")
-                out.extend(
-                    payload.episodes() if isinstance(payload, Flattened) else payload
-                )
+        pending = self._pending
+        out: list[Episode] = list(self._kept)
+        try:
+            for worker, busy in enumerate(pending):
+                if busy:
+                    payload = self._hear(worker, "episodes")
+                    out.extend(
+                        payload.episodes() if isinstance(payload, Flattened) else payload
+                    )
+        finally:
+            self._pending = None
+            self._kept = []
+            self._partial = None
         self.last_collect_seconds = time.perf_counter() - self._collect_started
         self.games += len(out)
         return out
 
-    def collect(self, episodes: int) -> list[Episode]:
+    def collect(self, episodes: int, partial: Partial | None = None) -> list[Episode]:
         """Each worker plays out an equal share of the quota.
 
         Fixed shares rather than first-`n`-across-workers, so the cohort is
@@ -1011,29 +1626,29 @@ class ParallelCollector:
         selects for short games, the same bias the in-process collector's
         `deal` bound exists to prevent.
         """
-        self.start_collect(episodes)
+        self.start_collect(episodes, partial)
         return self.finish_collect()
 
     def games_started(self) -> int:
         """The next safe base index: above it, no worker has dealt anything."""
-        if self._pending_quotas is not None:
+        if self._pending is not None:
             raise RuntimeError("cannot read counters while collection is in flight")
-        for connection in self._connections:
-            connection.send(("counter", None))
+        for worker in range(len(self._connections)):
+            self._send(worker, ("counter", None))
         return max(
-            self._hear(connection, "counter") for connection in self._connections
+            self._hear(worker, "counter") for worker in range(len(self._connections))
         )
 
     def close(self) -> None:
-        if self._pending_quotas is not None:
+        if self._pending is not None:
             try:
                 self.finish_collect()
             except Exception:
                 pass
-        for connection in self._connections:
+        for worker, connection in enumerate(self._connections):
             try:
-                connection.send(("stop", None))
-                self._hear(connection, "ok")
+                self._send(worker, ("stop", None))
+                self._hear(worker, "ok", timeout=10)
             except Exception:
                 pass
             connection.close()

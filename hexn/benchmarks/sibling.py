@@ -117,7 +117,7 @@ class Probing:
         policy,
         evaluator,
         *,
-        max_trades,
+        max_offers,
         rate,
         rng,
         chance_draws: int = DRAWS,
@@ -125,7 +125,7 @@ class Probing:
     ) -> None:
         self.policy = policy
         self.evaluator = evaluator
-        self.max_trades = max_trades
+        self.max_offers = max_offers
         self.rate = rate
         self.rng = rng
         self.chance_draws = chance_draws
@@ -287,7 +287,7 @@ def main(argv: list[str] | None = None) -> int:
     probing = Probing(
         policy,
         LeafEvaluator(policy=policy),
-        max_trades=loaded.max_trades,
+        max_offers=loaded.max_offers,
         rate=args.probe,
         rng=random.Random(args.seed + 2),
         chance_draws=args.chance_draws,
@@ -301,7 +301,7 @@ def main(argv: list[str] | None = None) -> int:
         players=args.players,
         seed=args.seed + 1,
         action_cap=args.action_cap,
-        max_trades=loaded.max_trades,
+        max_offers=loaded.max_offers,
         deal=args.games,
         board=board,
     )

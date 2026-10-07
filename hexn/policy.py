@@ -65,6 +65,7 @@ from hexset.encoding import encode_batch, from_frame
 from hexset.game import Game
 from .model import HexNet, Packing, pack, packing, unpack
 from .selfplay import Choice, Request
+from .trade import trade_params, trader_gate
 
 __all__ = [
     "masked_log_softmax",
@@ -109,6 +110,13 @@ class Evaluation:
     # so the value loss can be taken on the forward pass the ratio already
     # paid for; `hexn.ppo` is the only reader.
     quantiles: Tensor | None = None
+    # The whole masked log-softmax row `log_prob` was gathered from, so a
+    # divergence to another policy over every legal action (`hexn.ppo`'s
+    # prior term) is taken on the same forward rather than a second one.
+    log_probs: Tensor | None = None
+    # The fast-win head's raw output (`Prediction.fast_logits`), `None` when
+    # the net has none; `hexn.ppo`'s fast-win loss is its only reader.
+    fast_logits: Tensor | None = None
 
 
 class NetworkPolicy:
@@ -146,6 +154,17 @@ class NetworkPolicy:
         self.device = torch.device(device)
         self.greedy = greedy
         self.generator = generator
+        # Record the fast-win head's seat values (`Prediction.fast`) on each
+        # `Choice` instead of the win head's -- what a run that pays for fast
+        # wins takes its advantage from. The gates and a search still read the
+        # win head; this only changes what `act` hands the trajectory.
+        self.record_fast = False
+        # Record the value of a per-VP reward (`hexn.ppo.PPOConfig.vp_reward`,
+        # c per victory point gained): the mover's component becomes the win
+        # (or fast-win) value plus c times the VP still to come, which the
+        # margin head predicts as final points / 10 in that mode. 0 records
+        # the plain value.
+        self.vp_reward = 0.0
 
     def _sample(self, log_probs: Tensor) -> Tensor:
         if self.greedy:
@@ -192,11 +211,26 @@ class NetworkPolicy:
             # One read-back rather than three. A transfer costs a fixed
             # overhead per tensor whatever its size, so the concatenation is
             # free and the two extra crossings are not.
+            recorded = (
+                prediction.fast[:, : prediction.value.shape[1]]
+                if self.record_fast
+                else prediction.value
+            )
+            if self.vp_reward:
+                now = torch.tensor(
+                    [float(request.points) for request in requests],
+                    device=recorded.device,
+                    dtype=recorded.dtype,
+                )
+                to_come = 10.0 * prediction.margin[:, 0] - now
+                recorded = torch.cat(
+                    [(recorded[:, 0] + self.vp_reward * to_come).unsqueeze(1), recorded[:, 1:]], dim=1
+                )
             read = torch.cat(
                 [
                     chosen.unsqueeze(1).to(prediction.value.dtype),
                     log_prob.unsqueeze(1),
-                    prediction.value,
+                    recorded,
                 ],
                 dim=1,
             ).cpu().numpy()
@@ -298,7 +332,10 @@ class NetworkPolicy:
             return np.full(len(options), 1.0 / len(options))
         return prior / total
 
-    def trader(self, game: Game, seat: int | None, max_trades: int | None = None):
+    def trader(
+        self, game: Game, seat: int | None, max_offers: int | None = None,
+        trader: str | None = None,
+    ):
         """What this policy brings to `game`'s trade event at `seat`.
 
         A driver seats one of these per seat on `game.gates`; the engine asks
@@ -310,15 +347,22 @@ class NetworkPolicy:
         worth, so a self-play seat, a duelled checkpoint and a served `.onnx`
         file all trade through one implementation.
 
+        `max_offers` is the network's own offer budget (`hexn.trade`), declared
+        on the gate as HexSet's `TradeParams`: `0` does not trade, `None` is
+        HexSet's default. `trader` seats that HexSet bot's gate instead
+        (`hexn.trade.trader_gate`), and this policy's value head prices nothing.
+
         `seat` is carried onto the gate rather than left to the `View` to
         name: a gate wired to the wrong seat would answer for somebody else's
         hand, and `NetworkBot` raises on that instead of answering quietly.
         `seat_at` seats it at the position without asking it to move.
         """
+        if trader is not None:
+            return trader_gate(trader, game, seat)
         gate = NetworkBot(
             policy=self,
             players=self.players,
-            max_trades=max_trades,
+            trade=trade_params(max_offers),
             seat=seat,
         )
         gate.seat_at(game)
@@ -394,14 +438,22 @@ class NetworkPolicy:
         `test_evaluate_reproduces_the_log_prob_act_recorded` pins that.
         """
         prediction = self.net(*unpack(self.layout, buffer))
-        log_probs = masked_log_softmax(prediction.logits, mask)
+        # Back to fp32 before anything is normalised or differenced: under
+        # half-precision autocast (`PPOConfig.amp`) the heads come out in fp16,
+        # whose range cannot even hold the mask's fill. A no-op in fp32.
+        def wide(x: Tensor | None) -> Tensor | None:
+            return None if x is None else x.float()
+
+        log_probs = masked_log_softmax(prediction.logits.float(), mask)
         return Evaluation(
             log_prob=log_probs.gather(1, chosen.unsqueeze(1)).squeeze(1),
             entropy=_entropy(log_probs),
-            value=prediction.value,
-            value_logits=prediction.value_logits,
-            margin=prediction.margin,
-            quantiles=prediction.quantiles,
+            value=wide(prediction.value),
+            value_logits=wide(prediction.value_logits),
+            margin=wide(prediction.margin),
+            quantiles=wide(prediction.quantiles),
+            log_probs=log_probs,
+            fast_logits=wide(prediction.fast_logits),
         )
 
 

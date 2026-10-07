@@ -32,13 +32,14 @@ duplicated here, so this module cannot drift from the trainers it freezes.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 SCHEMA = 1
 
@@ -114,18 +115,21 @@ def provenance(repo: Path) -> dict[str, Any]:
     }
 
 
-def engine_provenance() -> dict[str, Any]:
-    """The installed `hexset` engine's own version and commit.
+def engine_provenance(runtimes: Sequence[str] = ()) -> dict[str, Any]:
+    """The installed `hexset` engine's own version and commit, and the commit
+    of each bot runtime the run loads.
 
     Additive to `provenance()`, which is about *this* repo's checkout --
     HexNet no longer vendors the engine, so a run's own tree being clean says
-    nothing about which `hexset` it trained against. `heximax` (HexSet's
-    sample bot, needed for the `heximax` arena presets and
-    `tuning.climb(evaluator="heximax-*")`) ships from the same repo as
-    `hexset` and is pinned to the same install, so `hexset`'s commit already
-    covers it -- no separate field. Best-effort and never raises: tooling
-    that only reads manifests, or a `hexset` build with no `.git` directory
-    (a wheel install), gets a null commit rather than a failed `run.init`.
+    nothing about which `hexset` it trained against. Nor does the engine's
+    commit say which bots a run's names resolved to: HexSet ships none, and
+    `heximax` or `rehex` is whatever bot the run's `--runtime` provides
+    (`hexn.runtime`). So each runtime module gets its own entry under
+    `runtimes`: the commit and dirty state of the checkout it was found in,
+    null where it is not a git checkout and `{}` where it is not installed.
+    Best-effort and never raises: tooling that only reads manifests, or a
+    `hexset` build with no `.git` directory (a wheel install), gets a null
+    commit rather than a failed `run.init`.
 
     The engine's commit comes from `hexset.experiment.provenance()`, where the
     rest of a result's fingerprint already lives. HexSet 0.47.0 dropped the
@@ -148,7 +152,25 @@ def engine_provenance() -> dict[str, Any]:
             "version": got["hexset"],
             "git_commit": got["commit"],
             "dirty": got["dirty"],
-        }
+        },
+        "runtimes": {module: _module_checkout(module) for module in runtimes},
+    }
+
+
+def _module_checkout(module: str) -> dict[str, Any]:
+    """The commit and dirty state of the git checkout `module` imports from,
+    found without importing it; `{}` when it cannot be found."""
+    try:
+        spec = importlib.util.find_spec(module)
+    except (ImportError, ValueError):
+        spec = None
+    if spec is None or spec.origin is None:
+        return {}
+    where = Path(spec.origin).resolve().parent
+    status = _git("status", "--porcelain", cwd=where)
+    return {
+        "git_commit": _git("rev-parse", "HEAD", cwd=where),
+        "dirty": bool(status) if status is not None else None,
     }
 
 
@@ -219,7 +241,7 @@ def freeze(
     # records as the record they are turned the field into a constant. A signal
     # that is always true cannot say "this result cannot be cited".
     prov = provenance(repo)
-    engine = engine_provenance()
+    engine = engine_provenance(resolved.get("runtime") or ())
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "config").mkdir(exist_ok=True)
     (directory / "config" / f"{mode}.json").write_text(

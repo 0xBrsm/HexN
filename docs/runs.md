@@ -89,10 +89,11 @@ serialise/parse round trip to introduce a type mismatch.
 
 ## Resuming a run
 
-`--resume` is itself a frozen parameter (default `False` for `ppo`/`exit`;
-`league` reads its own checkpoint state the same way). Resuming means
-re-freezing the manifest with `--resume` set and a higher `--iterations`,
-pointing at the same `--checkpoint-dir`:
+`--resume` is itself a frozen parameter (default `False`). For `ppo` and
+`exit`, resuming means re-freezing the manifest with `--resume` set, and a
+higher `--iterations` to train further, pointing at the same
+`--checkpoint-dir`; `league` resumes whenever its `learner*/latest.pt`
+checkpoints exist, so relaunching a crashed heat's own manifest is enough:
 
 ```bash
 python -m hexn.run.init --mode ppo --name my-run --force \
@@ -112,7 +113,21 @@ counter, then re-assert the command line's learning rate and Adam epsilon
 onto the restored optimiser (loading an optimiser's `state_dict` otherwise
 keeps its old hyperparameters and only refreshes `params`). `--resume` with
 no `latest.pt` present is a refusal rather than a silent restart from
-scratch.
+scratch, and so is a fresh start into a `--checkpoint-dir` that already
+holds a `latest.pt`.
+
+A resume loses at most the games that were in flight. Every game is kept
+under `<checkpoint-dir>/partial/iter-NNNNN/` as it finishes, and a cohort
+writes the list of indices it deals there first; the resumed iteration
+loads those games and deals only the missing indices, and every later deal
+starts past them. `hexn.exit` also takes a replay shard written just before
+the crash as its iteration's collection. The log row and the checkpoint are
+written before an iteration's evaluation, which gets a row of its own, and a
+resumed run appends `{"resumed_from": N}` to `log.jsonl` before its first
+row: an iteration logged but not checkpointed is logged again, so a reader
+keeps the last row per iteration. A `league` heat restores each seat's own
+config (a controller's entropy coefficient included) and sums its standings
+from the rows before the iteration it resumes at.
 
 ## Two kinds of manifest
 

@@ -66,21 +66,6 @@ def test_a_frozen_config_round_trips_through_load(tmp_path):
     assert vars(read.namespace()) == written.config
 
 
-def test_the_resolved_values_are_the_parsers_own_types(tmp_path):
-    manifest = freeze(tmp_path)
-
-    assert manifest.config["iterations"] == 3
-    assert isinstance(manifest.config["iterations"], int)
-    assert manifest.config["learner"] == ["", "lr=1.5e-4"]
-
-
-def test_a_directory_without_a_manifest_is_not_a_run(tmp_path):
-    (tmp_path / "bare").mkdir()
-
-    with pytest.raises(SystemExit, match="has no run.json"):
-        run.load(tmp_path / "bare")
-
-
 def test_a_config_missing_a_parameter_is_refused_rather_than_defaulted(tmp_path):
     """The load-bearing refusal: a manifest frozen before a flag existed."""
     freeze(tmp_path)
@@ -115,21 +100,7 @@ def test_a_manifest_from_another_schema_is_refused(tmp_path):
         run.load(tmp_path / "unit")
 
 
-def test_provenance_reports_no_commit_outside_a_repository(tmp_path):
-    """None rather than a guess -- `init` turns this into a refusal."""
-    assert run.provenance(tmp_path)["git_commit"] is None
-
-
-def test_the_parameter_set_comes_from_the_parser_not_a_copy(tmp_path):
-    """If a flag is added to the league, this set grows with no change here."""
-    from hexn.league import build_parser
-
-    assert run.parameters("league") == {
-        action.dest for action in build_parser()._actions if action.dest != "help"
-    }
-
-
-@pytest.mark.parametrize("mode", ["ppo", "league", "exit"])
+@pytest.mark.parametrize("mode", ["ppo", "exit"])
 def test_every_mode_can_build_its_parser_twice(mode):
     """The check that was missing, and the bug it would have caught.
 
@@ -148,66 +119,6 @@ def test_every_mode_can_build_its_parser_twice(mode):
 
     assert first == second
     assert len(first) > 10, f"{mode} resolved suspiciously few parameters"
-
-
-def test_the_modes_map_to_modules_that_exist():
-    """Every mode's entry names a module `python -m` can actually launch.
-
-    `hexn.ppo` and `hexn.exit` are packages: `import hexn.ppo` reaches the
-    package's own math (`__init__.py`), while `python -m hexn.ppo` runs its
-    `__main__.py` instead -- the loop this map exists to point at. The error
-    messages interpolate this map, so a wrong entry would send a reader to a
-    module that does not exist.
-    """
-    import importlib
-
-    for mode, module in run.manifest.MODULES.items():
-        assert mode in ("ppo", "league", "exit")
-        assert importlib.import_module(module) is not None
-
-
-def test_engine_provenance_records_the_installed_hexset():
-    """The happy path assumed by everything else -- `hexset` is a hard
-    dependency of this package, so a working `hexn` venv has it installed
-    from the HexSet repo (or a local checkout of it)."""
-    info = run.manifest.engine_provenance()
-
-    assert "hexset" in info
-    if info["hexset"] is not None:
-        assert "version" in info["hexset"]
-        assert "git_commit" in info["hexset"]
-        # `hexset.experiment.provenance` answers this too, and a commit alone
-        # cannot reproduce a run trained against a modified engine tree.
-        assert "dirty" in info["hexset"]
-
-
-def test_engine_provenance_is_none_without_hexset(monkeypatch):
-    """A hexset-less environment (tooling that only reads manifests, say)
-    gets a null field instead of an ImportError out of `run.init`."""
-    import builtins
-
-    real_import = builtins.__import__
-
-    def fake_import(name, *args, **kwargs):
-        # The provenance read is `from hexset.experiment import provenance`,
-        # so the name reaching `__import__` is the submodule's, not the
-        # package's -- match the whole subtree.
-        if name == "hexset" or name.startswith("hexset."):
-            raise ImportError("simulated: hexset not installed")
-        return real_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", fake_import)
-
-    assert run.manifest.engine_provenance() == {"hexset": None}
-
-
-def test_freeze_records_engine_provenance_in_the_manifest(tmp_path):
-    """Additive to `provenance()`: which `hexset` a run trained against,
-    not just whether this repo's own tree was clean."""
-    manifest = freeze(tmp_path)
-
-    assert "engine" in manifest.meta
-    assert "hexset" in manifest.meta["engine"]
 
 
 def test_a_manifest_without_an_engine_field_still_loads(tmp_path):

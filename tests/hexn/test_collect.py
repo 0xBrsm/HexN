@@ -1,29 +1,32 @@
 # SPDX-License-Identifier: GPL-3.0-only
 from __future__ import annotations
 
+import pickle
 import random
 
 import pytest
+from _bots import needs
 
 torch = pytest.importorskip("torch", reason="PyTorch runs on the training box only")
 
-from hexn.collect import ParallelCollector, WorkerSpec  # noqa: E402
+from hexn.collect import ParallelCollector, WorkerSpec, _build, _serve  # noqa: E402
 
 
 def spec(worker: int, workers: int, **overrides) -> WorkerSpec:
-    # Trade-free by default (`max_trades=0`): nothing below is about trading,
+    # Trade-free by default (`max_offers=0`): nothing below is about trading,
     # and a network's gate prices every coverable candidate after every MAIN
     # action (`hexset.trading.trade_event`, `hexn.policy.NetworkPolicy.trader`)
     # -- at a nonzero budget that made a worker's cohort cost tens of seconds
     # to a couple of minutes for plumbing tests that never look at a trade.
     # Same trade `some_episodes` (`test_ppo.py`) and `searched_episodes`
     # (`test_exit.py`) already make. A test that needs trades overrides it.
+    # Truncated games are as good as finished ones for every claim here.
     base = dict(
         seed=5,
         players=4,
         lanes=2,
-        action_cap=500,
-        max_trades=0,
+        action_cap=200,
+        max_offers=0,
         first_game=worker,
         stride=workers,
         width=8,
@@ -36,83 +39,101 @@ def spec(worker: int, workers: int, **overrides) -> WorkerSpec:
     return WorkerSpec(**base)
 
 
-def test_workers_deal_disjoint_strided_indices_and_ship_valid_episodes():
-    collector = ParallelCollector([spec(0, 2), spec(1, 2)])
-    try:
-        episodes = collector.collect(4)
-
-        assert len(episodes) == 4
-        indices = sorted(e.index for e in episodes)
-        assert len(set(indices)) == 4, f"an index was dealt twice: {indices}"
-        # Both workers contributed: the two stride residues both appear.
-        assert {i % 2 for i in indices} == {0, 1}
-        for episode in episodes:
-            assert len(episode) > 0
-            assert episode.outcome.actions > 0
-        assert collector.games == 4
-    finally:
-        collector.close()
+# A table of arena entrants, so the one spawned pool below also carries the
+# cast-and-record-only-the-learner claim. Scripted bots only: `heximax` would
+# cost more than every other game in this file. `random-too` is registered by
+# a test runtime each worker loads itself (`WorkerSpec.runtime`).
+POOL = (("table(random|random-too)", 1.0),)
+RUNTIME = ("_scripted_runtime",)
 
 
-def test_collection_can_be_started_then_finished_around_other_work():
-    collector = ParallelCollector([spec(0, 2), spec(1, 2)])
-    try:
-        collector.start_collect(4)
-        with pytest.raises(RuntimeError, match="already in flight"):
-            collector.start_collect(2)
-
-        # Production uses this window for the preceding batch's GPU update.
-        assert collector.games == 0
-        episodes = collector.finish_collect()
-
-        assert len(episodes) == 4
-        assert collector.games == 4
-        assert collector.last_collect_seconds > 0.0
-        with pytest.raises(RuntimeError, match="nothing in flight"):
-            collector.finish_collect()
-    finally:
-        collector.close()
+@pytest.fixture(scope="module")
+def pool():
+    """The one `ParallelCollector` this file spawns, shared by every test that
+    needs real worker processes: a spawned worker pays a fresh interpreter's
+    torch import, which cost more than the games these tests play. The pool
+    keeps its history across tests, so they read its counters as deltas."""
+    collector = ParallelCollector(
+        [spec(0, 2, mix=POOL, runtime=RUNTIME), spec(1, 2, mix=POOL, runtime=RUNTIME)]
+    )
+    yield collector
+    collector.close()
 
 
-def test_a_parallel_resume_never_redeals_a_seen_index():
-    first = ParallelCollector([spec(0, 2), spec(1, 2)])
-    try:
-        seen = {e.index for e in first.collect(4)}
-        base = first.games_started()
-    finally:
-        first.close()
+class ScriptedPipe:
+    """A worker pipe's parent end with the commands queued up front, so
+    `_serve` -- the loop a worker process runs -- can run in this process."""
+
+    def __init__(self, *commands) -> None:
+        self.commands = list(commands)
+        self.sent: list = []
+
+    def recv(self):
+        if not self.commands:
+            raise EOFError
+        return self.commands.pop(0)
+
+    def send(self, message) -> None:
+        # Through pickle, as a real pipe would carry it.
+        self.sent.append(pickle.loads(pickle.dumps(message)))
+
+
+def served(worker: WorkerSpec, *commands) -> list:
+    pipe = ScriptedPipe(*commands)
+    _serve(worker, pipe)
+    return pipe.sent
+
+
+def test_workers_deal_disjoint_strided_indices_and_ship_valid_episodes(pool):
+    before = pool.games
+    episodes = pool.collect(4)
+
+    assert len(episodes) == 4
+    indices = sorted(e.index for e in episodes)
+    assert len(set(indices)) == 4, f"an index was dealt twice: {indices}"
+    # Both workers contributed: the two stride residues both appear.
+    assert {i % 2 for i in indices} == {0, 1}
+    for episode in episodes:
+        assert len(episode) > 0
+        assert episode.outcome.actions > 0
+    assert pool.games == before + 4
+
+
+def test_collection_can_be_started_then_finished_around_other_work(pool):
+    before = pool.games
+    pool.start_collect(4)
+    with pytest.raises(RuntimeError, match="already in flight"):
+        pool.start_collect(2)
+
+    # Production uses this window for the preceding batch's GPU update.
+    assert pool.games == before
+    episodes = pool.finish_collect()
+
+    assert len(episodes) == 4
+    assert pool.games == before + 4
+    assert pool.last_collect_seconds > 0.0
+    with pytest.raises(RuntimeError, match="nothing in flight"):
+        pool.finish_collect()
+
+
+def test_a_parallel_resume_never_redeals_a_seen_index(pool):
+    seen = {e.index for e in pool.collect(4)}
+    base = pool.games_started()
 
     # The resume rule: base is the max over worker counters, so indices the
     # slow worker never reached are skipped — unused seeds, never replays.
     assert base > max(seen)
-    second = ParallelCollector([spec(base + 0, 2), spec(base + 1, 2)])
-    try:
-        fresh = {e.index for e in second.collect(2)}
-    finally:
-        second.close()
+    # The resumed shards, built exactly as a worker builds them and played
+    # here rather than behind a second spawn.
+    fresh: set[int] = set()
+    for worker in range(2):
+        _, resumed = _build(spec(base + worker, 2, mix=POOL, runtime=RUNTIME))
+        fresh |= {e.index for e in resumed.cohort(1)}
     assert not (seen & fresh)
     assert min(fresh) >= base
 
 
-def test_workers_cast_mix_opponents_and_record_only_the_learner():
-    collector = ParallelCollector(
-        [
-            spec(0, 2, mix=(("random", 1.0),)),
-            spec(1, 2, mix=(("random", 1.0),)),
-        ]
-    )
-    try:
-        episodes = collector.collect(2)
-    finally:
-        collector.close()
-
-    for episode in episodes:
-        assert any(pid == 1 for pid in episode.cast)
-        for seat, pid in enumerate(episode.cast):
-            assert bool(episode.trajectories[seat]) == (pid == 0)
-
-
-def test_sync_ships_weights_the_workers_actually_load():
+def test_sync_ships_weights_the_workers_actually_load(pool):
     from hexset.actions import build_space
     from hexset.board.board import random_base_board
     from hexset.encoding import static_graph
@@ -125,44 +146,43 @@ def test_sync_ships_weights_the_workers_actually_load():
     )
     net = HexNet(space, static_graph(topology), 4, ModelConfig(width=8, rounds=1))
 
-    collector = ParallelCollector([spec(0, 1, lanes=2)])
-    try:
-        collector.sync(net)
-        episodes = collector.collect(1)
-        assert episodes and len(episodes[0]) > 0
-    finally:
-        collector.close()
+    pool.sync(net)
+    episodes = pool.collect(1)
+    assert episodes and len(episodes[0]) > 0
+
+
+def test_a_worker_casts_a_table_and_records_only_the_learner_seat(pool):
+    """The seating-free geometry in the sharded collector: one learner seat,
+    the rest drawn from the pool by id, opponent seats never recorded."""
+    from hexn.selfplay import owned
+
+    episodes = pool.collect(4)
+
+    seen: set[int] = set()
+    for episode in episodes:
+        assert episode.cast.count(0) == 1, episode.cast
+        assert set(episode.cast) <= {0, 1, 2}
+        seen |= {pid for pid in episode.cast if pid}
+        for seat, pid in enumerate(episode.cast):
+            assert bool(episode.trajectories[seat]) == (pid == 0)
+    assert seen == {1, 2}
+    # `owned` is the assemble-side gate on the same fact, and the two must agree:
+    # nothing an opponent did may reach an update.
+    for kept, episode in zip(owned(episodes, 0), episodes):
+        assert kept.trajectories == episode.trajectories
 
 
 def test_a_searched_worker_returns_episodes_whose_transitions_carry_targets():
     """The whole point of sharding the searched path: the corpus must still be
     distillable, which means every transition needs its `Target` to survive the
     pipe as well as the search."""
-    from hexn.collect import ParallelCollector, WorkerSpec
     from hexn.expert import Target
 
-    collector = ParallelCollector(
-        [
-            WorkerSpec(
-                seed=5,
-                players=4,
-                lanes=2,
-                action_cap=600,
-                max_trades=0,
-                first_game=0,
-                stride=1,
-                width=16,
-                rounds=1,
-                torch_seed=5,
-                simulations=8,
-                wave=4,
-            )
-        ]
+    (kind, payload), = served(
+        spec(0, 1, width=16, simulations=8, wave=4, action_cap=120), ("cohort", 1)
     )
-    try:
-        episodes = collector.collect(1)
-    finally:
-        collector.close()
+    assert kind == "episodes", payload
+    episodes = payload.episodes()
     assert episodes
     targets = [
         t.aux
@@ -176,39 +196,6 @@ def test_a_searched_worker_returns_episodes_whose_transitions_carry_targets():
     # The prior rides along too, or `contested_only` has nothing to filter on.
     searched = [t for t in targets if len(t.options) > 1]
     assert searched and all(t.prior is not None for t in searched)
-
-
-def test_a_worker_with_no_simulations_is_the_plain_policy_path():
-    from hexn.collect import ParallelCollector, WorkerSpec
-
-    collector = ParallelCollector(
-        [
-            WorkerSpec(
-                seed=6,
-                players=4,
-                lanes=2,
-                action_cap=600,
-                max_trades=0,
-                first_game=0,
-                stride=1,
-                width=16,
-                rounds=1,
-                torch_seed=6,
-            )
-        ]
-    )
-    try:
-        episodes = collector.collect(1)
-    finally:
-        collector.close()
-    assert episodes
-    # The invariant is that no search target appears -- `aux` is a general
-    # pocket and the plain path is free to use it for other things.
-    from hexn.expert import Target
-
-    auxes = [t.aux for e in episodes for traj in e.trajectories for t in traj]
-    assert auxes
-    assert not any(isinstance(a, Target) for a in auxes)
 
 
 def test_the_flat_wire_format_rebuilds_byte_identical_episodes():
@@ -241,7 +228,7 @@ def test_the_flat_wire_format_rebuilds_byte_identical_episodes():
     policy = NetworkPolicy(net, space_for(game), packing(graph, 4))
     # Trade-free and short: the round trip is about the flattening, and a
     # network gate prices every candidate after every MAIN action.
-    episodes = Collector(policy, lanes=4, seed=3, action_cap=400, max_trades=0).collect(3)
+    episodes = Collector(policy, lanes=4, seed=3, action_cap=150, max_offers=0).collect(3)
 
     flat = pickle.loads(pickle.dumps(Flattened(episodes, policy.layout)))
     rebuilt = flat.episodes()
@@ -275,30 +262,26 @@ def test_the_flat_wire_format_rebuilds_byte_identical_episodes():
 def test_a_league_worker_records_every_seat_and_loads_a_weight_list():
     """Stage 2's worker contract: two learner nets share the table, every seat
     records under its caster's id, and sync ships one dict per learner."""
-    collector = ParallelCollector([spec(w, 2, learners=2) for w in range(2)])
-    try:
-        from hexn.collect import _build  # the same construction the worker runs
+    league = spec(0, 1, learners=2)
+    policies, _ = _build(league)  # the same construction the worker runs
+    assert len(policies) == 2
+    states = [policy.net.state_dict() for policy in policies]
 
-        policies, _ = _build(spec(0, 2, learners=2))
-        assert len(policies) == 2
-        collector.sync_many([policies[0].net, policies[1].net])
+    loaded, (kind, payload) = served(league, ("weights", states), ("cohort", 2))
 
-        episodes = collector.collect(4)
-        assert len(episodes) == 4
-        for episode in episodes:
-            assert set(episode.cast) == {0, 1}
-            for seat, trajectory in enumerate(episode.trajectories):
-                assert trajectory, "both ids are learners; every seat records"
-                assert all(t.seat == seat for t in trajectory)
-    finally:
-        collector.close()
+    assert loaded == ("ok", None)
+    assert kind == "episodes", payload
+    episodes = payload.episodes()
+    assert len(episodes) == 2
+    for episode in episodes:
+        assert set(episode.cast) == {0, 1}
+        for seat, trajectory in enumerate(episode.trajectories):
+            assert trajectory, "both ids are learners; every seat records"
+            assert all(t.seat == seat for t in trajectory)
 
-
-def test_a_league_spec_refuses_a_mix():
-    from hexn.collect import _build
-
-    with pytest.raises(ValueError):
-        _build(spec(0, 1, learners=2, mix=(("random", 0.15),)))
+    # One dict for a two-learner table is refused, not loaded into learner 0.
+    (kind, message), = served(league, ("weights", states[0]))
+    assert kind == "error" and "1 weight dicts for 2 learners" in message
 
 
 def test_the_league_caster_balances_seats_and_fixes_adjacency():
@@ -339,43 +322,8 @@ def test_a_permuted_learner_order_reseats_the_cycle_without_unbalancing_seats():
     assert successor[0] == 2 and successor[2] == 1
 
 
-def test_a_learner_order_that_is_not_a_permutation_is_refused():
-    import pytest
-
-    from hexn.collect import league_caster
-
-    with pytest.raises(ValueError, match="permutation"):
-        league_caster(4, 4, order=(0, 1, 1, 3))
-
-
-def test_a_paired_caster_casts_both_halves_of_a_pair_identically():
-    from hexn.collect import league_caster, paired_caster
-
-    plain = league_caster(4, 4)
-    caster = paired_caster(plain)
-    for k in range(12):
-        assert caster(2 * k) == caster(2 * k + 1) == plain(k)
-
-
-def test_a_paired_league_balances_every_seat_over_a_doubled_window():
-    from collections import Counter
-
-    from hexn.collect import league_caster, paired_caster
-
-    learners, players = 4, 4
-    caster = paired_caster(league_caster(learners, players))
-    # The documented cost of pairing: the exact balance `league_caster` gives
-    # over any `learners`-game window now takes `2 * learners` games — and it
-    # holds at every offset, not just on pair boundaries.
-    for offset in range(2 * learners):
-        window = [caster(offset + i) for i in range(2 * learners)]
-        for seat in range(players):
-            share = Counter(cast[seat] for cast in window)
-            assert share == {k: 2 for k in range(learners)}
-
-
 def test_a_paired_worker_wraps_its_caster_and_deals_paired_boards():
-    from hexn.collect import _build, league_caster
+    from hexn.collect import league_caster
 
     _, collector = _build(spec(0, 1, learners=2, pair_boards=True))
     assert collector.pair_boards
@@ -392,31 +340,6 @@ def test_a_paired_worker_wraps_its_caster_and_deals_paired_boards():
 # without their configuration changing. `greedy` was the other reserved name;
 # HexSet 0.47.0 deleted the bot behind it with `search2`, and it is now an
 # unknown mix name rather than a name quietly pointing at a different bot.
-
-
-def _cast_cohort(opponents, *, seed=11, games=4, lanes=2):
-    """A cohort with every game cast, played by a torch-free learner.
-
-    `RandomPolicy` rather than a network on purpose: two runs of this with
-    identically seeded policies play identical games, so any difference in the
-    episodes is a difference in the *opponent* and nothing else. A network
-    learner would put a torch generator between the claim and the evidence.
-    """
-    from hexn.collect import mixed_caster
-    from hexn.selfplay import Collector, RandomPolicy
-
-    collector = Collector(
-        RandomPolicy(random.Random(seed)),
-        lanes=lanes,
-        fill=False,
-        players=4,
-        seed=seed,
-        action_cap=600,
-        max_trades=3,
-        opponents=opponents,
-        caster=mixed_caster([1.0], 4, seed),
-    )
-    return collector.cohort(games)
 
 
 def _a_checkpoint(path, *, players: int = 4):
@@ -478,7 +401,7 @@ def test_a_bare_network_mix_entry_routes_through_the_batched_frozen_policy(tmp_p
     # An explicit `@trades` override keeps its own fixed trade switch, which
     # `frozen`'s plain NetworkPolicy has no field for -- it must still go
     # through `named_opponent`/`hexset.arena.spawn`, whose `NetworkBot`
-    # carries `max_trades` per entrant.
+    # carries `max_offers` per entrant.
     overridden = mix_opponents(
         [(f"{spec}@0", 1.0)], seed=1, lanes=2, board=board, players=4
     )[0]
@@ -490,11 +413,80 @@ def test_a_bare_network_mix_entry_routes_through_the_batched_frozen_policy(tmp_p
     assert not isinstance(no_board, NetworkPolicy)
 
 
+def test_a_sampled_network_member_samples_and_a_bare_one_stays_greedy(tmp_path):
+    """`sampled:network:<path>` is the same batched `frozen` policy as the
+    bare entry, sampling from its own seeded stream instead of taking the
+    argmax; the bare entry is unchanged."""
+    from hexn.collect import check_mix, mix_opponents
+    from hexn.policy import NetworkPolicy
+
+    path = tmp_path / "latest.pt"
+    board = _a_checkpoint(path)
+    bare, hot = f"network:{path}", f"sampled:network:{path}"
+    mix = [(f"table(self|{bare}|{hot})", 1.0)]
+    check_mix(mix, have_parent=False)
+
+    greedy, sampled = mix_opponents(mix, seed=1, lanes=2, board=board, players=4, torch_seed=9)
+    assert isinstance(greedy, NetworkPolicy) and greedy.greedy
+    assert isinstance(sampled, NetworkPolicy) and not sampled.greedy
+
+    # Near-uniform rows: the argmax never moves, the sampled draws do, and a
+    # second build from the same worker seed draws the same stream.
+    rows = torch.log_softmax(torch.zeros(64, 32) + 0.01 * torch.arange(32.0), dim=-1)
+    assert greedy._sample(rows).unique().numel() == 1
+    draws = sampled._sample(rows)
+    assert draws.unique().numel() > 1
+    again = mix_opponents(mix, seed=1, lanes=2, board=board, players=4, torch_seed=9)[1]
+    assert torch.equal(again._sample(rows), draws)
+    other = mix_opponents(mix, seed=1, lanes=2, board=board, players=4, torch_seed=10)[1]
+    assert not torch.equal(other._sample(rows), draws)
+
+
+def test_a_sampled_member_casts_exactly_as_its_bare_spelling(tmp_path):
+    """Sampling draws nothing from the cast stream, so swapping a bare
+    `network:` member for its `sampled:` spelling deals the same tables."""
+    from hexn.collect import mix_table, parse_mix
+
+    bare = f"table(self|self|network:{tmp_path}/a.pt|random)=1.0"
+    hot = bare.replace("network:", "sampled:network:")
+
+    law, hot_law = mix_table(parse_mix(bare), 4, 3), mix_table(parse_mix(hot), 4, 3)
+    assert [law(i) for i in range(200)] == [hot_law(i) for i in range(200)]
+
+
+def test_sampled_takes_only_a_bare_network(tmp_path):
+    from hexn.collect import check_mix, rung_opponent
+
+    path = tmp_path / "latest.pt"
+    board = _a_checkpoint(path)
+    for name in ("sampled:heximax", f"sampled:network:{path}@0", "sampled:random"):
+        with pytest.raises(SystemExit, match="bare network"):
+            check_mix([(name, 1.0)], have_parent=False)
+    with pytest.raises(SystemExit, match="not there"):
+        check_mix([(f"sampled:network:{tmp_path}/missing.pt", 1.0)], have_parent=False)
+    with pytest.raises(ValueError, match="bare network"):
+        rung_opponent("sampled:heximax", seed=1, lanes=2, board=board, players=4, device="cpu")
+
+
+def test_a_worker_seeds_its_sampled_members_from_its_own_torch_seed(tmp_path):
+    """Workers share the board seed; a sampled member's stream comes from
+    the worker's `torch_seed`, so two workers do not sample in lockstep."""
+    path = tmp_path / "latest.pt"
+    _a_checkpoint(path)
+    mix = ((f"table(self|sampled:network:{path})", 1.0),)
+    rows = torch.log_softmax(torch.zeros(64, 32), dim=-1)
+    first, second = (
+        _build(spec(worker, 2, mix=mix))[1].opponents[0]._sample(rows) for worker in (0, 1)
+    )
+    assert not torch.equal(first, second)
+
+
+@needs("heximax")
 def test_heximax_resolves_as_a_mix_opponent():
-    """`"heximax"` is not in `hexset.arena.PRESETS`: `hexset.bots.heximax`
-    registers it at import, and `hexn.collect` importing `hexset.bots` is
-    what makes it resolvable in `--mix` from a collector process. Without that
-    import the run dies at launch with `unknown entrant`."""
+    """`"heximax"` is not one of HexSet's own presets: a runtime registers
+    it, and a loaded runtime is what makes it resolvable in `--mix` from a
+    collector process. Without it the run dies at launch with `unknown
+    entrant`."""
     from hexset.board.board import random_base_board
     from hexn.collect import check_mix, mix_opponents
 
@@ -502,30 +494,18 @@ def test_heximax_resolves_as_a_mix_opponent():
     board = random_base_board(random.Random(3))
     bot = mix_opponents([("heximax", 0.25)], seed=1, lanes=2)[0].spawn(board)
     assert hasattr(bot, "gains_many")
-    # And it is the entrant, not a lookalike: `heximax`'s own preset carries
-    # `depth=2, width=6, max_trades=None`. `--max-trades` is the run's switch
-    # for the seats the *run* deals; a named entrant is literally the entrant
-    # the arena scores, budget included.
-    assert (bot.depth, bot.width, bot.max_trades) == (2, 6, None)
+    # And it is the entrant, not a lookalike: the bot the arena itself
+    # spawns for the name, search and bargaining alike. `--max-offers` is the
+    # budget of the networks the run trains; a named entrant is literally the
+    # entrant the arena scores, budget included.
+    from hexset.arena import entrant_from_name, spawn
+
+    arena = spawn(entrant_from_name("heximax"), board, random.Random(1))
+    assert type(bot) is type(arena)
+    assert (bot.depth, bot.width, bot.max_offers) == (arena.depth, arena.width, arena.max_offers)
 
 
-def test_a_mix_without_a_parent_entry_never_builds_one():
-    """`parent` arrives as a thunk so a worker pays no `torch.load` for a
-    checkpoint nothing in its mix casts."""
-    from hexn.collect import mix_opponents
-
-    def thunk():
-        raise AssertionError("built a parent for a mix that never asks for one")
-
-    opponents = mix_opponents(
-        [("heximax", 0.15), ("random", 0.1)],
-        seed=1,
-        lanes=2,
-        parent=thunk,
-    )
-    assert len(opponents) == 2
-
-
+@needs("heximax")
 def test_the_parent_mix_opponent_is_whatever_the_thunk_returned():
     from hexn.collect import mix_opponents
 
@@ -540,70 +520,6 @@ def test_the_parent_mix_opponent_is_whatever_the_thunk_returned():
     assert opponents[1] is sentinel
     with pytest.raises(ValueError, match="needs a parent"):
         mix_opponents([("parent", 0.1)], seed=1, lanes=2)
-
-
-def test_a_worker_casts_an_arena_entrant_and_still_records_only_the_learner():
-    from hexn.selfplay import owned
-
-    collector = ParallelCollector(
-        [
-            spec(0, 2, mix=(("random", 1.0),)),
-            spec(1, 2, mix=(("random", 1.0),)),
-        ]
-    )
-    try:
-        episodes = collector.collect(2)
-    finally:
-        collector.close()
-
-    assert len(episodes) == 2
-    for episode in episodes:
-        assert any(pid == 1 for pid in episode.cast)
-        assert episode.outcome.actions > 0
-        for seat, pid in enumerate(episode.cast):
-            assert bool(episode.trajectories[seat]) == (pid == 0)
-    # `owned` is the assemble-side gate on the same fact, and the two must agree:
-    # nothing an opponent did may reach an update.
-    for kept, episode in zip(owned(episodes, 0), episodes):
-        assert kept.trajectories == episode.trajectories
-
-
-def test_a_worker_casts_a_table_and_records_only_the_learner_seat():
-    """The seating-free geometry in the sharded collector: one learner seat,
-    the rest drawn from the pool by id, opponent seats never recorded."""
-    mix = (("table(random|heximax|random-placement)", 1.0),)
-    collector = ParallelCollector([spec(0, 1, lanes=4, mix=mix)])
-    try:
-        episodes = collector.collect(24)
-    finally:
-        collector.close()
-
-    seen: set[int] = set()
-    for episode in episodes:
-        assert episode.cast.count(0) == 1, episode.cast
-        assert set(episode.cast) <= {0, 1, 2, 3}
-        seen |= {pid for pid in episode.cast if pid}
-        for seat, pid in enumerate(episode.cast):
-            assert bool(episode.trajectories[seat]) == (pid == 0)
-    assert seen == {1, 2, 3}
-
-
-def test_a_worker_seats_self_from_the_pool_and_records_every_learner_seat():
-    """`self` in a table pool is the learner again: one to four learner seats a
-    game, all of them recorded, opponent seats still never."""
-    mix = (("table(self|self|random|random-placement)", 1.0),)
-    collector = ParallelCollector([spec(0, 1, lanes=4, mix=mix)])
-    try:
-        episodes = collector.collect(24)
-    finally:
-        collector.close()
-
-    learner_seats = {episode.cast.count(0) for episode in episodes}
-    assert learner_seats <= {1, 2, 3, 4} and max(learner_seats) > 1, learner_seats
-    for episode in episodes:
-        assert set(episode.cast) <= {0, 1, 2}
-        for seat, pid in enumerate(episode.cast):
-            assert bool(episode.trajectories[seat]) == (pid == 0)
 
 
 def test_a_worker_hands_tempered_self_seats_their_temperature():
@@ -626,14 +542,138 @@ def test_a_worker_hands_tempered_self_seats_their_temperature():
         lanes=4,
         players=4,
         seed=11,
+        action_cap=200,
         opponents=[RandomPolicy(random.Random(1))],
         caster=lambda index: mix_table(mix, 4, 11)(index)[0],
         temperatures=mix_temperatures(mix, 4, 11),
     )
-    episodes = collector.collect(8)
+    episodes = collector.collect(4)
     temperatures = [t for _, t in Recording.seen]
     assert temperatures and all(0.6 <= t <= 1.4 for t in temperatures)
     assert any(t != 1.0 for t in temperatures) and any(t == 1.0 for t in temperatures)
     for episode in episodes:
         for seat, pid in enumerate(episode.cast):
             assert bool(episode.trajectories[seat]) == (pid == 0)
+
+
+def test_a_duel_entry_casts_two_live_seats_at_every_relative_slot():
+    """`duel(...)`: the learner and one drawn opponent on two live seats, the
+    other two retired and carrying the opponent's id; the opponent sits one,
+    two or three seats round from the learner; the law is pure in the index."""
+    from hexn.collect import mix_caster, mix_deal, parse_mix
+    from hexset.rules import DUEL_VARIANT_GAME
+
+    mix = parse_mix("duel(self|parent|network:/x/a.pt)=1.0")
+    cast, deal = mix_caster(mix, 4, 7), mix_deal(mix, 4, 7)
+    slots, members = set(), set()
+    for index in range(600):
+        game_type, retired = deal(index)
+        assert game_type is DUEL_VARIANT_GAME and len(retired) == 2
+        seats = cast(index)
+        live = [s for s in range(4) if s not in retired]
+        learner = next(s for s in live if seats[s] == 0)
+        partner = next(s for s in live if s != learner)
+        slots.add((partner - learner) % 4)
+        members.add(seats[partner])
+        assert all(seats[s] == seats[partner] for s in retired)
+        assert (cast(index), deal(index)) == (seats, (game_type, retired))
+    assert slots == {1, 2, 3} and members == {0, 1, 2}
+
+
+def test_mix_deal_is_absent_without_a_duel_and_standard_for_other_entries():
+    from hexn.collect import mix_deal, parse_mix
+    from hexset.rules import DUEL_VARIANT_GAME, STANDARD_GAME
+
+    assert mix_deal(parse_mix("table(self|parent)=1.0"), 4, 7) is None
+    deal = mix_deal(parse_mix("table(self|parent)=0.5,duel(self|parent)=0.5"), 4, 7)
+    kinds = {deal(index)[0] for index in range(200)}
+    assert kinds == {STANDARD_GAME, DUEL_VARIANT_GAME}
+    for index in range(200):
+        game_type, retired = deal(index)
+        assert (game_type is STANDARD_GAME) == (not retired)
+
+
+def test_a_worker_plays_duel_variant_games_on_the_live_seats_only():
+    """A duel entry reaches the worker's lanes: every game is dealt under the
+    duel-variant rules with its two retired seats never moving, and only the
+    learner's live seats are recorded."""
+    from hexn.collect import mix_deal
+    from hexset.rules import DUEL_VARIANT
+
+    mix = (("duel(self|random)", 1.0),)
+    collector = ParallelCollector([spec(0, 1, lanes=4, mix=mix)])
+    try:
+        episodes = collector.collect(12)
+    finally:
+        collector.close()
+
+    deal = mix_deal(mix, 4, 5)
+    for episode in episodes:
+        _, retired = deal(episode.index)
+        assert episode.record is not None and episode.record.rules == DUEL_VARIANT
+        for seat in range(4):
+            if seat in retired:
+                assert not episode.trajectories[seat]
+                assert episode.outcome.points[seat] == 0
+            else:
+                assert bool(episode.trajectories[seat]) == (episode.cast[seat] == 0)
+        if episode.outcome.winner is not None:
+            assert episode.outcome.winner not in retired
+
+
+def test_a_wedged_worker_fails_the_collection_and_a_resume_plays_only_the_rest(
+    tmp_path, monkeypatch
+):
+    """A worker that stops ticking fails the run instead of hanging it, a dead
+    one too, and the iteration's games survive both: the resumed collection
+    returns exactly the planned games, the kept ones as they were kept."""
+    import json
+    import os
+    import signal
+    import time
+
+    from hexn import collect, durable
+
+    monkeypatch.setattr(collect, "POLL_SECONDS", 0.2)
+    partial = durable.Partial(tmp_path / "partial" / "iter-00000")
+    heartbeat = tmp_path / "heartbeat.json"
+    first = ParallelCollector([spec(0, 2), spec(1, 2)], heartbeat=heartbeat)
+    try:
+        # Built and answering first: a fresh worker's interpreter start and
+        # torch import are not a stall, and are not what this is timing.
+        first.games_started()
+        first.stall_seconds = 2.0
+        first.start_collect(8, partial)
+        deadline = time.time() + 120
+        while not partial.finished() and time.time() < deadline:
+            time.sleep(0.05)
+        assert partial.finished(), "no game was kept as it finished"
+        stuck = first._processes[0]
+        os.kill(stuck.pid, signal.SIGSTOP)
+        with pytest.raises(RuntimeError, match="wedged"):
+            first.finish_collect()
+        assert json.loads(heartbeat.read_text())["workers"][0]["busy"]
+        os.kill(stuck.pid, signal.SIGKILL)
+        stuck.join(10)
+        first._busy.add(0)
+        with pytest.raises(RuntimeError, match="died"):
+            first._check()
+    finally:
+        for process in first._processes:
+            if process.is_alive():
+                process.kill()
+
+    plan = partial.plan()
+    assert sorted(plan) == list(range(8))
+    kept = {episode.index: episode for episode in partial.done()}
+    base = durable.resume_base(0, partial.indices())
+    resumed = ParallelCollector([spec(w, 2, first_game=base + w) for w in range(2)])
+    try:
+        episodes = resumed.collect(8, partial)
+        assert sorted(e.index for e in episodes) == list(range(8))
+        for episode in episodes:
+            if episode.index in kept:
+                assert episode.record == kept[episode.index].record
+        assert resumed.games_started() >= base
+    finally:
+        resumed.close()

@@ -23,6 +23,7 @@ has already learned from. It would look like it was working.
 from __future__ import annotations
 
 import argparse
+import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,11 +39,13 @@ from .collect import alternating, frozen
 from hexset.encoding import static_graph
 from hexset.game import start
 from hexset.gym.lanes import BoardBots
+from hexset.trading import UNLIMITED, TradeParams
 from .model import POLICY_HEADS, VALUE_HEADS, HexNet, ModelConfig, packing
 from .policy import NetworkPolicy
 from .ppo import ADAM_EPS
 from .rewards import reward
 from .selfplay import BatchPolicy, Episode
+from .trade import trade_params, trader_gate
 
 
 @dataclass
@@ -70,21 +73,31 @@ class Progress:
 class _Checkpoint:
     """`hexset.clients.policy.Checkpoint` for a policy hexn is holding live.
 
-    The protocol's fourth field, `max_trades`, is the trade switch *recorded
-    at training time*, read only when a caller's own switch is `None`
-    (`clients.netbot.bot_for`). hexn has no such recording -- every duel
-    passes its switch explicitly, at every call, through `compete_batched`'s
-    own `max_trades` -- so this is always `None` too: hexn's spelling for
-    "unbounded" either way, and never consulted when the run names a number.
+    `trade_params` is how this network bargains, read by name by
+    `hexset.clients.netbot.bot_for` (`hexset.trading.params_of`): the run's own
+    offer budget (`hexn.trade.trade_params`). A table no longer caps trading;
+    each seat declares its own, and this is the network declaring its own.
     """
 
     policy: object
     space: object
     players: int
-    max_trades: int | None = None
+    trade_params: TradeParams = UNLIMITED
 
 
-def duellist(policy) -> BatchPolicy:
+class _Traded(PolicyPolicy):
+    """A network's moves with a HexSet trader's gate at every seat it holds
+    (`hexn.trade.trader_gate`)."""
+
+    def __init__(self, policy, trader: str) -> None:
+        super().__init__(policy)
+        self.trader = trader
+
+    def gate(self, game, seat: int) -> object:
+        return trader_gate(self.trader, game, seat)
+
+
+def duellist(policy, max_offers: int | None = None, trader: str | None = None) -> BatchPolicy:
     """Whatever hexn seats in an evaluation, behind HexSet's `BatchPolicy`.
 
     A scripted rung is a `hexset.gym.lanes.BoardBots` bench
@@ -98,14 +111,18 @@ def duellist(policy) -> BatchPolicy:
     else already answers `act` over the lane driver's own requests and is
     passed through; a gate it wants seated it exposes as `BatchPolicy.gate`.
 
-    Takes no `max_trades` any more: the run's own switch reaches the gate
-    through `compete_batched(..., max_trades=...)`'s three-argument form
-    (`hexset.bench.versus._budgeted`), not a value bound in here.
+    `max_offers` is the network's own offer budget (`hexn.trade`): it goes on
+    the `_Checkpoint`, which is where HexSet reads how a network bargains.
+    `trader` gates a network's seats with that HexSet bot instead. A scripted
+    rung brings its own gate and ignores both.
     """
     if isinstance(policy, BoardBots):
         return BotPolicy(policy.spawn, capacity=policy.capacity)
+    if hasattr(policy, "act_rows") and trader is not None:
+        return _Traded(policy, trader)
     if hasattr(policy, "act_rows"):
-        return PolicyPolicy(policy, _Checkpoint(policy, policy.space, policy.players))
+        return PolicyPolicy(policy, _Checkpoint(
+            policy, policy.space, policy.players, trade_params(max_offers)))
     return policy
 
 
@@ -117,7 +134,8 @@ def duel(
     players: int,
     seed: int,
     network_seats: Sequence[int],
-    max_trades: int | None,
+    max_offers: int | None,
+    trader: str | None = None,
 ) -> dict:
     """Play the network against uniform-random opponents and report an interval.
 
@@ -136,9 +154,9 @@ def duel(
     driver happens to finish would select for short games, and game length is
     not independent of who is winning.
 
-    `max_trades` is the run's own trade switch, passed in rather than
-    defaulted, because a duel that trades where the run did not is measuring
-    a different game. The random seats never trade at all
+    `max_offers` is the network's own offer budget, passed in rather than
+    defaulted, because a network that trades where the run did not is
+    measuring a different game. The random seats never trade at all
     (`hexset.bots.RandomBot`), exactly as the `RandomPolicy` this replaced
     never did.
     """
@@ -146,7 +164,7 @@ def duel(
     cast = tuple(0 if seat in seats else 1 for seat in range(players))
     verdict = compete_batched(
         {
-            0: duellist(policy),
+            0: duellist(policy, max_offers, trader),
             1: BotPolicy(lambda board: RandomBot(random.Random(seed))),
         },
         games,
@@ -155,7 +173,6 @@ def duel(
         seed=seed,
         lanes=lanes,
         action_cap=4000,
-        max_trades=max_trades,
         antithetic=False,
         learner=0,
         episodes=True,
@@ -185,8 +202,9 @@ def versus(
     lanes: int,
     players: int,
     seed: int,
-    max_trades: int | None,
+    max_offers: int | None,
     antithetic: bool = True,
+    trader: str | None = None,
 ) -> dict:
     """The learner against one reference, two seats each, seats rotating.
 
@@ -222,14 +240,13 @@ def versus(
     account for the seat residual the same way.
     """
     verdict = compete_batched(
-        {0: duellist(policy), 1: duellist(reference)},
+        {0: duellist(policy, max_offers, trader), 1: duellist(reference, max_offers, trader)},
         games,
         caster=alternating(players),
         players=players,
         seed=seed,
         lanes=lanes,
         action_cap=4000,
-        max_trades=max_trades,
         antithetic=antithetic,
         learner=0,
     )
@@ -247,6 +264,20 @@ def rival_rung(directory: str, iteration: int, device: str, board, players: int)
     """
     path = Path(directory) / f"iter-{iteration:05d}.pt"
     if not path.exists():
+        return None
+    return frozen(str(path), device, board, players)
+
+
+def lag_rung(directory: Path, iteration: int, device: str, board, players: int):
+    """This run's own kept checkpoint at `iteration`, or None.
+
+    Exact iteration only, for the same reason `rival_rung` refuses a nearest
+    match: a lag that silently varied would not be a lag. A run launched with
+    `--init` keeps `iter-00000.pt`, so its first lag reads the weights it
+    started from.
+    """
+    path = Path(directory) / f"iter-{iteration:05d}.pt"
+    if iteration < 0 or not path.exists():
         return None
     return frozen(str(path), device, board, players)
 
@@ -272,7 +303,8 @@ def ladder(
             lanes=args.lanes,
             players=args.players,
             seed=args.seed + 10_000,
-            max_trades=args.max_trades,
+            max_offers=args.max_offers,
+            trader=getattr(args, "trader", None),
         )
         for name, reference in rungs.items()
     }
@@ -307,10 +339,14 @@ def summarise(
 
 
 def save(path: Path, payload: dict) -> None:
-    """Write then rename, so a crash mid-save cannot destroy the last good one."""
+    """Write, fsync, then rename, so a crash mid-save cannot destroy the last
+    good one and a renamed file is on the disk, not only in the page cache."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".partial")
-    torch.save(payload, temporary)
+    with open(temporary, "wb") as handle:
+        torch.save(payload, handle)
+        handle.flush()
+        os.fsync(handle.fileno())
     temporary.replace(path)
 
 
@@ -419,6 +455,7 @@ def build(args) -> tuple[NetworkPolicy, torch.optim.Optimizer, object]:
             value_head=getattr(args, "value_head", "linear"),
             policy_head=getattr(args, "policy_head", "linear"),
             quantiles=int(getattr(args, "quantiles", 32)),
+            fast_win=bool(getattr(args, "fast_win", None)),
         ),
     ).to(args.device)
     # The same instance attribute `hexn.exit.__main__` uses: gradient wiring,
@@ -429,6 +466,8 @@ def build(args) -> tuple[NetworkPolicy, torch.optim.Optimizer, object]:
     # reference path, which measured faster on CPU.
     net.fused = getattr(args, "fused", False)
     policy = NetworkPolicy(net, space, packing(graph, args.players), device=args.device)
+    policy.record_fast = net.config.fast_win
+    policy.vp_reward = float(getattr(args, "vp_reward", 0.0))
     # eps 1e-5 rather than torch's 1e-8, which is the standard PPO value and
     # matters more here than usual. `masked_log_softmax` zeroes the gradient at
     # illegal positions, and a position offers ~6 legal actions out of 456, so a

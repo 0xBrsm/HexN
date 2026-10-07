@@ -149,8 +149,8 @@ def main(argv: list[str] | None = None) -> int:
     behaviour = policy
     if args.behaviour:
         entrant = entrant_from_name(args.behaviour)
-        if entrant.max_trades is None:
-            entrant = replace(entrant, max_trades=loaded.max_trades)
+        if entrant.max_offers is None:
+            entrant = replace(entrant, max_offers=loaded.max_offers)
         behaviour = Scored(
             spawn(entrant, board, random.Random(args.seed + 2)), policy
         )
@@ -163,7 +163,7 @@ def main(argv: list[str] | None = None) -> int:
         players=args.players,
         seed=args.seed + 1,
         action_cap=args.action_cap,
-        max_trades=loaded.max_trades,
+        max_offers=loaded.max_offers,
         deal=args.games,
         board=board if fixed else None,
     )

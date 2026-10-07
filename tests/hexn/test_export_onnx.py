@@ -5,6 +5,7 @@ import random
 
 import numpy as np
 import pytest
+from _bots import needs
 
 torch = pytest.importorskip("torch", reason="PyTorch runs on the training box only")
 onnx = pytest.importorskip("onnx", reason="only needed to run hexn.export_onnx")
@@ -138,7 +139,7 @@ def test_record_encoder_matches_encode_batch():
         assert_exact(tuple(g[i] for g in got), obs)
 
 
-def a_checkpoint(path, *, players: int = 4, max_trades: int | None = 3, seed: int = 0):
+def a_checkpoint(path, *, players: int = 4, max_offers: int | None = 3, seed: int = 0):
     """A checkpoint in the shape `hexn.loop.save` writes, tiny enough to
     export quickly. Mirrors `test_netbot.py::a_checkpoint` — kept as its own
     copy rather than a cross-file import, same as that file does for itself.
@@ -157,7 +158,7 @@ def a_checkpoint(path, *, players: int = 4, max_trades: int | None = 3, seed: in
                 "players": players,
                 "width": 16,
                 "rounds": 1,
-                "max_trades": max_trades,
+                "max_offers": max_offers,
             },
         },
         path,
@@ -236,7 +237,7 @@ def test_the_graph_is_shaped_the_way_hexset_feeds_and_reads_it_v2(tmp_path):
 
 def test_the_exported_metadata_says_contract_6_and_matches_the_checkpoints_own_args(tmp_path):
     checkpoint = tmp_path / "latest.pt"
-    board = a_checkpoint(checkpoint, players=3, max_trades=5)
+    board = a_checkpoint(checkpoint, players=3, max_offers=5)
     out = tmp_path / "latest.onnx"
 
     export(str(checkpoint), out, topology=board.topology)
@@ -245,7 +246,7 @@ def test_the_exported_metadata_says_contract_6_and_matches_the_checkpoints_own_a
     meta = session.get_modelmeta().custom_metadata_map
     assert meta["contract"] == "6"
     assert meta["players"] == "3"
-    assert meta["max_trades"] == "5"
+    assert meta["max_offers"] == "5"
     assert meta["iteration"] == "7"
     assert meta["num_hexes"] == str(board.topology.num_hexes)
     assert meta["num_vertices"] == str(board.topology.num_vertices)
@@ -259,21 +260,23 @@ def test_the_exported_metadata_says_contract_6_and_matches_the_checkpoints_own_a
     # Nor about the trade gate's own continuation budget: the UI's gate
     # rolls no rollout unless a file asks for one.
     assert "gate_plies" not in meta
+    # Nor about a trader: the file trades through its own gate.
+    assert "trader" not in meta
 
 
-def test_a_checkpoint_that_omits_max_trades_exports_empty_metadata_not_none(tmp_path):
+def test_a_checkpoint_that_omits_max_offers_exports_empty_metadata_not_none(tmp_path):
     checkpoint = tmp_path / "latest.pt"
-    board = a_checkpoint(checkpoint, max_trades=None)
+    board = a_checkpoint(checkpoint, max_offers=None)
     out = tmp_path / "latest.onnx"
 
     export(str(checkpoint), out, topology=board.topology)
 
     session = ort.InferenceSession(str(out), providers=["CPUExecutionProvider"])
-    assert session.get_modelmeta().custom_metadata_map["max_trades"] == ""
+    assert session.get_modelmeta().custom_metadata_map["max_offers"] == ""
 
 
 def test_a_search_export_declares_itself_in_the_keys_hexset_reads(tmp_path):
-    """`hexset.clients.modelmeta.search_config`: `search == "mcts"` turns the
+    """`hexset.clients._modelmeta.search_config`: `search == "mcts"` turns the
     search on, `simulations`/`wave` are its budget, and the UI clamps them."""
     checkpoint = tmp_path / "latest.pt"
     board = a_checkpoint(checkpoint)
@@ -294,7 +297,7 @@ def test_a_search_export_declares_itself_in_the_keys_hexset_reads(tmp_path):
 
 
 def test_a_gate_plies_export_declares_itself_in_the_keys_hexset_reads(tmp_path):
-    """`hexset.clients.modelmeta.gate_config`: `gate_plies` is the trade gate's
+    """`hexset.clients._modelmeta.gate_config`: `gate_plies` is the trade gate's
     own continuation budget, independent of `search` -- a plain policy file
     (no `search` at all here) can still ask its gate to roll forward."""
     checkpoint = tmp_path / "latest.pt"
@@ -309,6 +312,25 @@ def test_a_gate_plies_export_declares_itself_in_the_keys_hexset_reads(tmp_path):
     assert meta["contract"] == "6"
     assert meta["gate_plies"] == "8"
     assert "search" not in meta
+
+
+@needs("heximax")
+def test_a_trader_export_names_it_in_the_key_hexset_reads(tmp_path):
+    """`hexset.clients._modelmeta.trader_config`: a file naming `trader` is
+    seated with that bot answering its trades; a file naming none is not
+    given the key at all."""
+    checkpoint = tmp_path / "latest.pt"
+    board = a_checkpoint(checkpoint)
+    out = tmp_path / "traded.onnx"
+
+    export(str(checkpoint), out, topology=board.topology, trader="heximax")
+
+    meta = ort.InferenceSession(
+        str(out), providers=["CPUExecutionProvider"]
+    ).get_modelmeta().custom_metadata_map
+    assert meta["trader"] == "heximax"
+    with pytest.raises(Exception):
+        export(str(checkpoint), tmp_path / "x.onnx", topology=board.topology, trader="nobody")
 
 
 def test_a_search_budget_without_a_search_is_refused_not_written(tmp_path):

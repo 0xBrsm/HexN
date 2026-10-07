@@ -64,4 +64,10 @@ positions — `floor`, `rank`, `horizon` — take
 positions are sampled and how many times each is rolled out; `sibling` probes
 positions too, but sizes that work with `--games` and `--probe` instead. Each
 module's own `--help` is the reference for its exact flag set.
+
+`floor`, `rank` and `horizon` also append each probed position to a JSONL
+journal as it finishes (`--rows`; named from the settings when omitted), and
+a rerun with the same settings resumes from it, probing only the positions it
+does not hold. Each position draws from streams keyed by its own index, so
+it reads the same whichever positions ran before it.
 </content>

@@ -133,6 +133,17 @@ column, which dominates the wall clock, costs nothing extra because its
 budget is partitioned rather than multiplied. `--simulations` at the parent is
 untouched: the tree already handles its own chance internally.
 
+## A run keeps every position as it finishes
+
+Each probed position is one line of `--rows` (a JSONL journal, named from
+the settings when not given) the moment its truth is in. A rerun with the
+same settings replays the seeding pass, which reproduces the same positions,
+checks each kept line's fingerprint against the position it rebuilt, and
+probes only the positions the journal does not hold yet. That works because
+every position draws from streams of its own, keyed by its index; the shared
+stream it used to draw its chance children and its search from made a
+position depend on every one probed before it.
+
     python -m hexn.benchmarks.rank --checkpoint runs/example/iter-00585.pt \\
         --positions 24 --rollouts 96
 """
@@ -156,6 +167,7 @@ from hexset.mcts import Leaf, draws_hidden, sampled_children
 from hexn.rewards import relative_points, reward
 from hexn.selfplay import Collector, Episode
 from hexset.victory import victory_points
+from hexn import durable
 
 DRAWS = 8
 """Draws per chance child. See "Averaging a chance child" in the docstring."""
@@ -180,9 +192,9 @@ class Forking:
     ranking that fails here fails everywhere.
     """
 
-    def __init__(self, policy, *, max_trades, rate, rng) -> None:
+    def __init__(self, policy, *, max_offers, rate, rng) -> None:
         self.policy = policy
-        self.max_trades = max_trades
+        self.max_offers = max_offers
         self.rate = rate
         self.rng = rng
 
@@ -191,7 +203,7 @@ class Forking:
         for row, request in enumerate(requests):
             if self.rng.random() >= self.rate:
                 continue
-            if not probeable(request.game, self.max_trades):
+            if not probeable(request.game, self.max_offers):
                 continue
             choices[row] = replace(
                 choices[row],
@@ -203,10 +215,10 @@ class Forking:
         return choices
 
 
-def options(game, max_trades) -> tuple:
+def options(game, max_offers) -> tuple:
     """Everything legal here.
 
-    `max_trades` no longer selects any of it — trading is an engine event, not
+    `max_offers` no longer selects any of it — trading is an engine event, not
     an action (`hexset.trading`) — and is kept only so the callers that thread
     the run's own switch through do not have to change shape.
     """
@@ -215,7 +227,7 @@ def options(game, max_trades) -> tuple:
     return tuple(legal_actions(game))
 
 
-def probeable(game, max_trades) -> tuple:
+def probeable(game, max_offers) -> tuple:
     """The same, but only where ranking children is a question worth asking.
 
     Roll positions are skipped: the spread across dice outcomes is chance, not
@@ -224,7 +236,7 @@ def probeable(game, max_trades) -> tuple:
     perfectly good leaf, and filtering it would hand `LeafEvaluator` an empty
     option list.
     """
-    legal = options(game, max_trades)
+    legal = options(game, max_offers)
     if len(legal) < 2 or any(a.type is ActionType.ROLL for a in legal):
         return ()
     return legal
@@ -298,7 +310,7 @@ class Row:
 
 
 def head_row(
-    game, children, seat: int, *, evaluator, max_trades, draws: int, rng, extra
+    game, children, seat: int, *, evaluator, max_offers, draws: int, rng, extra
 ) -> Row:
     """Score every child of one position, averaging over each one's draws.
 
@@ -338,7 +350,7 @@ def head_row(
             else:
                 slots.append((len(drawn), len(row)))
                 row.append(0.0)
-                leaves.append(Leaf(child, seat, options(child, max_trades)))
+                leaves.append(Leaf(child, seat, options(child, max_offers)))
         drawn.append(row)
     for (child_at, draw_at), (_, value) in zip(slots, evaluator.evaluate(leaves)):
         drawn[child_at][draw_at] = value[seat]
@@ -689,6 +701,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--json", default="")
+    parser.add_argument(
+        "--rows",
+        default="",
+        help="the journal each position is appended to as it finishes, and "
+        "the one a rerun resumes from; named from the settings when omitted",
+    )
     args = parser.parse_args(argv)
 
     import torch
@@ -720,7 +738,6 @@ def main(argv: list[str] | None = None) -> int:
             simulations=args.simulations,
             wave=args.wave,
             exploration=args.exploration,
-            max_trades=loaded.max_trades,
             rng=random.Random(args.seed + 9001),
         )
         if args.simulations
@@ -730,12 +747,12 @@ def main(argv: list[str] | None = None) -> int:
     started = time.perf_counter()
     rng = random.Random(args.seed + 2)
     seeding = Collector(
-        Forking(policy, max_trades=loaded.max_trades, rate=args.fork_rate, rng=rng),
+        Forking(policy, max_offers=loaded.max_offers, rate=args.fork_rate, rng=rng),
         lanes=min(16, args.seed_games),
         players=args.players,
         seed=args.seed + 1,
         action_cap=args.action_cap,
-        max_trades=loaded.max_trades,
+        max_offers=loaded.max_offers,
         deal=args.seed_games,
         board=board,
     )
@@ -749,12 +766,38 @@ def main(argv: list[str] | None = None) -> int:
     chosen = rng.sample(forks, min(args.positions, len(forks)))
     seeded = time.perf_counter() - started
 
+    header = {
+        **{k: v for k, v in vars(args).items() if k not in ("json", "rows")},
+        "iteration": loaded.iteration,
+    }
+    journal = durable.Rows(args.rows or durable.rows_path("rank", header), header)
+    if journal.kept:
+        print(
+            f"resuming {journal.path}: {len(journal.kept)} positions kept",
+            file=sys.stderr,
+        )
+
     rows = []
     agreed = 0
     for index, fork in enumerate(chosen):
-        children = probeable(fork.game, loaded.max_trades)
-        if len(children) < 2:
+        children = probeable(fork.game, loaded.max_offers)
+        fingerprint = durable.fingerprint(fork.seat, children)
+        done = journal.check(index, fingerprint)
+        if done is not None:
+            if done.get("skipped") == "agreed":
+                agreed += 1
+            elif "row" in done:
+                rows.append(done["row"])
             continue
+        if len(children) < 2:
+            journal.add(index, fingerprint, skipped="narrow")
+            continue
+        # This position's own streams, keyed by its index, so it draws the
+        # same whichever positions came before it -- what lets a rerun pick
+        # up part-way.
+        position_rng = random.Random(f"{args.seed}:{index}:rank")
+        if search is not None:
+            search.rng = random.Random(f"{args.seed}:{index}:search")
         if len(children) > args.max_children:
             children = tuple(
                 random.Random(args.seed + 11 + index).sample(
@@ -763,16 +806,16 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         # The head's opinion of the row. A chance child is averaged over
-        # `--chance-draws` draws; every other child is drawn once off the shared
-        # stream exactly as before.
+        # `--chance-draws` draws; every other child is drawn once off the
+        # position's own stream.
         scored = head_row(
             fork.game,
             children,
             fork.seat,
             evaluator=evaluator,
-            max_trades=loaded.max_trades,
+            max_offers=loaded.max_offers,
             draws=args.chance_draws,
-            rng=rng,
+            rng=position_rng,
             # A fresh generator on the same seed per child, so draw `d` of one
             # child comes off the same stream state as draw `d` of its siblings.
             extra=lambda: random.Random(args.seed + 13 + index),
@@ -823,6 +866,7 @@ def main(argv: list[str] | None = None) -> int:
             prior_pick, visit_pick = int(prior.argmax()), int(visits.argmax())
             if prior_pick == visit_pick:
                 agreed += 1
+                journal.add(index, fingerprint, skipped="agreed")
                 continue
             # Only the two children the search actually chose between: no other
             # child can appear in the comparison, so no other child's truth is
@@ -870,7 +914,7 @@ def main(argv: list[str] | None = None) -> int:
                     players=args.players,
                     seed=args.seed + 3,
                     action_cap=args.action_cap,
-                    max_trades=loaded.max_trades,
+                    max_offers=loaded.max_offers,
                     deal=lanes,
                     board=board,
                 )
@@ -908,6 +952,7 @@ def main(argv: list[str] | None = None) -> int:
             row["prior_values"] = [float(v) for v in prior]
             row["visit_values"] = [float(v) for v in visits]
             row["teacher"] = teacher_row(prior, visits, true)
+        journal.add(index, fingerprint, row=row)
         rows.append(row)
         print(
             f"[{len(rows)}/{len(chosen)}] children {row['children']:>2d} "

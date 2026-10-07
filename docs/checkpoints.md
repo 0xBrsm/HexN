@@ -183,7 +183,9 @@ onnxruntime-based server to read at load time.
   board-seat order, already un-rotated — each seat's own win probability).
 - **Metadata props**: `contract` (`hexset.onnx_record.CONTRACT_VERSION`),
   `players`, the topology fingerprint (`num_hexes`/`num_vertices`/
-  `num_edges`), `max_trades`, `iteration`, and `--gate-plies` (the served
+  `num_edges`), `max_offers` (the network's offer budget; a file still
+  carrying the pre-0.24 `max_trades` key is read as it), `iteration`, and
+  `--gate-plies` (the served
   trade gate's own look-ahead budget, independent of `--search`).
   `search=mcts` with `--simulations`/`--wave` is included only when passed
   on the command line.

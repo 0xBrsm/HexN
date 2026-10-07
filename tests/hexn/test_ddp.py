@@ -25,24 +25,38 @@ def _decided(episode):
     )
 
 
-def _fixture():
-    args = SimpleNamespace(
-        seed=5, players=4, width=8, rounds=1, device="cpu", learning_rate=3e-4
-    )
-    policy, optimiser, _ = build(args)
-    config = PPOConfig(minibatch=256, epochs=2)
+ARGS = SimpleNamespace(
+    seed=5, players=4, width=8, rounds=1, device="cpu", learning_rate=3e-4
+)
+
+
+@pytest.fixture(scope="module")
+def batch():
+    """One collected batch for the module; each test builds its own weights."""
+    policy, _, _ = build(ARGS)
     # Trade-free and decided, for the same reasons `test_ppo.some_episodes`
     # gives: the sharded update's claim is about the arithmetic, and a game
     # the cap truncates has no winner for the win head to be seen learning.
     collector = Collector(
-        policy, lanes=4, players=4, seed=5, action_cap=400, max_trades=0, deal=4
+        policy, lanes=2, players=4, seed=5, action_cap=100, max_offers=0, deal=2
     )
     episodes = [_decided(e) for e in collector.drain()]
-    batch = assemble(episodes, policy.layout, config)
-    return args, policy, optimiser, config, batch
+    return assemble(episodes, policy.layout, PPOConfig())
 
 
-def test_the_sharded_update_matches_the_single_device_update():
+@pytest.fixture(scope="module")
+def crew():
+    """Three spawned workers, shared: spawning them is most of what either test
+    costs, and a worker keeps nothing across updates beyond the shard each
+    update hands it afresh."""
+    crew = UpdateCrew([UpdateSpec(seed=5, players=4, width=8, rounds=1)] * 3)
+    try:
+        yield crew
+    finally:
+        crew.close()
+
+
+def test_the_sharded_update_matches_the_single_device_update(batch, crew):
     """The whole module's claim: same schedule, same math, same result.
 
     Both paths start from identical weights and optimizer state and walk the
@@ -55,7 +69,8 @@ def test_the_sharded_update_matches_the_single_device_update():
     genuinely different update moves parameters by ~5e-3, an order above the
     bar, which is what keeps the test non-vacuous.
     """
-    args, policy, optimiser, config, batch = _fixture()
+    policy, optimiser, _ = build(ARGS)
+    config = PPOConfig(minibatch=64, epochs=2)
     weights = copy.deepcopy(policy.net.state_dict())
     opt_state = copy.deepcopy(optimiser.state_dict())
     initial = (
@@ -69,17 +84,13 @@ def test_the_sharded_update_matches_the_single_device_update():
 
     policy.net.load_state_dict(weights)
     optimiser.load_state_dict(opt_state)
-    crew = UpdateCrew([UpdateSpec(seed=5, players=4, width=8, rounds=1)] * 2)
-    try:
-        sharded = crew.update(
-            policy,
-            optimiser,
-            batch,
-            config,
-            generator=torch.Generator().manual_seed(3),
-        )
-    finally:
-        crew.close()
+    sharded = crew.update(
+        policy,
+        optimiser,
+        batch,
+        config,
+        generator=torch.Generator().manual_seed(3),
+    )
     result = torch.nn.utils.parameters_to_vector(policy.net.parameters()).detach()
 
     assert torch.allclose(reference, result, atol=3e-4, rtol=1e-3), (
@@ -95,20 +106,24 @@ def test_the_sharded_update_matches_the_single_device_update():
     assert float((result - initial).abs().max()) > 1e-3
 
 
-def test_a_worker_with_no_rows_in_a_minibatch_is_harmless():
-    # Eight workers over a small batch: some minibatches miss some shards
-    # entirely, which must contribute nothing rather than hang or skew.
-    args, policy, optimiser, config, batch = _fixture()
-    crew = UpdateCrew([UpdateSpec(seed=5, players=4, width=8, rounds=1)] * 8)
-    try:
-        stats = crew.update(
-            policy,
-            optimiser,
-            batch,
-            config,
-            generator=torch.Generator().manual_seed(4),
-        )
-    finally:
-        crew.close()
+def test_a_worker_with_no_rows_in_a_minibatch_is_harmless(batch, crew):
+    # Three contiguous shards and two- or three-row minibatches: every step
+    # misses at least one shard entirely, which must contribute nothing rather
+    # than hang or skew. The first thirty rows are plenty of steps for that.
+    batch = type(batch)(
+        **{
+            field.name: None if (value := getattr(batch, field.name)) is None else value[:30]
+            for field in dataclasses.fields(batch)
+        }
+    )
+    policy, optimiser, _ = build(ARGS)
+    config = PPOConfig(minibatch=2, epochs=1)
+    stats = crew.update(
+        policy,
+        optimiser,
+        batch,
+        config,
+        generator=torch.Generator().manual_seed(4),
+    )
     assert stats.positions == len(batch)
     assert stats.value_loss > 0.0

@@ -57,7 +57,7 @@ def main() -> int:
                 device="cpu",
                 compile_mode=args.compile_mode,
                 inference_batch=None,
-                max_trades=None,
+                max_offers=None,
                 actions_per_game=args.actions_per_game,
             )
             process = context.Process(target=_measure, args=(queue, barrier, kwargs))

@@ -84,6 +84,7 @@ from hexset.board.terrain import NUM_RESOURCES
 from hexset.encoding import encode, global_columns, global_features, static_graph
 from hexset.game import is_over, start
 from hexset.play import step_randomly
+from . import runtime
 from .model import HexNet, ModelConfig, collate, config_from_args
 from .readout import GLOBALS, plan
 
@@ -364,8 +365,12 @@ def _win_temperature_samples(
     samples: there is no "eventual winner" to label them with.
     """
     from hexset.actions import apply
-    from hexset.bots.heximax import heximax
+    from hexset.arena import entrant_from_name, spawn
     from hexset.game import to_move
+
+    # By name, through the arena: HexSet ships no bots, and `heximax` is
+    # whatever bot the loaded runtime (`--runtime`) put behind the name.
+    heximax = entrant_from_name("heximax")
 
     observations: list = []
     winner_slots: list[int] = []
@@ -373,16 +378,15 @@ def _win_temperature_samples(
         board = random_base_board(random.Random(f"{seed}:{g}:board"))
         game = start(board, players, random.Random(f"{seed}:{g}:game"))
         bots = [
-            heximax(board, random.Random(f"{seed}:{g}:{s}")) for s in range(players)
+            spawn(heximax, board, random.Random(f"{seed}:{g}:{s}")) for s in range(players)
         ]
         game.gates = tuple(bots)
-        # Reproduce the historical protocol exactly: contract 5's default was
-        # the exhaustive automatic clearing house, uncapped (`max_trades`
-        # was `int | None`, `None` meaning "unbounded"). The engine's default
-        # is now the trade round (`trade_mode="round"`, `max_trades=1`), so
-        # matching the fit this helper reproduces needs both set explicitly.
+        # Reproduce the historical protocol: contract 5's default was the
+        # exhaustive automatic clearing house, uncapped. The engine's default
+        # is now the trade round, so the mechanism is set explicitly. There
+        # is no table cap left to lift: since HexSet 0.60 each seat's bot
+        # declares its own budget.
         game.trade_mode = "auto"
-        game.max_trades = -1
         pending: list[tuple[object, int]] = []
         last_turns = -1
         actions = 0
@@ -555,7 +559,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--win-seed", type=int, default=90000)
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--force", action="store_true")
+    runtime.add_argument(parser)
     args = parser.parse_args(argv)
+    runtime.load(args.runtime)
 
     if args.out.exists() and not args.force:
         raise SystemExit(f"{args.out} exists; pass --force to overwrite")

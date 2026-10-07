@@ -72,16 +72,21 @@ alongside and never differentiated.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Iterator, Sequence
+import math
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Iterator, Sequence
 
 import numpy as np
 import torch
 from torch import Tensor
 
-from hexset.encoding import to_frame
-from ..model import Packing, pack
-from ..policy import NetworkPolicy
+from hexset.encoding import global_columns, to_frame
+from hexset.game import Phase
+from ..model import Packing, pack, unpack
+from ..policy import NetworkPolicy, masked_log_softmax
+
+if TYPE_CHECKING:
+    from ..steps import Steps
 from ..rewards import relative_points, win_loss
 from ..selfplay import Episode, Transition
 
@@ -126,6 +131,12 @@ class PPOConfig:
     entropy_coefficient: float = 0.01
     epochs: int = 4
     minibatch: int = 1024
+    # Rows per forward/backward inside a minibatch. A minibatch larger than
+    # this is stepped through in micro-batches whose gradients accumulate,
+    # each weighted by its share of the minibatch's rows, into the one
+    # optimiser step the minibatch takes: same step, less device memory.
+    # 0 (the default) is the whole minibatch in one pass.
+    micro_batch: int = 0
     learning_rate: float = 3e-4
     max_grad_norm: float = 0.5
     # Shared across seats by default; carried on the config
@@ -159,8 +170,79 @@ class PPOConfig:
     # changes what the policy is paid, never what the head is trained toward.
     # Off by default, so existing batch assembly is unchanged.
     pair_baseline: bool = False
+    # Weight on KL(pi || prior): the learner's divergence from a fixed prior
+    # policy over every legal action, averaged over the minibatch's rows and
+    # added to the loss. The prior's log-probabilities ride on the batch
+    # (`attach_prior`), taken once per update from a frozen network, so the
+    # term costs no second forward per minibatch. The direction is the
+    # learner's own: it is the learner's probability mass that is charged for
+    # sitting where the prior puts little, which holds a warm-started policy
+    # near the play it was initialised from without pulling it toward every
+    # move the prior merely tolerates. 0.0, the default, adds nothing and
+    # takes no prior.
+    prior_kl: float = 0.0
+    # Pay for fast wins: `fast_win[r - 1]` is what a win in round `r` is worth
+    # (the last entry holds for every later round), and a loss or an unfinished
+    # game is worth zero whenever it ends -- so a losing seat gains nothing by
+    # stalling. The payoff reaches the policy through the fast-win head
+    # (`hexn.model.Prediction.fast`), which the net must be built with; the
+    # win head keeps its one-hot target. Empty, the default, pays every win 1.
+    fast_win: tuple[float, ...] = ()
+    # Pay `vp_reward` for every victory point a seat gains, at the decision
+    # after it lands (and charge it for one lost, a road or army award
+    # passing), on top of the win payoff. Over a game that sums to
+    # `vp_reward * (final - opening points)`, so it is part of the objective,
+    # weighted to stay well below a win. The critic for the extra return is
+    # the margin head, retargeted to final points / 10 (`assemble`), trained
+    # at `aux_margin_weight`, and recorded into the value by the policy
+    # (`hexn.policy.NetworkPolicy.vp_reward`). 0.0, the default, pays nothing.
+    vp_reward: float = 0.0
+    # Leave out of the batch every position whose mover's own recorded win
+    # estimate (`Transition.value[0]`) is below `decided_cut` or above
+    # `1 - decided_cut`: the game is settled for that seat, whatever it plays.
+    # The position still prices its neighbours -- GAE runs over the whole
+    # trajectory first -- and only then is the row dropped, from every loss
+    # term. 0.0, the default, keeps every position.
+    decided_cut: float = 0.0
+    # Every setup-phase position (`SETUP_SETTLEMENT`, `SETUP_ROAD`) enters the
+    # batch this many times, so the opening carries that many times its weight
+    # in every loss term. 1, the default, enters it once.
+    setup_weight: int = 1
+    # The update's forward and backward under autocast in this dtype, with a
+    # gradient scaler stepping the optimiser (`update`'s `scaler`). "" (the
+    # default) is fp32 throughout. "fp16" is the only other value: the network's
+    # outputs are cast back to fp32 before the log-softmax and every loss term
+    # (`NetworkPolicy.evaluate`), so only the trunk and heads run in half.
+    # bfloat16 is refused: its 7-bit mantissa moves the recomputed log-probs
+    # far enough from the recorded ones to clip positions before any step.
+    amp: str = ""
 
     def __post_init__(self) -> None:
+        if self.amp not in ("", "fp16"):
+            raise ValueError(f"amp must be '' or 'fp16', got {self.amp!r}")
+        if not 0.0 <= self.decided_cut < 0.5:
+            raise ValueError(f"decided_cut must lie in [0, 0.5), got {self.decided_cut}")
+        if self.decided_cut and (self.vp_reward or self.fast_win):
+            raise ValueError(
+                "decided_cut reads the recorded win estimate; under vp_reward or "
+                "fast_win the recorded value is not one"
+            )
+        if self.setup_weight < 1:
+            raise ValueError(f"setup_weight must be at least 1, got {self.setup_weight}")
+        if self.micro_batch < 0:
+            raise ValueError(f"micro_batch cannot be negative, got {self.micro_batch}")
+        if self.vp_reward < 0.0:
+            raise ValueError(f"vp_reward cannot be negative, got {self.vp_reward}")
+        if self.vp_reward and (self.aux_margin_weight <= 0.0 or self.critic != "gae"):
+            raise ValueError(
+                "vp_reward's critic is the margin head: it needs aux_margin_weight > 0 and critic='gae'"
+            )
+        if self.vp_reward and self.pair_baseline:
+            raise ValueError("vp_reward is not wired into the pair baseline")
+        if any(not 0.0 <= w <= 1.0 for w in self.fast_win):
+            raise ValueError(f"fast_win weights must lie in [0, 1], got {self.fast_win}")
+        if self.fast_win and self.critic != "gae":
+            raise ValueError("fast_win prices wins through the fast-win head; run it with critic='gae'")
         if self.reward != "win":
             raise ValueError(
                 f"unknown reward {self.reward!r}: the value head trains on "
@@ -183,6 +265,8 @@ class PPOConfig:
             raise ValueError(
                 f"aux_margin_weight cannot be negative, got {self.aux_margin_weight}"
             )
+        if self.prior_kl < 0.0:
+            raise ValueError(f"prior_kl cannot be negative, got {self.prior_kl}")
 
 
 @dataclass(frozen=True)
@@ -246,17 +330,45 @@ class Stats:
     # trains on nothing but still reads as an untrained head's error) so a
     # run that later turns the weight on has a baseline to compare against.
     margin_loss: float = 0.0
+    # Mean KL(pi || prior) over the update's minibatches, whenever the batch
+    # carries a prior (`attach_prior`); 0.0 when it does not. The distance the
+    # policy has walked from the prior, read directly rather than inferred
+    # from ladder results against it.
+    prior_kl: float = 0.0
+    # The fast-win head's cross-entropy (`PPOConfig.fast_win`); 0.0 without it.
+    fast_loss: float = 0.0
+    # Under `amp`: optimiser steps the gradient scaler skipped (an inf or nan
+    # in the scaled gradients), and its scale when the update finished.
+    amp_skipped: int = 0
+    amp_scale: float = 0.0
+
+
+def win_round(outcome, players: int) -> int:
+    """The round a game ended in: `outcome.turns` counts every seat's turns,
+    so round `r` holds turns `players * (r - 1) + 1` through `players * r`."""
+    return max(1, math.ceil(outcome.turns / players))
+
+
+def fast_weight(curve: Sequence[float], outcome, players: int) -> float:
+    """What `outcome`'s win is worth under `curve` (`PPOConfig.fast_win`):
+    the entry for its round, the last entry past the curve's end, and 0.0 for
+    a game with no winner."""
+    if outcome.winner is None:
+        return 0.0
+    return float(curve[min(win_round(outcome, players), len(curve)) - 1])
 
 
 def advantages(
-    values: np.ndarray, terminal: float, lam: float
+    values: np.ndarray, terminal: float, lam: float, rewards: np.ndarray | None = None
 ) -> np.ndarray:
     """GAE over one seat's trajectory, with gamma fixed at 1.
 
     `values` is the seat's own value estimate at each of its decisions, in
     order. `terminal` is the reward the game ended on, from this seat's point of
-    view. The reward is zero at every step but the last, so the residual is just
-    the change in the seat's own estimate, and only the final step sees a payoff.
+    view. Without `rewards` the reward is zero at every step but the last, so
+    the residual is just the change in the seat's own estimate, and only the
+    final step sees a payoff; `rewards[t]` adds a reward earned between
+    decision t and the next (`PPOConfig.vp_reward`).
     """
     steps = len(values)
     out = np.zeros(steps, dtype=np.float32)
@@ -266,6 +378,8 @@ def advantages(
         # where there is no next state and the payoff arrives instead.
         nxt = values[t + 1] if t + 1 < steps else 0.0
         payoff = terminal if t + 1 == steps else 0.0
+        if rewards is not None:
+            payoff += rewards[t]
         delta = payoff + GAMMA * nxt - values[t]
         running = delta + GAMMA * lam * running
         out[t] = running
@@ -289,6 +403,14 @@ class Batch:
     # The auxiliary margin head's target: `relative_points`, rotated the same
     # way. Read only by `minibatch_terms`'s aux term; never by the advantage.
     margin_target: Tensor
+    # A fixed prior policy's masked log-softmax over every action, one row per
+    # position, for `PPOConfig.prior_kl`. `None` unless `attach_prior` filled
+    # it, which is every batch a run without a prior ever builds.
+    prior_log_probs: Tensor | None = None
+    # The fast-win head's target (`PPOConfig.fast_win`): the round weight on
+    # the winner's slot in each transition's own frame, the rest on the last
+    # slot. `None` for a run that does not pay for speed.
+    fast_target: Tensor | None = None
 
     def __len__(self) -> int:
         return self.buffer.shape[0]
@@ -306,8 +428,104 @@ class Batch:
                     "value_target",
                     "margin_target",
                 )
-            }
+            },
+            prior_log_probs=(
+                None
+                if self.prior_log_probs is None
+                else self.prior_log_probs.to(device)
+            ),
+            fast_target=(
+                None if self.fast_target is None else self.fast_target.to(device)
+            ),
         )
+
+
+def autocast(device: torch.device | str, amp: str):
+    """The update's autocast context for `PPOConfig.amp`: fp16 on `device`'s
+    type, or a disabled context that leaves fp32 untouched."""
+    kind = torch.device(device).type
+    return torch.autocast(kind, dtype=torch.float16, enabled=amp == "fp16")
+
+
+def attach_prior(
+    batch: Batch,
+    prior: NetworkPolicy,
+    layout: Packing,
+    chunk: int = 4096,
+    amp: str = "",
+) -> Batch:
+    """`batch` with `prior`'s masked log-softmax over every row attached.
+
+    One no-grad forward of the prior per update, in chunks, on the prior's own
+    device; the minibatch loop then indexes the rows it needs. `layout` is the
+    one the batch was packed with, and the prior has to read rows the same
+    way -- which any checkpoint of the same board graph and seat count does,
+    since the packing depends on neither width nor rounds. `amp` is
+    `PPOConfig.amp`: the prior's forward runs under the same autocast as the
+    update's, its logits back in fp32 before the log-softmax.
+    """
+    if prior.layout != layout:
+        raise ValueError("the prior packs positions differently from the batch")
+    rows = []
+    with torch.no_grad():
+        for start in range(0, len(batch), chunk):
+            buffer = batch.buffer[start : start + chunk].to(prior.device)
+            mask = batch.mask[start : start + chunk].to(prior.device)
+            with autocast(prior.device, amp):
+                logits = prior.net(*unpack(layout, buffer)).logits.float()
+            rows.append(masked_log_softmax(logits, mask).to(batch.buffer.device))
+    return replace(batch, prior_log_probs=torch.cat(rows))
+
+
+SETUP_PHASES = (Phase.SETUP_SETTLEMENT, Phase.SETUP_ROAD)
+
+
+def copies(transition: Transition, phase: slice, config: PPOConfig) -> int:
+    """How many times `transition` enters the batch: 0 when its mover's own
+    win estimate puts it outside `config.decided_cut`, `config.setup_weight`
+    in a setup phase, else 1. `phase` is the observation's phase block
+    (`hexset.encoding.global_columns(players)["phase"]`)."""
+    if config.decided_cut:
+        if not transition.value:
+            raise ValueError("decided_cut needs every recorded transition's value estimate")
+        own = transition.value[0]
+        if own < config.decided_cut or own > 1.0 - config.decided_cut:
+            return 0
+    if config.setup_weight != 1:
+        if int(np.argmax(transition.observation.globals[phase])) in SETUP_PHASES:
+            return config.setup_weight
+    return 1
+
+
+def stakes_gauges(episodes: Sequence[Episode], config: PPOConfig) -> dict[str, float]:
+    """What `decided_cut` and `setup_weight` did to one collection: the share
+    of recorded positions dropped, the share of the dropped ones whose mover
+    went on to win, on each side of the cut (a calibrated head wins about
+    `decided_cut` of its low drops and misses about that share of its high
+    ones), and the setup positions repeated."""
+    recorded = low = low_won = high = high_won = setup = 0
+    for episode in episodes:
+        winner = episode.outcome.winner
+        phase = global_columns(len(episode.outcome.points))["phase"]
+        for seat, trajectory in enumerate(episode.trajectories):
+            for transition in trajectory:
+                recorded += 1
+                n = copies(transition, phase, config)
+                if n == 0:
+                    if transition.value[0] < 0.5:
+                        low += 1
+                        low_won += winner == seat
+                    else:
+                        high += 1
+                        high_won += winner == seat
+                elif n > 1:
+                    setup += 1
+    return {
+        "decided_share": (low + high) / recorded if recorded else 0.0,
+        "decided_low_won": low_won / low if low else 0.0,
+        "decided_high_won": high_won / high if high else 0.0,
+        "setup_repeated": setup,
+    }
 
 
 def assemble(
@@ -326,20 +544,39 @@ def assemble(
     advantage_blocks: list[np.ndarray] = []
     targets: list[np.ndarray] = []
     margin_targets: list[np.ndarray] = []
+    fast_targets: list[np.ndarray] = []
+    counts: list[int] = []
+    weighed = bool(config.decided_cut) or config.setup_weight != 1
+
+    def paid(episode: Episode) -> tuple[float, ...]:
+        # What each seat is paid: the win/loss vector, scaled by the winning
+        # round's weight when the run pays for speed.
+        wins = win_loss(episode.outcome)
+        if not config.fast_win:
+            return wins
+        weight = fast_weight(config.fast_win, episode.outcome, len(wins))
+        return tuple(weight * x for x in wins)
 
     # The pair baseline needs every game's mate in the same batch: a game is a
     # pure function of (seed, index), so the pairing key is the same pair.
     # `owned` keeps every episode (it empties seats, never drops games), so a
     # learner's slice of a paired cohort still carries both halves.
     dealt = (
-        {(e.seed, e.index): win_loss(e.outcome) for e in episodes}
+        {(e.seed, e.index): paid(e) for e in episodes}
         if config.pair_baseline
         else {}
     )
 
     for episode in episodes:
         wins = win_loss(episode.outcome)
-        margins = relative_points(episode.outcome.points)
+        pay = paid(episode)
+        # In vp_reward mode the margin head is the critic for the VP still to
+        # come, so its target is each seat's final points (/ 10, its scale).
+        margins = (
+            tuple(p / 10.0 for p in episode.outcome.points)
+            if config.vp_reward
+            else relative_points(episode.outcome.points)
+        )
         mate = None
         if config.pair_baseline:
             mate = dealt.get((episode.seed, episode.index ^ 1))
@@ -350,13 +587,15 @@ def assemble(
                     "paired dealing (pair_boards) and an even cohort of "
                     "complete pairs"
                 )
+        phase = global_columns(len(wins))["phase"]
         for seat, trajectory in enumerate(episode.trajectories):
             if not trajectory:
                 continue
             seen = to_frame(wins, seat)
+            earned = to_frame(pay, seat)
             # Component 0 is this seat's own payoff, because `to_frame` puts it
             # first — the same convention the encoder and the value head use.
-            own = np.float32(seen[0])
+            own = np.float32(earned[0])
             if mate is not None:
                 # (r - r')/2 is algebraically r - (r + r')/2 in exact
                 # arithmetic, computed in the form whose float rounding makes
@@ -364,7 +603,7 @@ def assemble(
                 # negating a difference is exact, subtracting a rounded
                 # midpoint is not. The raw `seen` still feeds `target` below:
                 # only the policy-gradient terminal moves.
-                own = np.float32((seen[0] - mate[seat]) / 2)
+                own = np.float32((earned[0] - mate[seat]) / 2)
             if config.critic == "gae":
                 # Raise rather than substitute 0.0 for a missing estimate. A single
                 # zero mid-chain corrupts two GAE residuals directly and ~20 more
@@ -385,7 +624,11 @@ def assemble(
                     [t.value[0] for t in trajectory],
                     dtype=np.float32,
                 )
-                advantage_blocks.append(advantages(estimates, own, config.lam))
+                steps_paid = None
+                if config.vp_reward:
+                    held = [t.points for t in trajectory] + [episode.outcome.points[seat]]
+                    steps_paid = config.vp_reward * np.diff(np.asarray(held, dtype=np.float32))
+                advantage_blocks.append(advantages(estimates, own, config.lam, steps_paid))
             else:
                 # REINFORCE: every decision in the game is credited with the
                 # seat's terminal return, whole. Not GAE-with-zeros — with V≡0
@@ -401,6 +644,11 @@ def assemble(
 
             target = np.asarray(seen, dtype=np.float32)
             margin_target = np.asarray(to_frame(margins, seat), dtype=np.float32)
+            fast_target = (
+                np.asarray([*earned, 1.0 - sum(earned)], dtype=np.float32)
+                if config.fast_win
+                else None
+            )
             for transition in trajectory:
                 observations.append(transition.observation)
                 masks.append(transition.mask)
@@ -408,6 +656,25 @@ def assemble(
                 log_probs.append(transition.log_prob)
                 targets.append(target)
                 margin_targets.append(margin_target)
+                if fast_target is not None:
+                    fast_targets.append(fast_target)
+                if weighed:
+                    counts.append(copies(transition, phase, config))
+
+    advantage = np.concatenate(advantage_blocks) if advantage_blocks else None
+    if weighed and observations:
+        # Every row's advantage is taken over its whole trajectory above;
+        # only now are rows dropped or repeated, all fields together.
+        rows = np.repeat(np.arange(len(counts)), counts)
+        observations = [observations[i] for i in rows]
+        masks = [masks[i] for i in rows]
+        chosen = [chosen[i] for i in rows]
+        log_probs = [log_probs[i] for i in rows]
+        targets = [targets[i] for i in rows]
+        margin_targets = [margin_targets[i] for i in rows]
+        if config.fast_win:
+            fast_targets = [fast_targets[i] for i in rows]
+        advantage = advantage[rows]
 
     if not observations:
         raise ValueError("no transitions to learn from")
@@ -417,9 +684,12 @@ def assemble(
         mask=torch.from_numpy(np.stack(masks)),
         chosen=torch.tensor(chosen, dtype=torch.int64),
         log_prob=torch.tensor(log_probs, dtype=torch.float32),
-        advantage=torch.from_numpy(np.concatenate(advantage_blocks)),
+        advantage=torch.from_numpy(advantage),
         value_target=torch.from_numpy(np.stack(targets)),
         margin_target=torch.from_numpy(np.stack(margin_targets)),
+        fast_target=(
+            torch.from_numpy(np.stack(fast_targets)) if config.fast_win else None
+        ),
     )
 
 
@@ -442,12 +712,17 @@ def _minibatches(
     — draw their minibatches here, so the guard lands once for all of them.
     """
     order = torch.randperm(size, generator=generator)
+    for start, stop in _bounds(size, minibatch):
+        yield order[start:stop]
+
+
+def _bounds(size: int, minibatch: int) -> list[tuple[int, int]]:
+    """`_minibatches`' chunk boundaries, known without drawing the shuffle."""
     bounds = [(start, min(start + minibatch, size)) for start in range(0, size, minibatch)]
     if len(bounds) > 1 and bounds[-1][1] - bounds[-1][0] == 1:
         bounds[-2] = (bounds[-2][0], bounds[-1][1])
         bounds.pop()
-    for start, stop in bounds:
-        yield order[start:stop]
+    return bounds
 
 
 @dataclass(frozen=True)
@@ -488,6 +763,13 @@ class Terms:
     entropy: Tensor
     approx_kl: Tensor
     clip_fraction: Tensor
+    # `config.prior_kl * prior_kl`, attached, and the divergence itself,
+    # detached. Both `None` when the minibatch came with no prior, so a caller
+    # that never attaches one sees exactly the four summands it always has.
+    prior_term: Tensor | None = None
+    prior_kl: Tensor | None = None
+    # The fast-win head's cross-entropy, detached; `None` without a target.
+    fast_loss: Tensor | None = None
 
 
 def minibatch_terms(
@@ -500,9 +782,13 @@ def minibatch_terms(
     value_target: Tensor,
     margin_target: Tensor,
     config: PPOConfig,
+    prior_log_probs: Tensor | None = None,
+    fast_target: Tensor | None = None,
 ) -> Terms:
     """The clipped surrogate, win-head loss, auxiliary margin loss and
-    entropy for one minibatch.
+    entropy for one minibatch -- plus, when `prior_log_probs` is given, the
+    divergence to that prior (`PPOConfig.prior_kl`), and when `fast_target` is
+    given, the fast-win head's cross-entropy, inside the value term.
 
     `advantage` arrives already normalised — the caller owns that, because a
     sharded worker only holds a slice of the minibatch and cannot compute the
@@ -536,6 +822,16 @@ def minibatch_terms(
     # multiplies the gradient into the head (and, through it, the trunk) to
     # exactly zero -- not merely a small number -- since it is a Python float
     # zero times a tensor.
+    fast_loss = None
+    if fast_target is not None:
+        if evaluation.fast_logits is None:
+            raise ValueError("a fast-win target needs a net built with fast_win")
+        fast_loss = -(
+            fast_target * torch.log_softmax(evaluation.fast_logits, dim=-1)
+        ).sum(-1).mean()
+        value_loss_total = value_loss + fast_loss
+    else:
+        value_loss_total = value_loss
     margin_loss = (evaluation.margin - margin_target).pow(2).mean()
     margin_term = config.aux_margin_weight * margin_loss
     entropy = evaluation.entropy.mean()
@@ -543,7 +839,7 @@ def minibatch_terms(
     # gradient reaches the head or the trunk through it; `value_loss` is still
     # computed and logged, and reads as the untrained head's error.
     value_term = (
-        config.value_coefficient * value_loss
+        config.value_coefficient * value_loss_total
         if config.critic != "none"
         else torch.zeros_like(policy_loss)
     )
@@ -553,6 +849,19 @@ def minibatch_terms(
         + margin_term
         - config.entropy_coefficient * entropy
     )
+    prior_term = prior_kl = None
+    if prior_log_probs is not None:
+        # Over the legal entries only. The masked ones hold ~NEG in both rows
+        # and zero probability under the learner, which is a finite zero in
+        # exact arithmetic and not worth trusting to float32.
+        log_probs = evaluation.log_probs
+        divergence = torch.where(
+            mask, log_probs.exp() * (log_probs - prior_log_probs), 0.0
+        ).sum(-1)
+        prior_kl = divergence.mean()
+        prior_term = config.prior_kl * prior_kl
+        loss = loss + prior_term
+        prior_kl = prior_kl.detach()
     with torch.no_grad():
         # Schulman's low-variance estimator, which unlike the plain log-ratio
         # mean is non-negative and so cannot hide a diverging update behind
@@ -587,6 +896,9 @@ def minibatch_terms(
         entropy=entropy.detach(),
         approx_kl=kl,
         clip_fraction=clipped,
+        prior_term=prior_term,
+        prior_kl=prior_kl,
+        fast_loss=None if fast_loss is None else fast_loss.detach(),
     )
 
 
@@ -629,6 +941,81 @@ def _explained_variance(predicted: Tensor, actual: Tensor) -> float:
     return float(1 - (actual - predicted).var() / variance)
 
 
+def _terms_for(
+    policy: NetworkPolicy, batch: Batch, rows: Tensor, advantage: Tensor, config: PPOConfig
+) -> Terms:
+    """`minibatch_terms` on `rows` of `batch`, `advantage` already normalised
+    and on the policy's device. The rows are gathered where the batch lives
+    and moved to the device (a no-op when the batch is already there)."""
+    device = policy.device
+
+    def take(field: Tensor | None) -> Tensor | None:
+        return None if field is None else field[rows].to(device)
+
+    with autocast(device, config.amp):
+        return minibatch_terms(
+            policy,
+            take(batch.buffer),
+            take(batch.mask),
+            take(batch.chosen),
+            take(batch.log_prob),
+            advantage,
+            take(batch.value_target),
+            take(batch.margin_target),
+            config,
+            prior_log_probs=take(batch.prior_log_probs),
+            fast_target=take(batch.fast_target),
+        )
+
+
+def _backward(loss: Tensor, scaler: "torch.amp.GradScaler | None") -> None:
+    """`loss.backward()`, through the gradient scaler when there is one."""
+    (loss if scaler is None else scaler.scale(loss)).backward()
+
+
+def _accumulate(
+    policy: NetworkPolicy,
+    batch: Batch,
+    rows: Tensor,
+    advantage: Tensor,
+    config: PPOConfig,
+    scaler: "torch.amp.GradScaler | None" = None,
+) -> Terms:
+    """One minibatch in `config.micro_batch`-row slices, gradients accumulated.
+
+    Every term of the loss is a mean over rows, so weighting each slice's loss
+    by its share of the minibatch's rows and summing the backwards gives the
+    whole minibatch's gradient. The returned gauges are the same row-weighted
+    means, so they read as the whole minibatch's; `value` is every slice's,
+    in `rows` order. Everything returned is detached: the gradient is taken.
+    """
+    total = len(rows)
+    sums: dict[str, Tensor | None] = {}
+    values: list[Tensor] = []
+    for start in range(0, total, config.micro_batch):
+        piece = slice(start, start + config.micro_batch)
+        terms = _terms_for(policy, batch, rows[piece], advantage[piece], config)
+        share = len(rows[piece]) / total
+        _backward(terms.loss * share, scaler)
+        for field in _ACCUMULATED:
+            got = getattr(terms, field)
+            if got is None:
+                sums[field] = None
+            else:
+                got = share * got.detach()
+                sums[field] = got if start == 0 else sums[field] + got
+        values.append(terms.value)
+    return Terms(value=torch.cat(values), **sums)
+
+
+# Every `Terms` field but `value`: the row means `_accumulate` weights by share.
+_ACCUMULATED = (
+    "loss", "policy_term", "value_term", "entropy_term", "margin_term",
+    "policy_loss", "value_loss", "value_mse", "margin_loss", "entropy",
+    "approx_kl", "clip_fraction", "prior_term", "prior_kl", "fast_loss",
+)
+
+
 def update(
     policy: NetworkPolicy,
     optimiser: torch.optim.Optimizer,
@@ -636,71 +1023,112 @@ def update(
     config: PPOConfig,
     *,
     generator: torch.Generator | None = None,
+    steps: "Steps | None" = None,
+    scaler: "torch.amp.GradScaler | None" = None,
 ) -> Stats:
-    """One PPO update: `config.epochs` passes over `batch` in minibatches."""
-    batch = batch.to(policy.device)
+    """One PPO update: `config.epochs` passes over `batch` in minibatches.
+
+    With `steps` (`hexn.steps.Steps`) the update's progress goes to disk after
+    its optimiser steps, and an update `steps` was opened to resume carries
+    on from the step it holds.
+
+    Under `config.amp` the losses are scaled by `scaler`, which the caller
+    keeps for the whole run (its scale carries from update to update), and the
+    gradients are unscaled before they are clipped; a step whose scaled
+    gradients overflowed is skipped and counted in `Stats.amp_skipped`.
+    """
+    if bool(config.amp) != (scaler is not None):
+        raise ValueError("amp and a gradient scaler must come together")
+    from ..steps import Cursor
+
+    if bool(config.fast_win) != (batch.fast_target is not None):
+        raise ValueError("fast_win and the batch's fast-win target must come together (assemble)")
+    if config.prior_kl > 0 and batch.prior_log_probs is None:
+        # A weight with nothing to weigh would train as if it were zero and
+        # log a zero divergence, which reads as "the policy has not moved".
+        raise ValueError("prior_kl is set but the batch carries no prior (attach_prior)")
+    # A micro-batched update leaves the batch where it is (the host, as
+    # `assemble` builds it) and moves each slice's rows to the device as it
+    # is used, so the device holds one slice rather than the whole batch.
+    if not (config.micro_batch and config.micro_batch < config.minibatch):
+        batch = batch.to(policy.device)
     size = len(batch)
 
-    policy_losses: list[Tensor] = []
-    value_losses: list[Tensor] = []
-    entropies: list[Tensor] = []
-    kls: list[Tensor] = []
-    clipped: list[Tensor] = []
-    value_mses: list[Tensor] = []
-    margin_losses: list[Tensor] = []
-    grad_norms: list[Tensor] = []
-    epoch_kls: list[list[Tensor]] = []
-    epoch_clips: list[list[Tensor]] = []
-    predicted_for_variance = None
+    # Every per-step gauge, as device tensors read back once at the end, in
+    # one dict so a step file can carry them (`hexn.steps`).
+    g: dict = {
+        name: []
+        for name in (
+            "policy_losses", "value_losses", "entropies", "kls", "clipped",
+            "value_mses", "margin_losses", "prior_kls", "fast_losses",
+            "grad_norms", "epoch_kls", "epoch_clips",
+        )
+    }
+    g["variance"] = None
+    cursor = Cursor(generator, steps, policy, optimiser, lambda: g)
+    held = cursor.restored(policy.device)
+    if held is not None:
+        g = held
+        if g["variance"] is not None:
+            value, rows = g["variance"]
+            g["variance"] = (value, rows.to(batch.buffer.device))
 
     epochs_taken = 0
-    for _ in range(config.epochs):
-        epoch_kls.append([])
-        epoch_clips.append([])
-        for rows in _minibatches(size, config.minibatch, generator):
-            rows = rows.to(policy.device)
-            advantage = batch.advantage[rows]
+    amp_skipped = 0
+    for epoch in range(config.epochs):
+        if len(g["epoch_kls"]) <= epoch:
+            g["epoch_kls"].append([])
+            g["epoch_clips"].append([])
+        for rows in cursor.passes(size, config.minibatch):
+            rows = rows.to(batch.buffer.device)
+            advantage = batch.advantage[rows].to(policy.device)
             # Normalised per minibatch, which is what makes one clip range work
             # across a run whose reward scale is fixed but whose advantage
             # spread collapses as the value head improves. `_minibatches`
             # guarantees at least two rows, without which `std()` returns nan.
+            # Over the whole minibatch even when it is micro-batched below.
             advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
 
-            terms = minibatch_terms(
-                policy,
-                batch.buffer[rows],
-                batch.mask[rows],
-                batch.chosen[rows],
-                batch.log_prob[rows],
-                advantage,
-                batch.value_target[rows],
-                batch.margin_target[rows],
-                config,
-            )
-
             optimiser.zero_grad(set_to_none=True)
-            terms.loss.backward()
+            if config.micro_batch and config.micro_batch < len(rows):
+                terms = _accumulate(policy, batch, rows, advantage, config, scaler)
+            else:
+                terms = _terms_for(policy, batch, rows, advantage, config)
+                _backward(terms.loss, scaler)
+            if scaler is not None:
+                scaler.unscale_(optimiser)
             # The return value is the norm *before* clipping, which is the only
             # way to know whether `max_grad_norm` is binding. Kept, not
             # dropped, and kept as a tensor -- read back once, with the rest of
             # the update's gauges, in `_stack_median` below.
-            grad_norms.append(
+            g["grad_norms"].append(
                 torch.nn.utils.clip_grad_norm_(
                     policy.net.parameters(), config.max_grad_norm
                 ).detach()
             )
-            optimiser.step()
+            if scaler is None:
+                optimiser.step()
+            else:
+                scale = scaler.get_scale()
+                scaler.step(optimiser)
+                scaler.update()
+                amp_skipped += scaler.get_scale() < scale
 
-            policy_losses.append(terms.policy_loss)
-            value_losses.append(terms.value_loss)
-            value_mses.append(terms.value_mse)
-            margin_losses.append(terms.margin_loss)
-            entropies.append(terms.entropy)
-            kls.append(terms.approx_kl)
-            clipped.append(terms.clip_fraction)
-            epoch_kls[-1].append(terms.approx_kl)
-            epoch_clips[-1].append(terms.clip_fraction)
-            predicted_for_variance = (terms.value, rows)
+            g["policy_losses"].append(terms.policy_loss)
+            g["value_losses"].append(terms.value_loss)
+            g["value_mses"].append(terms.value_mse)
+            g["margin_losses"].append(terms.margin_loss)
+            if terms.prior_kl is not None:
+                g["prior_kls"].append(terms.prior_kl)
+            if terms.fast_loss is not None:
+                g["fast_losses"].append(terms.fast_loss)
+            g["entropies"].append(terms.entropy)
+            g["kls"].append(terms.approx_kl)
+            g["clipped"].append(terms.clip_fraction)
+            g["epoch_kls"][epoch].append(terms.approx_kl)
+            g["epoch_clips"][epoch].append(terms.clip_fraction)
+            g["variance"] = (terms.value, rows)
+            cursor.stepped()
 
         epochs_taken += 1
         # The break reads the epoch that just finished, so the damage an over-
@@ -710,8 +1138,11 @@ def update(
         # decision to keep taking epochs has to be made in Python, and
         # `config.kl_break > 0` short-circuits it away entirely at the
         # every-run-on-record default of 0.
-        if config.kl_break > 0 and _stack_mean(epoch_kls[-1]) > config.kl_break:
+        if config.kl_break > 0 and _stack_mean(g["epoch_kls"][epoch]) > config.kl_break:
             break
+    cursor.finish()
+    predicted_for_variance = g["variance"]
+    epoch_kls, epoch_clips = g["epoch_kls"], g["epoch_clips"]
 
     with torch.no_grad():
         if predicted_for_variance is None:
@@ -719,26 +1150,30 @@ def update(
         else:
             predicted, rows = predicted_for_variance
             variance = _explained_variance(
-                predicted[:, 0], batch.value_target[rows][:, 0]
+                predicted[:, 0], batch.value_target[rows][:, 0].to(predicted.device)
             )
 
     return Stats(
         positions=size,
-        policy_loss=_stack_mean(policy_losses),
-        value_loss=_stack_mean(value_losses),
-        entropy=_stack_mean(entropies),
-        approx_kl=_stack_mean(kls),
-        clip_fraction=_stack_mean(clipped),
+        policy_loss=_stack_mean(g["policy_losses"]),
+        value_loss=_stack_mean(g["value_losses"]),
+        entropy=_stack_mean(g["entropies"]),
+        approx_kl=_stack_mean(g["kls"]),
+        clip_fraction=_stack_mean(g["clipped"]),
         explained_variance=variance,
         approx_kl_first_minibatch=(
             float(epoch_kls[0][0]) if epoch_kls[0] else 0.0
         ),
         approx_kl_last_epoch=_stack_mean(epoch_kls[-1]),
         clip_fraction_last_epoch=_stack_mean(epoch_clips[-1]),
-        grad_norm=_stack_median(grad_norms),
+        grad_norm=_stack_median(g["grad_norms"]),
         value_target_variance=float(batch.value_target[:, 0].var()),
         lr=float(optimiser.param_groups[0]["lr"]),
         epochs_taken=epochs_taken,
-        value_mse=_stack_mean(value_mses),
-        margin_loss=_stack_mean(margin_losses),
+        value_mse=_stack_mean(g["value_mses"]),
+        margin_loss=_stack_mean(g["margin_losses"]),
+        prior_kl=_stack_mean(g["prior_kls"]),
+        fast_loss=_stack_mean(g["fast_losses"]),
+        amp_skipped=amp_skipped,
+        amp_scale=scaler.get_scale() if scaler is not None else 0.0,
     )

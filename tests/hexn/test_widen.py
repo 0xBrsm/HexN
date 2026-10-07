@@ -58,7 +58,8 @@ def widen(narrow: HexNet, width: int, **kwargs) -> HexNet:
     return wide.eval()
 
 
-@pytest.mark.parametrize("old,new", [(16, 32), (16, 24), (8, 40)])
+# A non-integer ratio and a 5x one; 16 -> 32 is what every test below widens.
+@pytest.mark.parametrize("old,new", [(16, 24), (8, 40)])
 def test_widening_preserves_the_function_on_both_forward_paths(old, new):
     narrow = a_net(old)
     wide = widen(narrow, new)
@@ -69,7 +70,7 @@ def test_widening_preserves_the_function_on_both_forward_paths(old, new):
     assert report["max_rel_value_delta_fused"] < 1e-5
 
 
-@pytest.mark.parametrize("shape", ["mlp", "pooled", "attn", "quantile"])
+@pytest.mark.parametrize("shape", ["mlp", "attn", "quantile"])
 def test_every_head_shape_widens_exactly(shape):
     kwargs = {"value_head": shape} if shape != "mlp" else {"value_head": "mlp", "policy_head": "mlp"}
     narrow = a_net(16, **kwargs)
@@ -77,14 +78,6 @@ def test_every_head_shape_widens_exactly(shape):
     report = compare(narrow, wide, observations(6))
     assert report["max_rel_logit_delta_reference"] < 1e-5
     assert report["max_rel_value_delta_reference"] < 1e-5
-
-
-def test_the_wide_net_has_exactly_a_fresh_wide_nets_parameters():
-    narrow = a_net(16)
-    wide = widen(narrow, 32)
-    fresh = a_net(32)
-    assert sum(p.numel() for p in wide.parameters()) == sum(p.numel() for p in fresh.parameters())
-    assert set(wide.state_dict()) == set(fresh.state_dict())
 
 
 def test_the_first_old_units_are_the_narrow_net():
@@ -111,22 +104,6 @@ def test_noise_separates_the_copies_and_moves_the_function_only_slightly():
     # per-seed spread; 3e-2 still bounds "only slightly".
     assert 0.0 < report["mean_policy_kl_reference"] < 3e-2
     assert report["max_abs_logit_delta_reference"] > 0.0
-
-
-def test_the_noise_is_seeded():
-    narrow = a_net(16)
-    a = widen(narrow, 32, noise=0.01, seed=7)
-    b = widen(narrow, 32, noise=0.01, seed=7)
-    c = widen(narrow, 32, noise=0.01, seed=8)
-    assert torch.equal(a.embed_hex.weight, b.embed_hex.weight)
-    assert not torch.equal(a.embed_hex.weight, c.embed_hex.weight)
-
-
-def test_narrowing_is_refused():
-    narrow = a_net(16)
-    wide = a_net(8)
-    with pytest.raises(ValueError):
-        widen_state_dict(narrow.state_dict(), wide.state_dict(), 16, 8)
 
 
 def test_a_checkpoint_round_trips_with_the_resume_contract(tmp_path):

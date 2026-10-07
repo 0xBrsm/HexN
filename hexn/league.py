@@ -13,6 +13,14 @@ Standings come from the games themselves — every game scores every learner —
 so the heat's gate reads off the log. The heat measures who learns best in
 this shared ecology, not isolated self-play; external anchors calibrate.
 
+A heat checkpoints every seat every iteration and keeps each game on disk as
+it finishes (`<checkpoint-dir>/partial/`). Launched again over a directory
+that holds its checkpoints, it resumes rather than starting over: each seat
+from its own weights, optimiser and config -- a controller's entropy
+coefficient included -- the torch RNG as it was, the interrupted iteration's
+games reloaded, and the standings summed from the log's rows before the
+iteration it resumes at, the last row per iteration.
+
     python -m hexn.league --base runs/example/iter-00450.pt \\
         --learner entropy=0.02 --learner entropy=0.03 \\
         --learner entropy=0.05 --learner entropy=0.08 \\
@@ -22,7 +30,6 @@ this shared ecology, not isolated self-play; external anchors calibrate.
 from __future__ import annotations
 
 import argparse
-import json
 import random
 import sys
 import time
@@ -34,6 +41,7 @@ import torch
 
 from hexset.actions import build_space
 from hexset.board.board import random_base_board
+from . import durable, runtime
 from .collect import ParallelCollector, WorkerSpec
 from hexset.encoding import static_graph
 from .model import VALUE_HEADS, HexNet, ModelConfig, packing, quantile_warm_start
@@ -41,6 +49,7 @@ from .policy import NetworkPolicy
 from .ppo import PPOConfig, assemble, update
 from .rewards import reward
 from .selfplay import owned
+from .trade import check_trader
 from .loop import preserve_blowout, prune_recent, save
 
 # What a --learner override may set, mapped onto PPOConfig fields. Collection
@@ -138,7 +147,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--resume",
         action="store_true",
         help="continue a heat from its own learner*/latest.pt checkpoints — "
-        "the box restart that killed the entropy heat at 35/60 is why this exists",
+        "the box restart that killed the entropy heat at 35/60 is why this exists. "
+        "A heat whose checkpoints exist resumes without it",
     )
     parser.add_argument(
         "--learner",
@@ -196,18 +206,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--action-cap", type=int, default=4000)
     parser.add_argument(
+        "--max-offers",
         "--max-trades",
         type=int,
         default=None,
-        help="the trade switch every seat plays under: 0 for the no-trade referent, omitted for the engine's own default of one broadcast round a turn (`Game.trade_mode='round'`), -1 to leave a turn's rounds uncapped (`hexset.trading`)",
+        help="the network's own offer budget a turn (hexn.trade): 0 for the no-trade network, omitted for HexSet's default (unlimited); -1 also reads as unlimited. Opponents bargain as their own bots do",
     )
+    parser.add_argument(
+        "--trader",
+        default=None,
+        help="a bot, by lineup name (e.g. 'heximax', registered by a --runtime), that answers every network seat's trades (hexn.trade.trader_gate). Not combinable with --max-offers",
+    )
+    # HexSet ships no bots: `--trader`, `--mix` and a rung name one only once
+    # the runtime registering it is loaded (`hexn.runtime`).
+    runtime.add_argument(parser)
     parser.add_argument("--collect-workers", type=int, default=16)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--checkpoint-dir", required=True)
-    parser.add_argument("--checkpoint-every", type=int, default=5)
+    parser.add_argument("--checkpoint-every", type=int, default=1)
     parser.add_argument("--keep-recent", type=int, default=5)
     parser.add_argument("--keep-every", type=int, default=25)
-    parser.add_argument("--dump-blowout-batch", action="store_true", default=True)
+    parser.add_argument(
+        "--dump-blowout-batch", action=argparse.BooleanOptionalAction, default=True
+    )
     return parser
 
 
@@ -237,18 +258,39 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"python -m {MODULES[manifest.mode]}"
         )
     args = manifest.namespace()
+    runtime.load(getattr(args, "runtime", None))
+    try:
+        check_trader(getattr(args, "trader", None), args.max_offers)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
     if not 2 <= len(args.learner) <= args.players:
         raise SystemExit(f"a league seats 2..{args.players} learners, got {len(args.learner)}")
 
     directory = Path(args.checkpoint_dir)
-    if args.resume:
+    seats = [directory / f"learner{k}" / "latest.pt" for k in range(len(args.learner))]
+    # A heat that has checkpoints resumes from them whether or not the frozen
+    # config says so: starting over from --base would overwrite every seat's
+    # progress, and the config a crashed heat was launched with is a fresh one.
+    resuming = args.resume or any(path.exists() for path in seats)
+    if resuming:
         seat_states = []
-        for k in range(len(args.learner)):
-            path = directory / f"learner{k}" / "latest.pt"
+        for path in seats:
             if not path.exists():
-                raise SystemExit(f"--resume needs {path}")
+                raise SystemExit(f"resuming this heat needs {path}")
             seat_states.append(torch.load(path, map_location=args.device, weights_only=False))
+        reached = min(int(seat["iteration"]) for seat in seat_states)
+        for k, seat in enumerate(seat_states):
+            if int(seat["iteration"]) != reached:
+                # A crash between two seats' saves: step the seats that got
+                # further back to the iteration every seat reached.
+                path = directory / f"learner{k}" / f"recent-{reached:05d}.pt"
+                if not path.exists():
+                    raise SystemExit(
+                        f"the heat's seats stopped at different iterations and "
+                        f"{path} is not there to bring learner {k} back to {reached}"
+                    )
+                seat_states[k] = torch.load(path, map_location=args.device, weights_only=False)
         state = seat_states[0]
     elif args.base:
         seat_states = None
@@ -268,6 +310,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     targets = [target for _, target, _ in parsed]
     gains = [gain for _, _, gain in parsed]
     learners = len(configs)
+    if seat_states:
+        # Each seat's own config as it last stood, not learner 0's with the
+        # overrides laid over it again: an entropy controller's coefficient
+        # is state, and re-parsing would reset it to the override.
+        configs = [
+            PPOConfig(
+                **{
+                    key: value
+                    for key, value in seat.get("config", {}).items()
+                    if key in asdict(PPOConfig())
+                }
+            )
+            for seat in seat_states
+        ]
 
     if args.pair_boards:
         # One flag, three wires: paired dealing and casting ride the
@@ -336,7 +392,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             optimiser.load_state_dict(seat_states[k]["optimiser"])
         optimisers.append(optimiser)
 
-    base_index = int(state.get("games_started", 0)) if args.resume else 0
+    log = directory / "log.jsonl"
+    collecting = directory / "partial"
+    start_iteration = int(state.get("iteration", 0)) if resuming else 0
+    base_index = int(state.get("games_started", 0)) if resuming else 0
+    # Past every game the interrupted iteration already dealt, so the resumed
+    # deal repeats none of them (`durable.resume_base`).
+    base_index = durable.resume_base(
+        base_index,
+        *(
+            held.indices()
+            for iteration, held in durable.partials(collecting).items()
+            if iteration >= start_iteration
+        ),
+    )
+    durable.prune(collecting, start_iteration - 1)
     if args.pair_boards and base_index % 2:
         # `games_started` is the max over the workers' counters and lands odd
         # about half the time; dealing from an odd base would give the first
@@ -353,7 +423,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 players=args.players,
                 lanes=shard,
                 action_cap=args.action_cap,
-                max_trades=args.max_trades,
+                max_offers=args.max_offers,
+                trader=getattr(args, "trader", None),
+                runtime=tuple(getattr(args, "runtime", None) or ()),
                 stride=args.collect_workers,
                 width=model_config.width,
                 rounds=model_config.rounds,
@@ -370,24 +442,37 @@ def main(argv: Sequence[str] | None = None) -> int:
                 pair_boards=args.pair_boards,
             )
             for worker in range(args.collect_workers)
-        ]
+        ],
+        heartbeat=directory / "heartbeat.json",
     )
 
-    log = directory / "log.jsonl"
     directory.mkdir(parents=True, exist_ok=True)
     total_wins = [0] * learners
-    start_iteration = 0
-    if args.resume:
-        start_iteration = int(state.get("iteration", 0))
-        if log.exists():
-            for line in log.open():
-                total_wins = json.loads(line).get("standings", total_wins)
+    if resuming:
+        # Only the iterations the checkpoint holds, and each once: a row
+        # logged after the last checkpoint is an iteration about to be
+        # played again, and a resumed one is logged twice.
+        rows = {
+            row["iteration"]: row
+            for row in durable.read_lines(log)
+            if "learners" in row and row["iteration"] < start_iteration
+        }
+        for row in rows.values():
+            for entry in row["learners"]:
+                total_wins[entry["learner"]] += entry["wins"]
+        durable.append_line(log, {"resumed_from": start_iteration})
+        # After every net is built, since building one draws its init.
+        if "torch_rng" in state:
+            torch.set_rng_state(state["torch_rng"].cpu())
+        print(f"resumed the heat at iteration {start_iteration}", file=sys.stderr)
     began = time.perf_counter()
 
     for iteration in range(start_iteration, args.iterations):
         collector.sync_many([p.net for p in policies])
         started = time.perf_counter()
-        episodes = collector.collect(args.games_per_iteration)
+        episodes = collector.collect(
+            args.games_per_iteration, partial=durable.partial(collecting, iteration)
+        )
         collected = time.perf_counter() - started
 
         wins, vp = standings(episodes, learners)
@@ -451,21 +536,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             "learners": per_learner,
             "elapsed": time.perf_counter() - began,
         }
-        line = json.dumps(record)
-        print(line, flush=True)
-        with log.open("a") as handle:
-            handle.write(line + "\n")
+        print(durable.append_line(log, record), flush=True)
 
         if (iteration + 1) % args.checkpoint_every == 0 or iteration + 1 == args.iterations:
+            games_started = collector.games_started()
+            rng = torch.get_rng_state()
             for k, (policy, optimiser, config) in enumerate(
                 zip(policies, optimisers, configs)
             ):
                 seat_dir = directory / f"learner{k}"
                 payload = {
                     "iteration": iteration + 1,
-                    "games_started": collector.games_started(),
+                    "games_started": games_started,
                     "net": policy.net.state_dict(),
                     "optimiser": optimiser.state_dict(),
+                    "torch_rng": rng,
                     "args": {**stored, **{"league_overrides": args.learner[k]}},
                     "config": asdict(config),
                 }
@@ -475,6 +560,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     prune_recent(seat_dir, args.keep_recent)
                 if args.keep_every and (iteration + 1) % args.keep_every == 0:
                     save(seat_dir / f"iter-{iteration + 1:05d}.pt", payload)
+            durable.prune(collecting, iteration)
 
     collector.close()
     return 0

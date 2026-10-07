@@ -44,8 +44,8 @@ def _run(label: str, args, asynchronous: bool) -> dict[str, object]:
             str(args.action_cap),
             *(
                 ()
-                if args.max_trades is None
-                else ("--max-trades", str(args.max_trades))
+                if args.max_offers is None
+                else ("--max-offers", str(args.max_offers))
             ),
             "--seed",
             str(args.seed),
@@ -108,10 +108,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--games", type=int, default=128)
     parser.add_argument("--action-cap", type=int, default=4000)
     parser.add_argument(
+        "--max-offers",
         "--max-trades",
         type=int,
         default=None,
-        help="the trade switch every seat plays under: 0 for the no-trade referent, omitted for the engine's own default of one broadcast round a turn, -1 to leave a turn's rounds uncapped",
+        help="the network's own offer budget a turn (hexn.trade): 0 for the no-trade network, omitted for HexSet's default (unlimited); -1 also reads as unlimited. Opponents bargain as their own bots do",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--width", type=int, default=64)

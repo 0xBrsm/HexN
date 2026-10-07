@@ -20,13 +20,15 @@ be looking at:
   and this package supplies the batched network evaluation it runs against
   (`hexn.policy`). The rule is that `hexn` calls the engine and never
   reimplements it.
-- **`hexset`** — the rules engine, handcrafted bots, the ledger of public
+- **`hexset`** — the rules engine, the gym, the ledger of public
   knowledge an honest policy may read, the observation encoder, and the
   search (`hexset.mcts`), in its own public repository. Needs nothing but
   numpy, so it is installable (and testable) on a machine where `hexn`'s
   dependencies cannot be. `hexn` depends on `hexset`; `hexset` never
-  imports `hexn`. The sample bot, `heximax`, and `hexset.bench`
-  (throughput, baselines, duels) ship from that same repository.
+  imports `hexn`. `hexset.bench` (throughput, baselines, duels) ships from
+  that same repository; playing bots do not. A bot such as `heximax` or
+  `rehex` comes from a runtime module (`hexset.arena.load_runtime`), and
+  every `hexn` command that names one takes `--runtime <module>`.
 - The development repository this package is cut from also carries a
   research journal, training runs, and a training source tree that this
   README does not describe. Nothing about it is needed to build or run
@@ -71,8 +73,9 @@ python -m hexn.run.init --mode ppo --name first \
 # 2. launch it, or resume it -- the same command either way
 python -m hexn.ppo runs/first
 
-# duels naming a trained checkpoint (HexSet's CLI; --runtime registers the loader)
-python -m hexset.bench.duel --runtime hexn.netbot \
+# duels naming a trained checkpoint (HexSet's CLI; --runtime loads the
+# checkpoint loader, and the module providing `heximax`)
+python -m hexset.bench.duel --runtime hexn.netbot --runtime <bot runtime> \
     network:runs/first/latest.pt heximax --games 400
 
 # export for the served table: search budget and the trade gate's own look-ahead are
@@ -80,7 +83,8 @@ python -m hexset.bench.duel --runtime hexn.netbot \
 python -m hexn.export_onnx --checkpoint runs/first/latest.pt --out latest.onnx \
     --search mcts --simulations 256 --gate-plies 8
 
-# the test suite; torch-dependent files skip cleanly where torch is absent
+# the test suite; torch-dependent files skip cleanly where torch is absent, and
+# the tests that seat a named bot skip unless `--runtime <module>` provides it
 python -m pytest tests -q
 ```
 

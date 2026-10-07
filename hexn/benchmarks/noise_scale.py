@@ -238,10 +238,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--lanes", type=int, default=64)
     parser.add_argument("--players", type=int, default=4)
     parser.add_argument(
+        "--max-offers",
         "--max-trades",
         type=int,
         default=None,
-        help="the trade switch every seat plays under: 0 for the no-trade referent, omitted for the engine's own default of one broadcast round a turn, -1 to leave a turn's rounds uncapped",
+        help="the network's own offer budget a turn (hexn.trade): 0 for the no-trade network, omitted for HexSet's default (unlimited); -1 also reads as unlimited. Opponents bargain as their own bots do",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cpu")
@@ -308,7 +309,7 @@ def main(argv: list[str] | None = None) -> int:
         players=args.players,
         seed=args.seed,
         action_cap=4000,
-        max_trades=args.max_trades,
+        max_offers=args.max_offers,
         deal=args.games,
         pair_boards=args.paired,
     )

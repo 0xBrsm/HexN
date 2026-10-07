@@ -2,6 +2,436 @@
 
 All notable changes to the `hexn` package are recorded here.
 
+## 0.38.0
+
+### Added
+
+- `--decided-cut` (`PPOConfig.decided_cut`): positions whose mover's own
+  recorded win estimate is below the cut or above one minus it leave the
+  batch after GAE has run over the whole trajectory. 0, the default, keeps
+  every position.
+- `--setup-weight` (`PPOConfig.setup_weight`): each `SETUP_SETTLEMENT` and
+  `SETUP_ROAD` position enters the batch that many times. 1, the default,
+  enters it once.
+- `decided_share`, `decided_low_won`, `decided_high_won` and
+  `setup_repeated` gauges in the PPO log when either is set
+  (`hexn.ppo.stakes_gauges`).
+- `--amp fp16` (`PPOConfig.amp`): the PPO update's forward and backward, and
+  the prior's forward, run under fp16 autocast, with a run-long gradient
+  scaler saved in each checkpoint. The network's outputs return to fp32
+  before the log-softmax and every loss term. `amp_skipped` and `amp_scale`
+  are logged per update. Refused with `--update-workers`.
+- `--batch-on-device`: each assembled batch moves to `--device` whole, before
+  the prior forward, instead of row by row inside the update.
+
+### Changed
+
+- With `--fused`, the parent loaded for `--prior-kl` runs the fused trunk too.
+
+### Fixed
+
+- `hexn.coalition` documents what `Targeted` does without a claim about
+  how tables behave.
+- The coalition-mix tests skip without PyTorch, like the rest of the
+  torch-dependent suite, instead of failing collection.
+- The distillation test asserts that repeated updates cut the loss, and no
+  longer that argmax agreement rises: the loss is a cross-entropy to the
+  search's soft visit distribution, which can fall while the argmax wanders,
+  and on HexSet 1.10.0's deal of the test's two games it does.
+
+## 0.37.0
+
+### Added
+
+- `coalition(...)` as a `--mix` entry: a table with a coalition in it,
+  drawn per game off the cast's own stream -- the learner in a drawn seat, a
+  target (the learner's seat for `targeted=` of the games, another seat
+  otherwise), `size=` frozen members from `members=` ganging up on it, the
+  rest drawn from the pool like a `table(...)`. The coalition is hostile
+  from the first move for `start=` of the games and otherwise from the move
+  the target leads the table's public points by a drawn `lead=` margin,
+  having built past its setup; once on it stays on
+  (`hexn.collect.coalition_term`, `CoalitionPlan`, `mix_coalitions`).
+- `hexn.coalition.Targeted`, HexSet 1.2.0's `Coalition` with one target and
+  a trigger, both read off the game's plan, seated by the arena spec
+  `targeted:<entrant>`; a run names it with `--runtime hexn.coalition`.
+  The members play the coalition's table layer -- the robber on the target's
+  best hex, no trade with it -- and are never trained on: a member is a pool
+  checkpoint under its own cast id.
+- `coalition_*` gauges in the PPO log: the share of games with a coalition,
+  the share targeting the learner, and the learner's win rate in targeted,
+  neutral and coalition-free games.
+
+### Changed
+
+- `Collector` takes a `coalition` law beside `game_law`; a run with one
+  deals through `RuledLaneEnv`, which hangs the plan on each game as
+  `Game.coalition`.
+
+## 0.36.1
+
+Trains against HexSet 1.2.1.
+
+### Changed
+
+- The `hexset` submodule moves to HexSet 1.2.1 (a trade pick passes over an
+  answer the actor cannot cover). Nothing in `hexn` changes.
+
+## 0.36.0
+
+Trains against HexSet 1.2.0.
+
+### Changed
+
+- The `hexset` submodule moves to HexSet 1.2.0, which ships the coalition
+  test opponent: `hexset.bots.Coalition` around any bot, the
+  `coalition:<entrant>` spec, the `PlaysAgainst` hook, and a
+  `hexset.mcts.Search` that plays as one side against named seats. The bots
+  submodule moves to the release where `heximax` and `rehex` implement
+  `play_against` and the runtime registers the `coalition` preset
+  (`coalition:rehex`). Nothing in `hexn` changes.
+
+## 0.35.0
+
+Trains against HexSet 1.1.2, which ships no playing bots.
+
+### Added
+
+- **`--runtime <module>`** (repeatable) on `hexn.ppo`, `hexn.league`,
+  `hexn.export_onnx` and `hexn.migrate` (`hexn.runtime`): the module that
+  registers the bots a run names -- a `--mix` opponent, a `--search-rung`, a
+  `--trader` -- imported through `hexset.arena.load_runtime` before anything
+  is resolved. The trainers freeze it into the config like every other
+  parameter and hand it to each collector worker
+  (`hexn.collect.WorkerSpec.runtime`), since a spawned process inherits no
+  registrations. A manifest frozen before the flag has none and is refused
+  by `hexn.run.load`; re-freeze it.
+- The run manifest's `engine` field records `runtimes`: per loaded module,
+  the commit and dirty state of the checkout it was imported from, since
+  the engine's commit no longer says which bots a run's names resolved to.
+- **`pytest --runtime <module>`** (`tests/conftest.py`): the tests that seat
+  `heximax` or `rehex` skip unless a loaded runtime registers them.
+
+### Changed
+
+- `heximax` and `rehex` resolve only through a loaded runtime. `hexn.collect`
+  no longer imports `hexset.bots` for them, and `hexn.migrate` spawns the
+  `heximax` entrant by name instead of importing the bot.
+- `hexn.trade.trader_gate` spawns the trader as its name resolves; the
+  engine's entrants no longer carry a placement wrapper to take off.
+- A searched forced move records the search's value. HexSet evaluates a
+  root with one legal move and credits its only edge with every simulation
+  at that value, where it used to return the root unexpanded: the move's
+  `Transition.value` is the evaluator's estimate rather than `()`, its
+  `Target` carries a one-hot prior, and an ExIt value horizon that lands on
+  one bootstraps from that estimate instead of falling back to the terminal
+  target. The distillation target at a forced move is unchanged.
+- From HexSet: a virtual-loss descent in `hexset.mcts` now counts as a lost
+  visit under the search's stance (`hexset.mcts.lost_value`); a network
+  checkpoint's trade gate prices an exchange without reading hidden cards;
+  `max_offers=0` signs nothing, so the no-trade network also accepts no
+  offer; lanes sharing a pinned board seat every gate at the lane being
+  stepped; a game that reaches the turn cap is a reading neither side won,
+  counted in `exhausted`.
+
+## 0.34.0
+
+### Added
+
+- **`hexn.ppo` / `hexn.exit --step-checkpoint-every <K>`** (`hexn.steps`):
+  the update writes `<checkpoint-dir>/latest-step.pt` -- weights, optimiser,
+  steps taken, the shuffle RNG state of the pass in progress and every gauge
+  accumulated so far -- after every K-th optimiser step and after the last,
+  fsynced and renamed. A resumed run rebuilds the interrupted iteration's
+  batch from its kept games, checks it against the fingerprint the file was
+  written over, loads the file and continues the update from the next
+  minibatch; the finished update, its logged gauges and the RNG the next
+  iteration draws from are the uninterrupted run's. A file of another
+  iteration or another batch is removed and the update starts from the
+  iteration's start. `1`, the default, is every step; `0` disables; a
+  manifest frozen before the flag has none. `--update-workers` keeps none.
+- Every iteration row carries `step_checkpoints`, `step_checkpoint_seconds`
+  and `resumed_at_step`.
+- **`hexn.exit --keep-recent <N>`**: the rolling `recent-XXXXX.pt` ring
+  `hexn.ppo` has, the last N checkpoints whatever `--keep-every` keeps
+  (default 5).
+- `hexn.ppo.update` and `hexn.exit.update` take `steps=` (`hexn.steps.Steps`).
+
+### Changed
+
+- Both trainers order an iteration's games by index before assembling them,
+  so a collection resumed from its partial assembles the batch the
+  uninterrupted one did.
+- `hexn.loop.save` fsyncs the file before renaming it over the checkpoint.
+- The step file is removed once the iteration's checkpoint is written; the
+  iteration's games stay in its partial until then, as before.
+
+## 0.33.0
+
+### Added
+
+- **`hexn.exit --k <worlds>`** (`hexn.collect.WorkerSpec.k`): the number of
+  determinized worlds, drawn from the mover's own belief, each searched
+  decision is rooted in (`hexset.mcts.Search(k=...)`). `1`, the default, is
+  one sampled world, as before.
+- **`hexn.exit --micro-batch <rows>`** (`DistillConfig.micro_batch`): each
+  minibatch in slices of this many rows with gradients accumulated into its
+  one step, every term normalised by the minibatch's own denominators. A
+  micro-batched update leaves the batch on the host. `0`, the default, is one
+  backward per minibatch.
+- **`hexn.exit --prior-kl <weight>`** (`DistillConfig.prior_kl`): KL(policy ||
+  the iteration's starting policy) over every legal action, added to the
+  loss. `0`, the default, is off.
+- Every `hexn.exit` iteration row carries `kl_to_start`, `agreement_start` /
+  `agreement_end`, `target_ce_start` / `target_ce_end`, `entropy_start` /
+  `entropy_end` and `decision_positions` (`hexn.exit.measure`), plus
+  `assemble_seconds`, `measure_seconds`, `prior_kl` and `grad_norm`.
+- **`hexn.exit --replay-positions 0`**: no replay store; each iteration
+  trains on its own games, which stay in `<checkpoint-dir>/partial/` until its
+  checkpoint is written, so a resumed iteration plays only its missing games.
+
+### Changed
+
+- `hexn.exit --resume` with `--init` on a directory without `latest.pt` starts
+  fresh from `--init`, as `hexn.ppo` does, and keeps the starting weights as
+  `iter-00000.pt`; without `--init` it still refuses.
+- Searched collection workers seed their search from their own `torch_seed`
+  rather than the run's shared `seed`, so workers no longer draw identical
+  search streams.
+- `hexn.exit.Batch` carries an optional `prior_log_probs`; `refresh` keeps it.
+
+## 0.32.0
+
+### Added
+
+- **`hexn.ppo --micro-batch <rows>`** (`PPOConfig.micro_batch`): step through
+  each minibatch in slices of this many rows, accumulating their gradients
+  (each weighted by its share of the minibatch's rows) into the minibatch's
+  one optimiser step. Advantages are still normalised over the whole
+  minibatch, and the logged gauges are the same row-weighted means. A
+  micro-batched update leaves the batch on the host and moves each slice's
+  rows to the device as it is used. `0`, the default, is the whole minibatch
+  in one pass with the batch moved to the device, as before. Refused with
+  `--update-workers`.
+
+### Changed
+
+- A collector worker keeps nothing of a cohort once it has sent it; the
+  trainer lets go of the episodes' transitions once the batch is assembled,
+  and of the batch once its iteration is logged and saved, before the next
+  collection (`hexn.collect.release_memory` trims the heap after each).
+  `hexn.durable.write_atomic` drops what it wrote from the page cache once it
+  is fsynced (`posix_fadvise` DONTNEED, where the platform has it). Peak
+  memory falls; nothing logged changes.
+
+## 0.31.0
+
+### Added
+
+- **`--no-dump-blowout-batch`** on `hexn.ppo` and `hexn.league`: when the KL
+  brake fires, keep only the pre-update weights (`blowout-XXXXX-pre.pt`) and
+  not the batch. `--dump-blowout-batch` stays the default.
+
+## 0.30.1
+
+### Changed
+
+- Trains against HexSet 0.101.1. No hexn code changes.
+
+## 0.30.0
+
+### Added
+
+- **`hexn.ppo --vp-reward <c>`**: pay `c` for every victory point a seat
+  gains, at the decision after it lands (and charge it for one lost), on top
+  of the win payoff (`PPOConfig.vp_reward`). Over a game it sums to
+  `c * (final - opening points)`. The critic for the extra return is the
+  margin head, retargeted to final points / 10 and trained at
+  `--aux-margin-weight` (required > 0); the policy records the win (or
+  fast-win) value plus `c` times the points still to come
+  (`NetworkPolicy.vp_reward`). The win head is untouched.
+- `Request.points` and `Transition.points`: the seat's own victory points at
+  each recorded decision, hidden VP cards included, carried through the
+  worker pipe.
+- `advantages(..., rewards=)`: rewards earned between decisions.
+- vp-reward runs log `learner_final_vp_mean`.
+
+## 0.29.1
+
+### Changed
+
+- Trains against HexSet 0.99.0. No hexn code changes.
+
+## 0.29.0
+
+### Added
+
+- **`hexn.ppo --fast-win <curve.json>`**: pay for fast wins. The curve is a
+  list of weights (or an object with a `"weights"` list); a win in round `r`
+  pays entry `r - 1`, the last entry holds past the curve's end, and a loss or
+  an unfinished game pays 0 whenever it ends. `PPOConfig.fast_win`,
+  `hexn.ppo.win_round`, `hexn.ppo.fast_weight`.
+- **The fast-win head** (`ModelConfig.fast_win`, `HexNet.fast_win`,
+  `Prediction.fast` / `fast_logits`): a softmax over the seats plus a "not won
+  in time" slot, trained by cross-entropy against the round weight on the
+  winner and the rest on the last slot. A fast-win run takes its advantage
+  from it (`NetworkPolicy.record_fast`); the win head, which every gate and
+  search reads, keeps its one-hot target. Built only when asked for, so every
+  existing checkpoint keeps its key set. `hexn.model.graft_fast_win` seeds it
+  from the win head when `--init` names a checkpoint without one.
+- Fast-win runs log `fast_loss`, `win_round_median`,
+  `learner_win_round_median` and `fast_payoff_mean` every iteration.
+- `--fast-win` refuses a `duel(...)` mix and `--update-workers`, which it is
+  not wired into.
+
+## 0.28.0
+
+### Added
+
+- **`sampled:network:<path>`**, a `--mix` pool member: the checkpoint's
+  policy sampled at temperature 1.0 instead of its argmax, on the same
+  batched `frozen` path as a bare `network:` member. Its stream is seeded
+  per worker and per entry (`mix_opponents(torch_seed=...)`,
+  `rung_opponent(sample_seed=...)`), and it draws nothing from the cast
+  stream, so a table deals exactly as it does with the bare spelling. Only
+  a bare `network:<path>` can be sampled; `check_mix` refuses anything
+  else. `frozen` gains `greedy` and `generator` keywords.
+
+## 0.27.0
+
+### Added
+
+- **`hexn.export_onnx --trader <bot>`** (and `export(trader=...)`) writes a
+  `trader` metadata key: a HexSet bot, as a lineup names it, that answers
+  the served file's trades while the network plays every move. It defaults
+  to the trader the run trained with (`hexn.ppo --trader`), and a file with
+  none gets no key.
+
+## 0.26.0
+
+Needs a HexSet with `hexset.bots.TradesBy` (0.91.0 or later) for `--trader`.
+
+### Added
+
+- **`hexn.ppo --trader <bot>`** and **`hexn.league --trader <bot>`**: a HexSet
+  bot, named as a lineup names it (e.g. `heximax`), answers every trade for
+  the run's networks in collection and the ladder; the networks still play
+  every move, bank trades included. Not combinable with `--max-offers`.
+  `WorkerSpec.trader`, `Collector(trader=...)`, and a `trader` argument on
+  `NetworkPolicy.trader`, `SearchPolicy.trader`, `hexn.loop.duellist`,
+  `duel` and `versus`.
+- **`hexn.trade.trader_gate`** and **`hexn.trade.check_trader`**.
+
+### Removed
+
+- **`tests/hexn/test_engine_pin.py`.** The development engine may run ahead
+  of the HexSet release `pyproject.toml` pins; the release script checks that
+  pin against the latest HexSet release.
+
+## 0.25.0
+
+Breaks clients: `max_trades` is `max_offers` throughout, and it is now the
+network's own offer budget rather than a table-wide trade switch. Default
+runs trade under HexSet's current rules, so they do not reproduce numbers
+from 0.24.0 and earlier.
+
+### Added
+
+- **`hexn.ppo --init <checkpoint>`** starts a run from another checkpoint's
+  weights, at iteration 0 with a fresh optimiser, and keeps them as the run's
+  own `iter-00000.pt`. With `--resume` as well, a directory that already holds
+  `latest.pt` resumes from it instead.
+- **`hexn.ppo --prior-kl <weight>`** adds the policy's KL divergence from
+  `--parent`, over every legal action, to the loss; `PPOConfig.prior_kl`,
+  `hexn.ppo.attach_prior`, and a `prior_kl` column in the log.
+- **`hexn.ppo --lag-rung <n>`** adds a ladder rung: the run's own kept
+  checkpoint from `n` iterations before each evaluation. A missing checkpoint
+  is logged as `lag_checkpoint_missing`.
+- **`hexn.collect.rung_opponent`**: a named opponent, batched when it is a
+  bare `network:<path>`.
+- **`hexn.trade`**: `offer_budget`, `recorded_budget` and `trade_params`,
+  the network's budget as HexSet's `TradeParams`.
+
+### Changed
+
+- **`hexset` is pinned to the HexSet 0.68.0 release**, up from 0.58.1, through
+  the `hexset @ git+https://github.com/0xBrsm/HexSet.git@...` dependency.
+- **`--max-offers` replaces `--max-trades`** in `hexn.ppo`, `hexn.exit`,
+  `hexn.league` and the benchmarks; `--max-trades` is still accepted. It is
+  how many offers the network makes a turn: `0` does not trade, omitted is
+  HexSet's default (unlimited), and `-1` also reads as unlimited.
+- **Opponents bargain as their own bots do.** A named entrant such as
+  `heximax` keeps its own trade settings; no-trade opponents are HexSet's own
+  `heximax:trading=off` and `network:<path>@0`.
+- **Checkpoints and exports record `max_offers`.** `hexn.netbot.load` and
+  `hexn.export_onnx` still read a pre-0.25 checkpoint's `max_trades`, and
+  `Loaded.trade_params` is the checkpoint's own budget as HexSet reads it.
+- **A bare `network:<path>` `--search-rung` is a batched network** playing
+  under the run's own `--max-offers`, like the same name in `--mix`, rather
+  than an arena bot answering one position at a time.
+
+## 0.24.0
+
+### Added
+
+- **`hexn.durable`**: `write_atomic`, `append_line` and `read_lines` (JSON
+  lines flushed and fsynced as written; a torn last line is dropped),
+  `Partial` (one file per finished game, plus a cohort's index plan),
+  `resume_base`, and `Rows`, a benchmark's per-position journal.
+- **Collection keeps each game on disk as it finishes.** `Collector.cohort`,
+  `Collector.collect`, `ParallelCollector.collect` and `start_collect` take
+  `partial=`; a partial that holds a plan deals only its missing indices.
+  `Collector.sink`, `beat`, `upcoming` and `listed` are the parts underneath.
+- **`ParallelCollector(heartbeat=..., stall_seconds=...)`.** A worker that
+  dies, or goes `hexn.collect.STALL_SECONDS` without a tick, raises
+  `RuntimeError` instead of hanging; `heartbeat.json` reports every worker.
+- **`--rows`** on `hexn.benchmarks.rank`, `floor` and `horizon`: one JSONL
+  line per probed position as it finishes, and a rerun with the same
+  settings resumes from it.
+- **`EpisodeStore.resume(before=...)`, `EpisodeStore.ahead` and
+  `EpisodeStore.adopt`**: a shard written ahead of the checkpoint is taken
+  as its iteration's collection.
+
+### Changed
+
+- **`hexn.ppo`, `hexn.exit` and `hexn.league` keep every game under
+  `<checkpoint-dir>/partial/`** and resume an interrupted iteration from it.
+- **`--checkpoint-every` defaults to 1** in `hexn.ppo` and `hexn.league`.
+- **The log row and the checkpoint come before in-loop evaluation**, which
+  is its own row: `{"iteration": N, "ladder": ...}` in `hexn.ppo`,
+  `{"iteration": N, "duel": ...}` in `hexn.exit`. A resumed run first
+  appends `{"resumed_from": N}`; keep the last row per iteration.
+- **`hexn.league` resumes whenever its `learner*/latest.pt` exist**, and its
+  checkpoints carry `torch_rng`.
+- **`hexn.benchmarks.rank` draws each position's chance children and search
+  from streams keyed by the position's index**, not one shared stream, so it
+  reads differently from earlier runs at the same `--seed`. `floor` and
+  `horizon` reseed each position's rollouts the same way.
+- **`EpisodeStore` writes every shard atomically**, and `append` of an
+  iteration it already holds replaces that shard.
+
+### Fixed
+
+- **`hexn.exit --resume` with no `latest.pt` refuses** instead of starting
+  fresh, and `hexn.exit` and `hexn.ppo` refuse a fresh start into a
+  `--checkpoint-dir` that holds a `latest.pt`.
+- **A resumed `hexn.league` heat** restores each seat's own `PPOConfig` (an
+  entropy controller's coefficient included) and the torch RNG, sums its
+  standings over the rows before the iteration it resumes at, and steps
+  seats whose saves a crash split back to the iteration all of them reached.
+- **`hexn.exit --corpus`** keeps each game under `<corpus>.partial/` and
+  writes the corpus atomically.
+
+## 0.23.6
+
+No behaviour change. The test suite is smaller and faster.
+
+### Changed
+
+- **`tests/hexn` is smaller and faster.** Duplicate tests are removed, and
+  the collection, search and training tests share module-scoped games and
+  worker pools. `test_expert.py` no longer needs `torch`.
+
 ## 0.23.5
 
 ### Fixed

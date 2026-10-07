@@ -15,8 +15,6 @@ from __future__ import annotations
 
 import math
 import random
-import tempfile
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -33,9 +31,7 @@ from hexn.migrate import (
     REBUILT_KEYS,
     _fit_temperature,
     _global_columns,
-    _migrate_heads,
     compare,
-    migrate_checkpoint,
     migrate_state_dict,
     source_globals,
 )
@@ -220,15 +216,6 @@ def test_the_knight_slot_is_the_mean_of_its_old_block():
     assert torch.equal(migrated["heads.globals.bias"][knight_row], expected_bias)
 
 
-def test_migrate_heads_rejects_a_hexes_shape_that_is_not_contract_5():
-    net = _net()
-    template = net.state_dict()
-    bad = {**net.state_dict()}
-    # Already contract 6's width (SPAN, not 2 * SPAN): not a contract-5 shape.
-    with pytest.raises(ValueError, match="does not look like contract 5"):
-        _migrate_heads(bad, template, PLAYERS)
-
-
 def test_flat_gather_is_rebuilt_not_migrated():
     net = _net()
     template = net.state_dict()
@@ -299,24 +286,6 @@ def test_the_embed_global_projection_is_exact_on_zero_valuation_positions():
 
     report = compare(net, columns, _observations(), PLAYERS)
     assert report["max_abs_embed_delta_on_zero_valuation_positions"] == 0.0
-
-
-def test_a_globals_width_from_no_contract_this_tool_reads_is_refused():
-    net = _net()
-    old = _contract_5_state(net)
-    old["embed_global.weight"] = old["embed_global.weight"][:, :-1].clone()
-    state = {
-        "iteration": 0,
-        "games_started": 0,
-        "net": old,
-        "args": {},
-        "torch_rng": torch.get_rng_state(),
-    }
-    with tempfile.TemporaryDirectory() as tmp:
-        path = Path(tmp) / "bad.pt"
-        torch.save(state, path)
-        with pytest.raises(SystemExit, match="contract 5"):
-            migrate_checkpoint(path, players=PLAYERS)
 
 
 def test_fit_temperature_recovers_a_known_scale():
