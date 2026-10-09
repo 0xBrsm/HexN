@@ -23,7 +23,9 @@ else. The freeze is what makes "no defaults, no fallbacks" true rather than
 aspirational — `load` refuses a config whose keys are not exactly the
 parameter set, so a flag added to a parser cannot silently be absent from a
 manifest, and a manifest written before that flag existed fails loudly instead
-of picking up a new default.
+of picking up a new default. The one exception is `ADDED`: a flag whose
+old-behaviour value is known is filled with *that* value, never today's
+default, and the fill is listed in the loaded manifest's `meta["filled"]`.
 
 The parameter set is read from the mode's own `build_parser()` rather than
 duplicated here, so this module cannot drift from the trainers it freezes.
@@ -32,10 +34,12 @@ duplicated here, so this module cannot drift from the trainers it freezes.
 from __future__ import annotations
 
 import argparse
+import copy
 import importlib.util
 import json
 import os
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -66,6 +70,52 @@ MODULES = {"ppo": "hexn.ppo", "league": "hexn.league", "exit": "hexn.exit"}
 # Imported lazily: `hexn.ppo` pulls in torch, and this module is imported by
 # tooling that runs where torch is not installed.
 PARSERS: dict[str, Callable[[], argparse.ArgumentParser]] = {}
+
+
+# Parameters a mode gained after its manifests were already being frozen, each
+# with the one value under which the code behaves exactly as it did before the
+# flag existed -- usually the flag's off position, which need not be today's
+# default (`sample_stream` defaults to "game" for a new freeze; "worker" is what
+# every earlier run sampled with). `load` fills a key from here only when the
+# config lacks it, never rewrites the file, and lists what it filled in
+# `Manifest.meta["filled"]`, so an old run loads meaning what it meant when it
+# was frozen rather than what today's defaults would make of it.
+#
+# A key belongs here only when such a value exists. `runtime` is `[]`: a run
+# that names no bot plays exactly as before, and one that does -- from when
+# the engine shipped its own -- fails loudly at startup, since nothing
+# registers the name, rather than meaning something else. `reward` and `init`
+# have none: they predate the win head and the current warm start, so a
+# config without them is still refused (re-freeze it). A rename (`max_trades`
+# to `max_offers`) is not a fill.
+ADDED: dict[str, dict[str, Any]] = {
+    "ppo": {
+        "runtime": [],
+        "sample_stream": "worker",
+        "collect_trunk": "reference",
+        "collect_precision": "fp32",
+        "decided_cut": 0.0,
+        "setup_weight": 1,
+        "amp": "",
+        "batch_on_device": False,
+        "decoupled": False,
+        "step_checkpoint_every": 0,
+        "micro_batch": 0,
+        "vp_reward": 0.0,
+        "fast_win": None,
+        "trader": None,
+        "prior_kl": 0.0,
+        "lag_rung": 0,
+        "aux_margin_weight": 0.0,
+    },
+    "exit": {
+        "k": 1,
+        "keep_recent": 0,
+        "step_checkpoint_every": 0,
+        "micro_batch": 0,
+        "prior_kl": 0.0,
+    },
+}
 
 
 def _parser_for(mode: str) -> argparse.ArgumentParser:
@@ -297,7 +347,12 @@ def load(directory: str | Path) -> Manifest:
 
     expected = parameters(mode)
     got = set(config)
-    if missing := expected - got:
+    filled = {
+        key: copy.deepcopy(value)  # a list fill must not be the table's own
+        for key, value in ADDED.get(mode, {}).items()
+        if key in expected and key not in got
+    }
+    if missing := expected - got - set(filled):
         raise SystemExit(
             f"{directory / relative} is missing {sorted(missing)}. A frozen config "
             f"carries every parameter explicitly -- this manifest predates those "
@@ -308,6 +363,15 @@ def load(directory: str | Path) -> Manifest:
         raise SystemExit(
             f"{directory / relative} carries {sorted(extra)}, which this build's "
             f"{mode} parser does not define. The flags were removed or renamed."
+        )
+    if filled:
+        config = {**config, **filled}
+        meta = {**meta, "filled": filled}
+        print(
+            f"{directory}: frozen before {sorted(filled)}; running with the "
+            f"values that reproduce its old behaviour: {filled}",
+            file=sys.stderr,
+            flush=True,
         )
     return Manifest(
         name=meta["name"], mode=mode, directory=directory, config=config, meta=meta

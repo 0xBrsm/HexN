@@ -42,7 +42,7 @@ import torch
 from hexset.actions import build_space
 from hexset.board.board import random_base_board
 from . import durable, runtime
-from .collect import ParallelCollector, WorkerSpec
+from .collect import ParallelCollector, WorkerSpec, release_memory
 from hexset.encoding import static_graph
 from .model import VALUE_HEADS, HexNet, ModelConfig, packing, quantile_warm_start
 from .policy import NetworkPolicy
@@ -561,6 +561,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if args.keep_every and (iteration + 1) % args.keep_every == 0:
                     save(seat_dir / f"iter-{iteration + 1:05d}.pt", payload)
             durable.prune(collecting, iteration)
+
+        # Nothing of this iteration is read past here: without this the next
+        # collection would land with this one's games and last batch still
+        # held on the host.
+        batch = episodes = None
+        release_memory()
 
     collector.close()
     return 0

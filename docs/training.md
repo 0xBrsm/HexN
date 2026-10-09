@@ -42,10 +42,15 @@ advantage, or a search.
   games across the weight sync.
 
 `--collect-workers N` shards collection across `N` CPU processes, each with
-its own copy of the network for inference. `--async-collect` additionally
-prefetches iteration `k+1`'s games during iteration `k`'s GPU update; this
-requires `--collect-workers > 1` and applies only in `stream` mode, since a
-`cohort` deals a fixed batch with nothing to prefetch into. `--update-workers
+its own copy of the network for inference. With more than one worker,
+collection is asynchronous by default: iteration `k+1`'s games are played
+during iteration `k`'s update, by the pre-update policy, so each batch is one
+update stale (`--no-async-collect` restores the synchronous loop). In
+`cohort` mode each prefetched cohort is still played whole. Async collection
+turns on decoupled PPO (`--decoupled`) by default, which clips against the
+learner as the update starts and so absorbs the staleness. On a GPU device
+the learner's update also defaults to the fused trunk (`--fused`) and fp16
+autocast (`--amp auto`); on CPU both stay off. `--update-workers
 N` shards the PPO *update* itself across `N` CPU processes with a central
 Adam step (`hexn.ddp`) — data parallelism at the gradient level, for boxes
 where a single-device GPU update is not the bottleneck.

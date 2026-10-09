@@ -16,8 +16,9 @@ finishes, in one of three shapes:
   HexSet 0.77.0's `hexset.gamelog` keeps the same line discipline; this copy
   goes when the engine pin reaches it.
 - `Partial`: one collection in progress, a directory holding one file per
-  finished game and, for a cohort, the plan of every index it deals. A
-  resumed collection loads what is there and deals only the rest.
+  finished game (`hexn.gamefile`'s compact, exact encoding) and, for a
+  cohort, the plan of every index it deals. A resumed collection loads what
+  is there and deals only the rest.
 
 `Rows` is the line journal a benchmark keeps, one line per probed position.
 """
@@ -117,11 +118,19 @@ def read_lines(path: str | os.PathLike) -> list[dict]:
 
 
 PLAN = "plan.json"
+GAME = ".game"
+# The pickle a game was kept as before `hexn.gamefile`; read, never written.
+LEGACY = ".pkl"
 
 
 @dataclass(frozen=True)
 class Partial:
-    """One collection in progress: `<index>.pkl` per finished game.
+    """One collection in progress: `<index>.game` per finished game.
+
+    Each file is one game in `hexn.gamefile`'s encoding: exact, and a small
+    fraction of the game pickled as objects. A directory written before that
+    encoding holds `<index>.pkl` pickles instead, and is still read, so a run
+    stopped on older code resumes on newer.
 
     A cohort also writes `plan.json`, every index it deals, before its first
     game can finish, so a resumed cohort knows which games are missing
@@ -137,30 +146,59 @@ class Partial:
 
     def keep(self, episode: "Episode") -> None:
         """A collector's `sink`: one finished game, atomically."""
+        from . import gamefile
+
+        self.write(gamefile.encode(episode))
+
+    def write(self, game: bytes) -> None:
+        """One game already encoded (`hexn.gamefile.encode`), atomically."""
+        from . import gamefile
+
         self.directory.mkdir(parents=True, exist_ok=True)
-        write_atomic(self.directory / f"{episode.index}.pkl", pickle.dumps(episode))
+        write_atomic(self.directory / f"{gamefile.index_of(game)}{GAME}", game)
 
     def finished(self) -> list[int]:
         """The indices of the games on disk, from the file names alone."""
         if not self.directory.exists():
             return []
         return sorted(
-            int(path.stem)
-            for path in self.directory.glob("*.pkl")
-            if path.stem.isdigit()
+            {
+                int(path.stem)
+                for suffix in (GAME, LEGACY)
+                for path in self.directory.glob(f"*{suffix}")
+                if path.stem.isdigit()
+            }
         )
 
-    def done(self) -> list["Episode"]:
-        """Every game on disk, by index. One that does not load is removed,
-        which makes it missing, and a resumed collection plays it again."""
+    def games(self) -> list[bytes]:
+        """Every game on disk, encoded, by index. One that does not read back
+        whole is removed, which makes it missing, and a resumed collection
+        plays it again. A pre-encoding pickle is read and encoded here."""
+        from . import gamefile
+
         out = []
         for index in self.finished():
-            path = self.directory / f"{index}.pkl"
+            path = self.directory / f"{index}{GAME}"
+            legacy = self.directory / f"{index}{LEGACY}"
             try:
-                out.append(pickle.loads(path.read_bytes()))
-            except (EOFError, pickle.UnpicklingError):
+                if path.exists():
+                    game = path.read_bytes()
+                    gamefile.check(game)
+                else:
+                    game = gamefile.encode(pickle.loads(legacy.read_bytes()))
+            except (EOFError, pickle.UnpicklingError, gamefile.Corrupt):
                 path.unlink(missing_ok=True)
+                legacy.unlink(missing_ok=True)
+                continue
+            out.append(game)
         return out
+
+    def done(self, dtype=None) -> list["Episode"]:
+        """Every game on disk, by index, decoded (`hexn.gamefile.decode_all`;
+        `dtype` is its observation buffer's, float32 by default)."""
+        from . import gamefile
+
+        return gamefile.decode_all(self.games(), dtype or "float32")
 
     def plan(self) -> list[int] | None:
         path = self.directory / PLAN

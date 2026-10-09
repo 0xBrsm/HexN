@@ -101,6 +101,11 @@ GAMMA = 1.0
 # random-walk at the full learning rate. 1e-5 damps exactly that.
 ADAM_EPS = 1e-5
 
+# The cap on decoupled PPO's behaviour weight pi_prox / pi_behaviour: a
+# truncated importance weight, as V-trace truncates its rho, so one position
+# the behaviour policy all but never chose cannot dominate a minibatch.
+DECOUPLED_CAP = 2.0
+
 
 @dataclass(frozen=True)
 class PPOConfig:
@@ -216,6 +221,14 @@ class PPOConfig:
     # bfloat16 is refused: its 7-bit mantissa moves the recomputed log-probs
     # far enough from the recorded ones to clip positions before any step.
     amp: str = ""
+    # Decoupled PPO (Hilton, Cobbe & Schulman 2021): the clip is centred on
+    # the policy as it stands when the update starts (`Batch.prox_log_prob`,
+    # `attach_proximal`), not on the policy that played the games, and each
+    # row carries the fixed weight pi_prox / pi_behaviour, capped at
+    # `DECOUPLED_CAP`, for the games having been played by an older policy.
+    # On fresh data the two policies are one and the update is plain PPO;
+    # with `--async-collect` it keeps the trust region where the policy is.
+    decoupled: bool = False
 
     def __post_init__(self) -> None:
         if self.amp not in ("", "fp16"):
@@ -390,6 +403,8 @@ def advantages(
 class Batch:
     """One update's worth of positions, flattened out of many episodes."""
 
+    # The packed observations: float16 under fp16 autocast, else float32
+    # (`observation_dtype`).
     buffer: Tensor
     mask: Tensor
     chosen: Tensor
@@ -411,6 +426,9 @@ class Batch:
     # the winner's slot in each transition's own frame, the rest on the last
     # slot. `None` for a run that does not pay for speed.
     fast_target: Tensor | None = None
+    # The learner's own log-probability of each chosen action when the update
+    # starts, for `PPOConfig.decoupled`. `None` unless `attach_proximal` filled it.
+    prox_log_prob: Tensor | None = None
 
     def __len__(self) -> int:
         return self.buffer.shape[0]
@@ -436,6 +454,9 @@ class Batch:
             ),
             fast_target=(
                 None if self.fast_target is None else self.fast_target.to(device)
+            ),
+            prox_log_prob=(
+                None if self.prox_log_prob is None else self.prox_log_prob.to(device)
             ),
         )
 
@@ -475,6 +496,52 @@ def attach_prior(
                 logits = prior.net(*unpack(layout, buffer)).logits.float()
             rows.append(masked_log_softmax(logits, mask).to(batch.buffer.device))
     return replace(batch, prior_log_probs=torch.cat(rows))
+
+
+def attach_proximal(
+    batch: Batch,
+    policy: NetworkPolicy,
+    chunk: int = 4096,
+    amp: str = "",
+) -> Batch:
+    """`batch` with `policy`'s own log-probability of each chosen action
+    attached as `prox_log_prob`, for `PPOConfig.decoupled`: one no-grad forward
+    of the learner as it stands before the update, under the update's autocast."""
+    rows = []
+    with torch.no_grad():
+        for start in range(0, len(batch), chunk):
+            take = slice(start, start + chunk)
+            with autocast(policy.device, amp):
+                evaluation = policy.evaluate(
+                    batch.buffer[take].to(policy.device),
+                    batch.mask[take].to(policy.device),
+                    batch.chosen[take].to(policy.device),
+                )
+            rows.append(evaluation.log_prob.float().to(batch.buffer.device))
+    return replace(batch, prox_log_prob=torch.cat(rows))
+
+
+def staleness(batch: Batch) -> float:
+    """Mean KL estimate between the policy that played the batch and the
+    learner when its update starts (`prox_log_prob`): how old the data is."""
+    d = batch.log_prob - batch.prox_log_prob.to(batch.log_prob.device)
+    return float((torch.expm1(-d) + d).mean())
+
+
+def observation_dtype(config: PPOConfig) -> type:
+    """What a batch holds its observations in: float16 under fp16 autocast,
+    else float32.
+
+    Exact, not an approximation. Every forward that reads `Batch.buffer` --
+    the update's, `attach_proximal`'s and `attach_prior`'s -- runs under
+    `autocast(..., config.amp)`, and observations enter the network only
+    through its four input `nn.Linear` embeddings, which autocast feeds in
+    float16 by rounding a float32 input to nearest-even. A float16 buffer is
+    that rounding done once on the host, so the network reads the same
+    numbers and the batch takes half the memory (`hexn.gamefile`).
+    `test_ppo.py` pins the update to the bit against a float32 batch.
+    """
+    return np.float16 if config.amp == "fp16" else np.float32
 
 
 SETUP_PHASES = (Phase.SETUP_SETTLEMENT, Phase.SETUP_ROAD)
@@ -680,7 +747,7 @@ def assemble(
         raise ValueError("no transitions to learn from")
 
     return Batch(
-        buffer=pack(layout, observations),
+        buffer=pack(layout, observations, observation_dtype(config)),
         mask=torch.from_numpy(np.stack(masks)),
         chosen=torch.tensor(chosen, dtype=torch.int64),
         log_prob=torch.tensor(log_probs, dtype=torch.float32),
@@ -784,6 +851,7 @@ def minibatch_terms(
     config: PPOConfig,
     prior_log_probs: Tensor | None = None,
     fast_target: Tensor | None = None,
+    prox_log_prob: Tensor | None = None,
 ) -> Terms:
     """The clipped surrogate, win-head loss, auxiliary margin loss and
     entropy for one minibatch -- plus, when `prior_log_probs` is given, the
@@ -795,10 +863,19 @@ def minibatch_terms(
     minibatch's own mean and std.
     """
     evaluation = policy.evaluate(buffer, mask, chosen)
-    ratio = (evaluation.log_prob - old_log_prob).exp()
+    # Decoupled PPO: the ratio and its clip are taken against the proximal
+    # policy, and the behaviour weight (no gradient) stands in for the games'
+    # having been played by an older one. Without `prox_log_prob` the anchor is
+    # the behaviour policy and the weight is one: plain PPO.
+    anchor = old_log_prob if prox_log_prob is None else prox_log_prob
+    ratio = (evaluation.log_prob - anchor).exp()
     unclipped = ratio * advantage
     clamped = ratio.clamp(1 - config.clip, 1 + config.clip) * advantage
-    policy_loss = -torch.min(unclipped, clamped).mean()
+    surrogate = torch.min(unclipped, clamped)
+    if prox_log_prob is not None:
+        weight = (prox_log_prob - old_log_prob).exp().clamp(max=DECOUPLED_CAP)
+        surrogate = weight.detach() * surrogate
+    policy_loss = -surrogate.mean()
     if evaluation.quantiles is None:
         # Cross-entropy against the one-hot eventual winner: the win head's
         # raw output is a set of logits, never read directly -- only through
@@ -866,7 +943,7 @@ def minibatch_terms(
         # Schulman's low-variance estimator, which unlike the plain log-ratio
         # mean is non-negative and so cannot hide a diverging update behind
         # cancellation.
-        log_ratio = evaluation.log_prob - old_log_prob
+        log_ratio = evaluation.log_prob - anchor
         # `expm1`, not `ratio - 1`. The estimator is non-negative in exact
         # arithmetic, but in float32 `exp(x)` rounds to 1.0 for any |x| below
         # the ~1.2e-7 epsilon, so the difference collapses to `-log_ratio` and
@@ -965,6 +1042,7 @@ def _terms_for(
             config,
             prior_log_probs=take(batch.prior_log_probs),
             fast_target=take(batch.fast_target),
+            prox_log_prob=take(batch.prox_log_prob),
         )
 
 
@@ -1043,6 +1121,8 @@ def update(
 
     if bool(config.fast_win) != (batch.fast_target is not None):
         raise ValueError("fast_win and the batch's fast-win target must come together (assemble)")
+    if config.decoupled != (batch.prox_log_prob is not None):
+        raise ValueError("decoupled and the batch's proximal log-probs must come together (attach_proximal)")
     if config.prior_kl > 0 and batch.prior_log_probs is None:
         # A weight with nothing to weigh would train as if it were zero and
         # log a zero divergence, which reads as "the policy has not moved".

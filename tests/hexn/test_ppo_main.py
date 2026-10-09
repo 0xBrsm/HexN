@@ -131,14 +131,17 @@ def test_a_run_killed_mid_collection_resumes_without_losing_or_repeating_a_game(
     from hexn import durable
     from hexn.selfplay import Collector
 
+    from hexn.ppo import prepare as prepare_module
+
     used: list[list[int]] = []
-    real_assemble = ppo_main.assemble
+    real_assemble = prepare_module.assemble
 
     def assemble(episodes, *args, **kwargs):
         used.append(sorted(e.index for e in episodes))
         return real_assemble(episodes, *args, **kwargs)
 
-    monkeypatch.setattr(ppo_main, "assemble", assemble)
+    # The trainer assembles through `hexn.ppo.prepare.prepare`.
+    monkeypatch.setattr(prepare_module, "assemble", assemble)
     real_tick = Collector.tick
     interrupted = durable.partial(tmp_path / "partial", 1)
 
@@ -304,9 +307,39 @@ def test_async_collection_prefetches_each_batch_once(tmp_path):
     assert all(line["positions"] > 0 for line in lines)
 
 
-def test_prefetching_has_to_opt_out_of_the_on_policy_guarantee(tmp_path):
-    with pytest.raises(SystemExit):
-        run(tmp_path, 1, ["--collect-workers", "2", "--async-collect"])
+def test_a_prefetched_cohort_is_whole_and_exactly_one_update_stale(tmp_path):
+    # Cohort mode keeps its game count and plays every game out; prefetching
+    # makes iteration 1 train on games the pre-update policy played, which the
+    # first minibatch's KL shows and a synchronous run's does not.
+    common = ["--checkpoint-every", "1", "--collect-workers", "2", "--lanes", "2",
+              "--games-per-iteration", "2", "--learning-rate", "0.01"]
+    logs = {}
+    for name, extra in (("sync", ["--no-async-collect"]), ("async", ["--async-collect", "--no-decoupled"])):
+        assert run(tmp_path / name, 2, common + extra) == 0
+        logs[name] = [
+            json.loads(line)
+            for line in (tmp_path / name / "log.jsonl").read_text().splitlines()
+        ]
+    for lines in logs.values():
+        assert [line["iteration"] for line in lines] == [0, 1]
+        assert [line["games"] for line in lines] == [2, 4]
+    assert logs["sync"][1]["approx_kl_first_minibatch"] < 1e-9
+    assert logs["async"][1]["approx_kl_first_minibatch"] > 1e-7
+
+
+def test_an_async_checkpoint_records_the_counters_from_before_the_cohort_in_flight(tmp_path):
+    # Cohort k+1 is dispatched as soon as cohort k's games are home, so when
+    # update 0's checkpoint is written cohort 2 is already dealt. The
+    # checkpoint must still hold the counters as they stood after cohort 1:
+    # two workers, two games a cohort, worker w dealing w, w+2, ... -- after
+    # indices 0-3 the workers' next deals are 4 and 5, and the max is 5.
+    common = ["--checkpoint-every", "1", "--keep-every", "1", "--collect-workers", "2", "--lanes", "2",
+              "--games-per-iteration", "2", "--async-collect"]
+    assert run(tmp_path, 3, common) == 0
+    first = torch.load(tmp_path / "iter-00001.pt", weights_only=False)
+    assert first["games_started"] == 5
+    lines = [json.loads(line) for line in (tmp_path / "log.jsonl").read_text().splitlines()]
+    assert [line["games"] for line in lines] == [2, 4, 6]
 
 
 class Streamless:
@@ -700,7 +733,7 @@ def test_a_run_killed_mid_update_resumes_from_its_last_step_to_the_uninterrupted
     shape = ["--lanes", "4", "--games-per-iteration", "4", "--minibatch", "48", "--epochs", "2"]
     # Two collection workers return their games worker by worker, not in game
     # order, and a resumed collection returns its kept games first.
-    shape += ["--collect-workers", str(workers), "--keep-every", "1"]
+    shape += ["--collect-workers", str(workers), "--keep-every", "1", "--no-async-collect"]
     straight = tmp_path / "straight"
     assert run(straight, 3, shape) == 0
 
@@ -840,3 +873,52 @@ def test_an_fp16_run_on_a_device_batch_trains_resumes_and_keeps_its_scale(tmp_pa
     ]
     assert [r["iteration"] for r in records] == [0, 1]
     assert all(r["amp_scale"] > 0 and r["prior_kl"] > 0 for r in records)
+
+
+def test_a_decoupled_async_run_starts_each_update_on_the_learner(tmp_path):
+    # Async data is one update stale; decoupled PPO anchors the clip on the
+    # learner, so the first minibatch's KL is ~0 while the staleness gauge
+    # reads the age of the data.
+    flags = ["--checkpoint-every", "1", "--collect-workers", "2", "--lanes", "2",
+             "--games-per-iteration", "2", "--learning-rate", "0.01", "--async-collect", "--decoupled"]
+    assert run(tmp_path, 2, flags) == 0
+    lines = [json.loads(l) for l in (tmp_path / "log.jsonl").read_text().splitlines()]
+    assert [line["iteration"] for line in lines] == [0, 1]
+    assert lines[1]["approx_kl_first_minibatch"] < 1e-7
+    assert lines[1]["staleness_kl"] > 1e-7
+    assert lines[0]["staleness_kl"] < 1e-7
+
+
+def test_the_defaults_resolve_to_async_decoupled_with_workers_and_fp32_on_cpu(tmp_path):
+    # With collect workers and no flags, collection is async and the update
+    # decoupled; on a CPU device the fused trunk and fp16 stay off. Each log row
+    # says what ran.
+    assert run(tmp_path / "auto", 1, ["--collect-workers", "2", "--lanes", "2", "--games-per-iteration", "2"]) == 0
+    (row,) = [json.loads(l) for l in (tmp_path / "auto" / "log.jsonl").read_text().splitlines()]
+    assert (row["async_collect"], row["decoupled"], row["fused"], row["amp"]) == (True, True, False, "")
+    assert "staleness_kl" in row
+
+
+def test_an_explicit_off_and_one_worker_keep_the_synchronous_plain_loop(tmp_path):
+    for name, extra in (("one", []), ("off", ["--collect-workers", "2", "--lanes", "2", "--games-per-iteration", "2", "--no-async-collect"])):
+        assert run(tmp_path / name, 1, extra) == 0
+        (row,) = [json.loads(l) for l in (tmp_path / name / "log.jsonl").read_text().splitlines()]
+        assert (row["async_collect"], row["decoupled"]) == (False, False)
+
+
+def test_a_config_frozen_before_the_defaults_keeps_its_values():
+    # Frozen configs carry explicit false / "" for these flags; only None and
+    # "auto" (what a new freeze records) are resolved.
+    from types import SimpleNamespace
+
+    old = SimpleNamespace(device="cuda", fused=False, amp="", async_collect=False, decoupled=False,
+                          collect_workers=26, update_workers=0)
+    ppo_main.resolve_defaults(old)
+    assert (old.fused, old.amp, old.async_collect, old.decoupled) == (False, "", False, False)
+    older = SimpleNamespace(device="cuda", collect_workers=26, update_workers=0)
+    ppo_main.resolve_defaults(older)
+    assert (older.fused, older.amp, older.async_collect, older.decoupled) == (False, "", False, False)
+    new = SimpleNamespace(device="cuda", fused=None, amp="auto", async_collect=None, decoupled=None,
+                          collect_workers=26, update_workers=0)
+    ppo_main.resolve_defaults(new)
+    assert (new.fused, new.amp, new.async_collect, new.decoupled) == (True, "fp16", True, True)

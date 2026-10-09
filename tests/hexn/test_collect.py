@@ -9,6 +9,7 @@ from _bots import needs
 
 torch = pytest.importorskip("torch", reason="PyTorch runs on the training box only")
 
+from hexn import gamefile  # noqa: E402
 from hexn.collect import ParallelCollector, WorkerSpec, _build, _serve  # noqa: E402
 
 
@@ -181,8 +182,8 @@ def test_a_searched_worker_returns_episodes_whose_transitions_carry_targets():
     (kind, payload), = served(
         spec(0, 1, width=16, simulations=8, wave=4, action_cap=120), ("cohort", 1)
     )
-    assert kind == "episodes", payload
-    episodes = payload.episodes()
+    assert kind == "games", payload
+    episodes = gamefile.decode_all(payload)
     assert episodes
     targets = [
         t.aux
@@ -198,66 +199,21 @@ def test_a_searched_worker_returns_episodes_whose_transitions_carry_targets():
     assert searched and all(t.prior is not None for t in searched)
 
 
-def test_the_flat_wire_format_rebuilds_byte_identical_episodes():
-    """`Flattened` is a container change, not a data change.
+def test_a_worker_sends_home_exactly_the_games_it_kept(tmp_path):
+    """A worker encodes each game once, as it finishes: the bytes it sends
+    are the files it wrote, so a game read back after a resume and a game
+    that came over the pipe decode alike (`hexn.gamefile`)."""
+    from hexn import durable
 
-    The same cohort, shipped flat and rebuilt, must assemble to a Batch equal
-    tensor-for-tensor to the one the original objects assemble to — that is
-    the acceptance test the perf review set. The rebuilt observations must
-    also share one packed buffer, because restoring `pack`'s gather path is
-    half the point.
-    """
-    import pickle
+    partial = durable.Partial(tmp_path / "iter-00000")
+    (kind, payload), = served(spec(0, 1, width=16), ("cohort", (3, partial)))
 
-    from hexset.actions import space_for
-    from hexset.board.board import random_base_board
-    from hexn.collect import Flattened
-    from hexset.encoding import static_graph
-    from hexset.game import start
-    from hexn.model import HexNet, ModelConfig, packing
-    from hexn.policy import NetworkPolicy
-    from hexn.ppo import PPOConfig, assemble
-    from hexn.selfplay import Collector
-
-    rng = random.Random(0)
-    board = random_base_board(rng)
-    game = start(board, 4, rng)
-    graph = static_graph(board.topology)
-    torch.manual_seed(0)
-    net = HexNet(space_for(game), graph, 4, ModelConfig(width=16, rounds=1))
-    policy = NetworkPolicy(net, space_for(game), packing(graph, 4))
-    # Trade-free and short: the round trip is about the flattening, and a
-    # network gate prices every candidate after every MAIN action.
-    episodes = Collector(policy, lanes=4, seed=3, action_cap=150, max_offers=0).collect(3)
-
-    flat = pickle.loads(pickle.dumps(Flattened(episodes, policy.layout)))
-    rebuilt = flat.episodes()
-
-    assert [e.index for e in rebuilt] == [e.index for e in episodes]
-    assert [e.outcome for e in rebuilt] == [e.outcome for e in episodes]
-    assert [len(e) for e in rebuilt] == [len(e) for e in episodes]
-
-    config = PPOConfig()
-    original = assemble(episodes, policy.layout, config)
-    again = assemble(rebuilt, policy.layout, config)
-    for field in (
-        "buffer",
-        "mask",
-        "chosen",
-        "log_prob",
-        "advantage",
-        "value_target",
-    ):
-        assert torch.equal(getattr(original, field), getattr(again, field)), field
-
-    shared = {
-        id(t.observation._packed)
-        for e in rebuilt
-        for seat in e.trajectories
-        for t in seat
-    }
-    assert shared == {id(flat.buffer)}
-
+    assert kind == "games", payload
+    assert all(isinstance(game, bytes) for game in payload)
+    assert sorted(payload, key=gamefile.index_of) == partial.games()
+    episodes = gamefile.decode_all(payload)
+    assert sorted(e.index for e in episodes) == partial.finished()
+    assert all(len(e) > 0 for e in episodes)
 
 def test_a_league_worker_records_every_seat_and_loads_a_weight_list():
     """Stage 2's worker contract: two learner nets share the table, every seat
@@ -270,8 +226,8 @@ def test_a_league_worker_records_every_seat_and_loads_a_weight_list():
     loaded, (kind, payload) = served(league, ("weights", states), ("cohort", 2))
 
     assert loaded == ("ok", None)
-    assert kind == "episodes", payload
-    episodes = payload.episodes()
+    assert kind == "games", payload
+    episodes = gamefile.decode_all(payload)
     assert len(episodes) == 2
     for episode in episodes:
         assert set(episode.cast) == {0, 1}

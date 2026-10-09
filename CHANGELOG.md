@@ -2,6 +2,149 @@
 
 All notable changes to the `hexn` package are recorded here.
 
+## 0.39.0
+
+### Breaking
+
+- `hexn.collect.Flattened` is removed. A collector worker now sends its games
+  home as `hexn.gamefile` bytes, and `ParallelCollector.finish_collect`
+  decodes them, in game-index order, into one observation buffer for the
+  whole collection.
+
+### Added
+
+- `--collect-trunk {reference,fused}` and `--collect-precision {fp32,bf16}`
+  (`WorkerSpec.trunk`, `WorkerSpec.precision`, `NetworkPolicy.precision`):
+  the collect workers' forward. The trunk is speed only: `fused` is the
+  same numbers as dense GEMMs up to float reassociation. The precision is the
+  autocast `act` samples under. Under `bf16` the logits, and the recorded
+  value, come back to fp32 before the softmax, so the recorded log-probability
+  is the exact fp32 log-softmax of the logits the policy sampled from. That
+  makes a bf16 worker a slightly different behaviour policy whose
+  log-probabilities are still exact. `values`, `score` and `evaluate` keep
+  the net's own precision. A new freeze defaults to `fused` and `fp32`; a
+  config frozen before these flags loads with `reference` and `fp32`
+  (`hexn.run.manifest.ADDED`). The in-process collector plays on the
+  learner's own trunk and refuses a precision other than `fp32`.
+
+- `--sample-stream {worker,game}` (`WorkerSpec.sample_stream`,
+  `Collector(sample_stream=...)`): where a sampling policy's draws come from.
+  `game`, the default for a new freeze, keys every decision on
+  `hexn.selfplay.draw_key(seed, index, seat, step)` (`Request.draw`) and
+  `NetworkPolicy` takes a Gumbel-max draw from that key alone
+  (`hexn.policy.keyed_gumbel`), so a game is a pure function of its index and
+  the weights however collection is sharded, batched or resumed. `worker`
+  keeps each collector's own generator, under which a game's sampled actions
+  depend on the worker count, the lanes and which games shared a batch; it
+  is what every earlier run used, and what `WorkerSpec` and `Collector` still
+  default to. A searched worker refuses `game`.
+
+- `hexn.run.manifest.ADDED`: per mode, the parameters added after manifests
+  were being frozen, each with the value that reproduces the code's
+  behaviour from before the flag (its off position, not today's default).
+  `load` fills a key from it only when the frozen config lacks it, leaves the
+  file untouched, prints what it filled and lists it in
+  `Manifest.meta["filled"]`. `runtime` fills as `[]`: a run naming no bot
+  plays as before, and one naming a bot fails at startup, since no runtime
+  provides it. A missing key with no such value (`reward`, `init`, and
+  renames) is still refused.
+
+- `hexn.gamefile`: one finished game as compact bytes, exactly. Observation
+  rows are stored as each row's bitwise XOR against the row before, masks as
+  bits, the rest pickled, all deflated; decoding returns every field bit for
+  bit. `decode_all` decodes a collection into one shared buffer in the
+  network's packing order, so `pack` gathers a batch in one copy, or none when
+  the batch is the collection in order.
+
+- Under `--amp fp16` a PPO batch holds its observations in float16
+  (`hexn.ppo.observation_dtype`), and so does a parallel collection
+  (`ParallelCollector(observations=...)`). The update reads the same numbers:
+  observations reach the network only through its input embeddings, which
+  autocast feeds the same nearest-even float16 rounding. `unpack` copies a
+  float16 buffer's blocks out contiguous, as autocast's cast would, so the
+  update is the float32 batch's to the bit. `pack` takes a `dtype` and
+  refuses to widen float16 observations to float32.
+
+- Each PPO log row records `batch_fingerprint` (`hexn.steps.fingerprint`).
+
+- `--decoupled` (`PPOConfig.decoupled`): decoupled PPO. The clip is centred on
+  the learner as the update starts (`Batch.prox_log_prob`, `attach_proximal`),
+  and each row is weighted by pi_prox / pi_behaviour, capped at
+  `DECOUPLED_CAP`. On fresh data it is the plain PPO update. With it,
+  `approx_kl` and `clip_fraction` read against the proximal policy, and the
+  log gains `staleness_kl` (`hexn.ppo.staleness`). Refused with
+  `--update-workers`.
+
+### Changed
+
+- `--batch-on-device` is on by default for a new freeze (now
+  `--batch-on-device/--no-batch-on-device`): each assembled batch moves to
+  `--device` whole before the prior and proximal forwards, rather than row
+  by row inside the update. The batch is the same bits either way, and so
+  are the final weights. **Memory:** on a GPU the batch now lives in device
+  memory, about 3.3 KB a position (observations in fp16, and masks). On a
+  shared-memory GPU (WSL2 with an integrated GPU) that is host RAM the
+  driver holds outside the Linux VM's own memory and its cap. Read any memory guard's margin with it
+  counted. A config frozen before this flag existed loads with
+  `batch_on_device` False (`hexn.run.manifest.ADDED`), as before.
+
+- Async cohort collection assembles each cohort in a helper process
+  (`hexn.ppo.prepare.Preparer`) as soon as its last game is on disk, while
+  the update still runs. The helper decodes the games and assembles the
+  batch, the per-game gauges and the stripped games; the trainer only
+  receives the games from the workers and takes the helper's result. The
+  trainer compares a digest of the bytes it received with the bytes the
+  helper read, and assembles the cohort itself on a mismatch, a failure or
+  a timeout, so the batch is bit-identical either way. The trainer's own
+  assembly is `hexn.ppo.prepare.prepare`, used on both paths.
+  `fast_win_gauges`, `coalition_gauges` and `learner_final_vp` moved there
+  and are still importable from `hexn.ppo.__main__`.
+  For the common configuration the helper decodes the cohort into arrays
+  (`hexn.gamefile.decode_columns`) and assembles it without a per-position
+  object (`hexn.ppo.prepare.prepare_columns`), bit-identical to the object
+  path and about twice as fast. It covers GAE with or without `decided_cut`
+  and `setup_weight`, and no fast-win, per-VP, pair or coalition terms; any
+  other configuration takes the object path.
+
+- Async collection dispatches cohort k+1 as soon as cohort k's games are
+  home, before they are decoded and assembled, instead of after assembly.
+  The weights it ships are the same ones (no update runs in between), so
+  the games and every batch are bit-identical. The workers now play through
+  the decode, the assembly and the proximal pass instead of waiting on them.
+  A checkpoint written while that cohort plays records the workers' counters
+  from just before it was dealt, as before. `collect_seconds` now spans that
+  earlier dispatch to the decoded games.
+  `ParallelCollector.receive` and `ParallelCollector.decode` split
+  `finish_collect`, which keeps its behaviour.
+
+- `hexn.durable.Partial` keeps each finished game as `<index>.game` in the
+  `hexn.gamefile` encoding instead of a pickled `Episode`, at a small
+  fraction of the size. A directory of `<index>.pkl` pickles left by an
+  older trainer is still read, so such a run resumes; a damaged file of
+  either kind is removed and its game played again. `Partial.write` keeps a
+  game already encoded and `Partial.games` returns them encoded.
+
+- A collector worker encodes each game the tick it finishes and holds only
+  those bytes, rather than every episode of its cohort as objects until the
+  cohort ends. A `Collector.sink` that returns something replaces the
+  episode with it.
+
+- The PPO trainer lets go of an iteration's batch once its update is done,
+  before the next collection lands, and the league trainer lets go of an
+  iteration's games and batch before the next collection.
+
+- The validated speed and collection settings are now the defaults; each
+  keeps an explicit off switch. `--fused` (now `--fused/--no-fused`) is on
+  when `--device` is a GPU. `--amp` defaults to `auto`, meaning fp16 on a
+  GPU and fp32 on CPU; `off` (or `''`) keeps fp32. `--async-collect`
+  (now `--async-collect/--no-async-collect`) is on when `--collect-workers`
+  > 1 and the update is not sharded. `--decoupled` (now
+  `--decoupled/--no-decoupled`) is on exactly when collection is async
+  (`hexn.ppo.__main__.resolve_defaults`, `hexn.loop.resolve_fused`). A
+  config frozen before this change keeps the values it recorded, and a key
+  it lacks counts as off. Each PPO log row now records the resolved
+  `fused`, `amp`, `async_collect` and `decoupled`.
+
 ## 0.38.0
 
 ### Added
@@ -27,6 +170,9 @@ All notable changes to the `hexn` package are recorded here.
 ### Changed
 
 - With `--fused`, the parent loaded for `--prior-kl` runs the fused trunk too.
+- `--async-collect` runs with `--collect-mode cohort`: each prefetched cohort
+  is played whole by the pre-update policy, so the batch is one iteration
+  stale and unbiased in game length. It was refused before.
 
 ### Fixed
 

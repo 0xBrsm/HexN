@@ -190,3 +190,44 @@ def test_a_durable_write_leaves_the_page_cache_after_its_fsync(tmp_path, monkeyp
     durable.write_atomic(tmp_path / "game.pkl", b"x" * 4096)
     assert calls == ["fsync", os.POSIX_FADV_DONTNEED]
     assert (tmp_path / "game.pkl").read_bytes() == b"x" * 4096
+
+
+def test_a_partial_keeps_each_game_encoded_and_still_reads_the_old_pickles(tmp_path):
+    """A game is kept as `<index>.game` (`hexn.gamefile`), and a partial an
+    older trainer left as `<index>.pkl` pickles still loads, alone or mixed,
+    so a run stopped on older code resumes on newer."""
+    import pickle
+
+    from hexn import gamefile
+
+    episodes = Collector(First(), fill=False, **QUICK).cohort(4)
+    partial = durable.Partial(tmp_path / "iter-00002")
+    for episode in episodes[:2]:
+        partial.keep(episode)
+    for episode in episodes[2:]:
+        (partial.directory / f"{episode.index}.pkl").write_bytes(pickle.dumps(episode))
+
+    assert sorted(p.suffix for p in partial.directory.iterdir()) == [".game", ".game", ".pkl", ".pkl"]
+    assert partial.finished() == sorted(e.index for e in episodes)
+    assert fingerprint(partial.done()) == fingerprint(episodes)
+    assert [gamefile.index_of(game) for game in partial.games()] == partial.finished()
+    for kept, original in zip(partial.done(), sorted(episodes, key=lambda e: e.index)):
+        for a, b in zip(
+            (t for s in kept.trajectories for t in s), (t for s in original.trajectories for t in s)
+        ):
+            assert (a.observation.globals.view("uint32") == b.observation.globals.view("uint32")).all()
+            assert (a.mask == b.mask).all() and a.log_prob == b.log_prob
+
+
+def test_a_damaged_game_file_is_removed_and_played_again(tmp_path):
+    episodes = Collector(First(), fill=False, **QUICK).cohort(2)
+    partial = durable.Partial(tmp_path / "iter-00003")
+    partial.write_plan([e.index for e in episodes])
+    for episode in episodes:
+        partial.keep(episode)
+    damaged = partial.directory / f"{episodes[0].index}.game"
+    damaged.write_bytes(damaged.read_bytes()[:-5])
+
+    assert len(partial.done()) == 1
+    assert partial.finished() == [episodes[1].index], "the damaged game is missing now"
+    assert partial.indices() == {e.index for e in episodes}

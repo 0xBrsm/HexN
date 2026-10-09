@@ -530,10 +530,10 @@ class HexNet(nn.Module):
         # they are derived from the graph, not learned, and must not become
         # state_dict keys old checkpoints fail strict loading over.
         # Same numbers up to float reassociation; the equivalence test
-        # compares the two paths. Default OFF: on CPU eager the dense GEMMs do
-        # ~6x the gather path's arithmetic and are slower there, so the fused
-        # path is an opt-in for the dispatch-bound GPU update, where fewer
-        # kernels is the bet — `--fused` on `hexn.ppo`.
+        # compares the two paths. Default OFF: the dense GEMMs do ~6x the
+        # gather path's arithmetic, so whether they win depends on the host;
+        # the learner opts in with `--fused` on `hexn.ppo` and the collect
+        # workers with `--collect-trunk fused`.
         self.register_buffer(
             "A_vh", _mean_adjacency(hex_vertex[1], hex_vertex[0], graph.num_vertices, graph.num_hexes), persistent=False
         )
@@ -876,8 +876,15 @@ def packing(graph: StaticGraph, players: int) -> Packing:
     return Packing(width=start, blocks=tuple(blocks))
 
 
-def pack(layout: Packing, observations: list[Observation]) -> Tensor:
-    """Stack observations, reusing a batch encoder buffer when available."""
+def pack(layout: Packing, observations: list[Observation], dtype=np.float32) -> Tensor:
+    """Stack observations, reusing a batch encoder buffer when available.
+
+    `dtype` is the result's: float32, or float16 for a batch only an fp16
+    autocast forward reads (`hexn.gamefile`), rounded to nearest-even. A
+    float32 result is refused from observations already held in float16:
+    widening them back would hand a float32 reader values it never encoded.
+    """
+    dtype = np.dtype(dtype)
     batch = len(observations)
     if observations:
         source = observations[0]._packed
@@ -886,16 +893,20 @@ def pack(layout: Packing, observations: list[Observation]) -> Tensor:
             and source.shape[1] == layout.width
             and all(observation._packed is source for observation in observations)
         ):
+            _narrowing_only(source.dtype, dtype)
             rows = np.asarray(
                 [observation._row for observation in observations], dtype=np.intp
             )
             if batch == source.shape[0] and np.array_equal(rows, np.arange(batch)):
-                return torch.from_numpy(source)
+                return torch.from_numpy(source.astype(dtype, copy=False))
             # Opponent mixing can hand one policy a subset of a tick. One
             # contiguous gather is still cheaper than stacking four blocks.
-            return torch.from_numpy(source[rows])
+            return torch.from_numpy(source[rows].astype(dtype, copy=False))
+        if dtype != np.float16:
+            for observation in observations:
+                _narrowing_only(observation.globals.dtype, dtype)
 
-    out = np.empty((batch, layout.width), dtype=np.float32)
+    out = np.empty((batch, layout.width), dtype=dtype)
     for name, start, stop, shape in layout.blocks:
         destination = out[:, start:stop].reshape(batch, *shape)
         if destination.base is None:
@@ -904,10 +915,29 @@ def pack(layout: Packing, observations: list[Observation]) -> Tensor:
     return torch.from_numpy(out)
 
 
+def _narrowing_only(held: np.dtype, wanted: np.dtype) -> None:
+    if held == np.float16 and wanted != np.float16:
+        raise ValueError(
+            "these observations are held in float16 for an fp16-autocast update; "
+            "they cannot make a float32 batch"
+        )
+
+
 def unpack(layout: Packing, packed: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    """Views back onto the four blocks, so nothing is copied on the device."""
+    """Views back onto the four blocks, so nothing is copied on the device.
+
+    Except from a float16 buffer, which only an fp16-autocast forward reads
+    (`hexn.gamefile`): its blocks are copied out contiguous. Autocast hands
+    the input embeddings a float32 block as a fresh contiguous float16 copy,
+    and the embeddings' backward kernels follow the input's layout, so a
+    strided float16 view would give the same forward but gradients summed in
+    another order. Copied, the update is the float32 buffer's to the bit.
+    """
     batch = packed.shape[0]
-    return tuple(
+    blocks = tuple(
         packed[:, start:stop].view(batch, *shape)
         for _, start, stop, shape in layout.blocks
     )
+    if packed.dtype == torch.float16:
+        return tuple(block.contiguous() for block in blocks)
+    return blocks

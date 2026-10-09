@@ -426,11 +426,23 @@ def add_head_flags(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--fused",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help="the learner's forward runs the fused GEMM trunk — same math, "
-        "fewer kernels; measured slower on CPU, so this is the GPU update's "
-        "opt-in and the collect workers keep the reference path",
+        "fewer kernels. Default: on when --device is a GPU, off on CPU (where "
+        "it measured slower); the collect workers choose theirs with "
+        "--collect-trunk",
     )
+
+
+def resolve_fused(args) -> bool:
+    """`--fused` as the run uses it: the flag when given, else on for a GPU
+    device. A frozen config from before the default (`false`, or no key at all)
+    keeps the reference path."""
+    fused = getattr(args, "fused", False)
+    if fused is None:
+        return torch.device(args.device).type == "cuda"
+    return bool(fused)
 
 
 def build(args) -> tuple[NetworkPolicy, torch.optim.Optimizer, object]:
@@ -462,9 +474,9 @@ def build(args) -> tuple[NetworkPolicy, torch.optim.Optimizer, object]:
     # not architecture, so it lives on the net rather than in ModelConfig and
     # changes nothing about what a checkpoint rebuilds for play.
     net.detach_value = getattr(args, "detach_value", False)
-    # Learner-side only: collect workers build their own nets and keep the
-    # reference path, which measured faster on CPU.
-    net.fused = getattr(args, "fused", False)
+    # Learner-side only: collect workers build their own nets, on the trunk
+    # and precision `--collect-trunk` / `--collect-precision` name.
+    net.fused = resolve_fused(args)
     policy = NetworkPolicy(net, space, packing(graph, args.players), device=args.device)
     policy.record_fast = net.config.fast_win
     policy.vp_reward = float(getattr(args, "vp_reward", 0.0))

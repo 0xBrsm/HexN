@@ -66,6 +66,7 @@ from ..collect import (
 )
 from ..loop import (
     add_head_flags,
+    resolve_fused,
     build,
     ladder,
     lag_rung,
@@ -80,16 +81,20 @@ from . import (
     PPOConfig,
     assemble,
     attach_prior,
+    attach_proximal,
     fast_weight,
+    observation_dtype,
     stakes_gauges,
+    staleness,
     update,
     win_round,
 )
 from ..model import graft_fast_win
 from ..schedule import AdaptiveLR, current_lr, linear_anneal, set_lr
-from ..selfplay import BatchPolicy, Collector, Episode
+from ..selfplay import SAMPLE_STREAMS, BatchPolicy, Collector, Episode
 from ..steps import Steps, by_index, fingerprint, remove as remove_steps
 from ..trade import check_trader
+from .prepare import Prepared, Preparer, coalition_gauges, fast_win_gauges, games_digest, learner_final_vp, prepare  # noqa: F401
 
 
 # Arbitrary but documented: a single in-process collector saturates around
@@ -232,16 +237,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--amp",
-        choices=("", "fp16"),
-        default="",
+        choices=("auto", "fp16", "off", ""),
+        default="auto",
         help="run the update's (and the prior's) forward and backward under "
-        "fp16 autocast with a gradient scaler; '' keeps fp32. See PPOConfig",
+        "fp16 autocast with a gradient scaler. Default 'auto': fp16 when "
+        "--device is a GPU, fp32 on CPU; 'off' (or '') keeps fp32. See PPOConfig",
     )
     parser.add_argument(
         "--batch-on-device",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="move each assembled batch to --device whole, before the prior "
-        "forward, instead of moving every micro-batch's rows as it is used",
+        "forward, instead of moving every micro-batch's rows as it is used. "
+        "The default; the update's numbers are the same either way. On a GPU "
+        "the batch then lives in device memory (on a shared-memory GPU, host "
+        "RAM the driver holds outside the process's own accounting); "
+        "--no-batch-on-device keeps it on the host",
+    )
+    parser.add_argument(
+        "--decoupled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="decoupled PPO: clip against the learner as the update starts and "
+        "weight each row by pi_prox / pi_behaviour (capped); the same update on "
+        "fresh data, and the one --async-collect needs. Default: on exactly when "
+        "collection is async. See PPOConfig",
     )
     parser.add_argument("--checkpoint-dir", default="runs/ppo")
     parser.add_argument("--checkpoint-every", type=int, default=1)
@@ -342,10 +362,41 @@ def build_parser() -> argparse.ArgumentParser:
         "its game ends and carries the unfinished ones across the weight sync",
     )
     parser.add_argument(
+        "--sample-stream",
+        choices=SAMPLE_STREAMS,
+        default="game",
+        help="where the sampled actions' randomness comes from: game (the "
+        "default) keys every draw on (seed, game index, seat, step), so a game "
+        "is a pure function of its index and the weights; worker keeps each "
+        "collector's own generator, as every run frozen before this flag did "
+        "(a game then depends on the worker count and lanes)",
+    )
+    parser.add_argument(
+        "--collect-trunk",
+        choices=("reference", "fused"),
+        default="fused",
+        help="the collect workers' trunk: fused (the default), dense GEMMs, or "
+        "reference message passing -- the same numbers up to float "
+        "reassociation. The in-process collector plays on the learner's own "
+        "trunk and ignores this",
+    )
+    parser.add_argument(
+        "--collect-precision",
+        choices=("fp32", "bf16"),
+        default="fp32",
+        help="the precision the collect workers' policy samples under. bf16 "
+        "is a slightly different behaviour policy whose log-probabilities are "
+        "still recorded exactly (in fp32, from its own logits)",
+    )
+    parser.add_argument(
         "--async-collect",
-        action="store_true",
-        help="prefetch iteration k+1 during the GPU update of k; requires "
-        "--collect-workers > 1 and trains on a policy one iteration stale",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="prefetch iteration k+1 during the update of k; trains on a policy "
+        "one iteration stale (with --decoupled, the default alongside it). "
+        "Under --collect-mode cohort each prefetched cohort is played whole by "
+        "the pre-update policy. Default: on when --collect-workers > 1 and the "
+        "update is not sharded; --no-async-collect for the synchronous loop",
     )
 
     # Compile, precision, minibatch size and CPU thread count do not move the
@@ -403,64 +454,22 @@ def fast_win_curve(path: str | None) -> tuple[float, ...]:
     return tuple(float(w) for w in weights)
 
 
-def fast_win_gauges(episodes: Sequence[Episode], curve: Sequence[float], players: int) -> dict:
-    """The speed columns a fast-win run logs: the median round games were
-    won in, the median round of the learner's own wins, and the mean payoff
-    per won game."""
-    import statistics
-
-    won = [e for e in episodes if e.outcome.winner is not None]
-    mine = [e for e in won if e.trajectories[e.outcome.winner]]
-    return {
-        "win_round_median": statistics.median(win_round(e.outcome, players) for e in won) if won else None,
-        "learner_win_round_median": (
-            statistics.median(win_round(e.outcome, players) for e in mine) if mine else None
-        ),
-        "fast_payoff_mean": (
-            sum(fast_weight(curve, e.outcome, players) for e in won) / len(won) if won else None
-        ),
-    }
-
-
-def coalition_gauges(episodes: Sequence[Episode], plan_of) -> dict:
-    """What a `coalition(...)` mix dealt and how the learner fared in it:
-    the share of games with a coalition, the share of those whose target
-    was the learner's seat, and the learner's win rate in each kind of
-    game -- targeted (its target seat won), neutral (a learner seat won at
-    a table whose coalition was on someone else) and free (no coalition).
-    `plan_of` is `hexn.collect.mix_coalitions`' law, re-drawn here from the
-    game index: a plan is a pure function of the index, so nothing rides on
-    the episode."""
-    counts = {"targeted": [0, 0], "neutral": [0, 0], "free": [0, 0]}
-    for episode in episodes:
-        plan = plan_of(episode.index)
-        winner = episode.outcome.winner
-        if plan is None:
-            kind, won = "free", winner is not None and bool(episode.trajectories[winner])
-        elif episode.cast[plan.target] == 0:
-            kind, won = "targeted", winner == plan.target
-        else:
-            kind, won = "neutral", winner is not None and bool(episode.trajectories[winner])
-        counts[kind][0] += won
-        counts[kind][1] += 1
-    played = len(episodes)
-    with_coalition = counts["targeted"][1] + counts["neutral"][1]
-    return {
-        "coalition_share": with_coalition / played if played else None,
-        "coalition_targeted_share": counts["targeted"][1] / with_coalition if with_coalition else None,
-        **{
-            f"coalition_{kind}_win_rate": (wins / games if games else None)
-            for kind, (wins, games) in counts.items()
-        },
-    }
-
-
-def learner_final_vp(episodes: Sequence[Episode]) -> float | None:
-    """The mean final victory points of the seats the learner played: the
-    number a per-VP reward moves, read beside the win rate so points bought
-    without wins show up."""
-    held = [e.outcome.points[s] for e in episodes for s, t in enumerate(e.trajectories) if t]
-    return sum(held) / len(held) if held else None
+def resolve_defaults(args) -> None:
+    """The run's 'auto' defaults, decided once, in place, before anything reads
+    them: fused trunk and fp16 on a GPU device, async collection whenever there
+    are collect workers to prefetch with and the update is not sharded, and
+    decoupled PPO exactly when collection is async. An explicit value -- including
+    the `false` / `""` every config frozen before these defaults carries -- stands."""
+    gpu = torch.device(args.device).type == "cuda"
+    args.fused = resolve_fused(args)
+    amp = getattr(args, "amp", "")
+    args.amp = ("fp16" if gpu else "") if amp == "auto" else ("" if amp == "off" else amp)
+    args.async_collect = getattr(args, "async_collect", False)
+    if args.async_collect is None:
+        args.async_collect = args.collect_workers > 1 and args.update_workers <= 1
+    args.decoupled = getattr(args, "decoupled", False)
+    if args.decoupled is None:
+        args.decoupled = bool(args.async_collect)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -489,6 +498,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"python -m {MODULES[manifest.mode]}"
         )
     args = manifest.namespace()
+    resolve_defaults(args)
     # Cross-parameter validation below still reports through the parser, so a
     # bad combination frozen into a manifest fails with the same sentence it
     # would have as a flag.
@@ -498,6 +508,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         check_trader(getattr(args, "trader", None), args.max_offers)
     except ValueError as exc:
         parser.error(str(exc))
+    if args.collect_workers <= 1 and args.collect_precision != "fp32":
+        parser.error("--collect-precision sets the collect workers' forward; "
+                     "the in-process collector plays on the learner's")
     if args.async_collect and args.collect_workers <= 1:
         parser.error("--async-collect requires --collect-workers > 1")
     if args.async_collect and args.update_workers > 1:
@@ -542,12 +555,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "no more, so the surplus lanes would sit empty. Lanes are the "
                 "concurrency, not the cohort — lower them, or raise the cohort"
             )
-        if args.async_collect:
-            parser.error(
-                "--async-collect dispatches the next cohort before the update "
-                "lands, which is exactly the staleness --collect-mode cohort "
-                "exists to remove; pass --collect-mode stream to accept it"
-            )
+        # With --async-collect the next cohort is dealt before the update
+        # lands: every one of its games is still played to completion, all by
+        # one policy -- the pre-update one -- so the batch is one iteration
+        # stale but still unbiased in game length. The flag is that opt-in.
 
     # Printed unconditionally rather than only on the crippled path: a launch
     # that overrides every one of these still benefits from the confirmation,
@@ -590,9 +601,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         decided_cut=getattr(args, "decided_cut", 0.0),
         setup_weight=getattr(args, "setup_weight", 1),
         amp=getattr(args, "amp", ""),
+        decoupled=getattr(args, "decoupled", False),
     )
     if config.amp and args.update_workers > 1:
         raise SystemExit("--amp is not wired into the sharded update (--update-workers)")
+    if config.decoupled and args.update_workers > 1:
+        raise SystemExit("--decoupled is not wired into the sharded update (--update-workers)")
     if config.fast_win:
         if any(duel_pool(name) is not None for name, _ in parse_mix(args.mix)):
             raise SystemExit("--fast-win counts rounds over four live seats; a duel(...) mix is not supported")
@@ -724,7 +738,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parent = (
         frozen(args.parent, args.device, board, args.players) if args.parent else None
     )
-    if parent is not None and getattr(args, "fused", False):
+    if parent is not None and args.fused:
         # The parent's one job on the learner's device is the prior forward;
         # it runs the same fused trunk as the learner's update.
         parent.net.fused = True
@@ -770,10 +784,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                     mix=tuple(mix),
                     parent=args.parent,
                     cohort=args.collect_mode == "cohort",
+                    sample_stream=args.sample_stream,
+                    trunk=args.collect_trunk,
+                    precision=args.collect_precision,
                 )
                 for worker in range(args.collect_workers)
             ],
             heartbeat=directory / "heartbeat.json",
+            # The update is the only reader of a finished collection's
+            # observations, so they are held as it reads them.
+            observations=observation_dtype(config),
         )
     else:
         # Note what the comprehension this replaced did with a name that was
@@ -806,6 +826,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             game_law=mix_deal(mix, args.players, args.seed) if mix else None,
             coalition=mix_coalitions(mix, args.players, args.seed) if mix else None,
+            sample_stream=args.sample_stream,
         )
 
     crew = None
@@ -861,16 +882,63 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     prefetched: list[Episode] | None = None
     prefetched_seconds = 0.0
-    if args.async_collect and start_iteration < args.iterations:
-        # Prime the pipeline. Later cohorts are dispatched immediately before
-        # the preceding update and therefore act with the pre-update policy.
-        # That one-iteration staleness is why this path is explicit opt-in.
+    next_collect_started: float | None = None
+    # The workers' counters just before the cohort in flight was dealt: what a
+    # checkpoint records while that cohort plays (`games_started` cannot be
+    # read then), and what the old schedule read at the same point.
+    counters_before_flight = 0
+
+    # Async cohorts are assembled by a helper process as soon as their last
+    # game is on disk, while the update still runs (`hexn.ppo.prepare`).
+    preparer: Preparer | None = None
+    if args.async_collect and isinstance(collector, ParallelCollector) and args.collect_mode == "cohort":
+        preparer = Preparer(
+            policy.layout,
+            config,
+            args.players,
+            (mix, args.players, args.seed) if mix else None,
+            collector.observations,
+        )
+
+    def dispatch(cohort: int) -> float:
+        """Ship the weights the learner holds now and start cohort `cohort`."""
+        nonlocal counters_before_flight
         started = time.perf_counter()
+        counters_before_flight = collector.games_started()
         collector.sync(policy.net)
-        prefetched = by_index(draw(
-            args.games_per_iteration,
-            partial=durable.partial(collecting, start_iteration),
-        ))
+        collector.start_collect(
+            args.games_per_iteration, partial=durable.partial(collecting, cohort)
+        )
+        if preparer is not None:
+            preparer.submit(cohort, durable.partial(collecting, cohort).directory)
+        return started
+
+    def land(games: list[bytes], cohort: int):
+        """A received cohort: prepared by the helper when its games are the
+        ones received, decoded here otherwise."""
+        if preparer is not None:
+            got = preparer.take(cohort, games_digest(games))
+            if isinstance(got, Prepared):
+                collector.games += len(games)
+                games.clear()
+                return got
+            print(f"helper: {got}; decoding cohort {cohort} here", flush=True)
+        return by_index(collector.decode(games))
+
+    if args.async_collect and start_iteration < args.iterations:
+        # Prime the pipeline. Every later cohort acts with the policy as it
+        # stands before the preceding update -- one iteration stale, which
+        # is why this path is explicit opt-in. Cohort k+1 is dispatched the
+        # moment cohort k's games are home, before they are decoded and
+        # assembled: the weights are already the ones it must act with (no
+        # update runs in between), so the games are the same games, and the
+        # workers play through the decode, the assembly and the update
+        # instead of waiting on them.
+        started = dispatch(start_iteration)
+        games = collector.receive()
+        if start_iteration + 1 < args.iterations:
+            next_collect_started = dispatch(start_iteration + 1)
+        prefetched = land(games, start_iteration)
         prefetched_seconds = time.perf_counter() - started
 
     coalition_plans = mix_coalitions(mix, args.players, args.seed) if mix else None
@@ -893,22 +961,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         played = collector.games
 
         started = time.perf_counter()
-        batch = assemble(episodes, policy.layout, config)
-        # The per-game gauges that read trajectories, taken now; then every
-        # transition goes. Their observations are views into the collectors'
-        # buffers, a second copy of the batch that nothing after this reads
-        # (each game is already on disk in the partial).
-        gauges = {
-            **(fast_win_gauges(episodes, config.fast_win, args.players) if config.fast_win else {}),
-            **({"learner_final_vp_mean": learner_final_vp(episodes)} if config.vp_reward else {}),
-            **(coalition_gauges(episodes, coalition_plans) if coalition_plans is not None else {}),
-            **(
-                stakes_gauges(episodes, config)
-                if config.decided_cut or config.setup_weight != 1
-                else {}
-            ),
-        }
-        episodes = [replace(episode, trajectories=()) for episode in episodes]
+        if isinstance(episodes, Prepared):
+            batch, gauges, episodes = episodes.batch, episodes.gauges, episodes.episodes
+        else:
+            batch, gauges, episodes = prepare(episodes, policy.layout, config, args.players, coalition_plans)
         if getattr(args, "batch_on_device", False):
             # Rebinding drops the host copy: on a shared-memory device the
             # two would otherwise each hold the whole batch.
@@ -924,17 +980,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                     else {}
                 ),
             )
-        assembled = time.perf_counter() - started
-        next_collect_started: float | None = None
-        if args.async_collect and iteration + 1 < args.iterations:
-            # Ship the current policy before `update` mutates it, then let the
-            # CPU workers play while the GPU owns the learner's critical path.
-            next_collect_started = time.perf_counter()
-            collector.sync(policy.net)
-            collector.start_collect(
-                args.games_per_iteration,
-                partial=durable.partial(collecting, iteration + 1),
+        if config.decoupled:
+            batch = attach_proximal(
+                batch, policy, chunk=config.micro_batch or config.minibatch or 4096, amp=config.amp
             )
+            gauges["staleness_kl"] = staleness(batch)
+        assembled = time.perf_counter() - started
+        # Under async collection the next cohort is already in flight: it was
+        # dispatched when this one's games came home (see the priming above).
 
         # ~3 MB a clone: cheap insurance. The brake's third firing lost its
         # evidence because nothing held the pre-update state.
@@ -950,8 +1003,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         # Opened after the pre-update clones and the next collection's weight
         # sync, both of which want the iteration's starting weights: a step
         # file of this iteration's update replaces them with its own.
+        batch_fingerprint = fingerprint(batch)
         stepper = (
-            Steps.open(directory, iteration, fingerprint(batch), step_every, policy, optimiser)
+            Steps.open(directory, iteration, batch_fingerprint, step_every, policy, optimiser)
             if step_every
             else None
         )
@@ -972,16 +1026,32 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.dump_blowout_batch,
             )
 
+        # The update is done with the batch: let it go before the next
+        # collection lands, or the host holds this batch and that collection
+        # at once.
+        positions = len(batch)
+        batch = net_before = optimiser_before = None
+        release_memory()
+        if torch.device(args.device).type == "cuda":
+            torch.cuda.empty_cache()
+
         if next_collect_started is not None:
-            prefetched = by_index(collector.finish_collect())
-            prefetched_seconds = time.perf_counter() - next_collect_started
+            games = collector.receive()
+            started, next_collect_started = next_collect_started, None
+            if iteration + 2 < args.iterations:
+                # The weights are this update's result: what the old schedule
+                # shipped at the next iteration's dispatch, before its update.
+                next_collect_started = dispatch(iteration + 2)
+            prefetched = land(games, iteration + 1)
+            # Dispatch to decoded, so it spans the previous iteration's tail.
+            prefetched_seconds = time.perf_counter() - started
         else:
             prefetched = None
 
         progress = summarise(
             episodes,
             iteration,
-            len(batch),
+            positions,
             collected,
             updated,
             played,
@@ -1006,6 +1076,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             # Same rule again: which critic wiring was in effect appears in its
             # own log, so a row can never be attributed to the wrong wiring.
             "critic": config.critic,
+            # The resolved speed and collection defaults, so a row says what ran.
+            "fused": args.fused,
+            "amp": config.amp,
+            "async_collect": args.async_collect,
+            "decoupled": config.decoupled,
+            # What the update trained on, as `hexn.steps.fingerprint` reads it:
+            # a resumed iteration rebuilt from its partial matches the
+            # uninterrupted one here.
+            "batch_fingerprint": batch_fingerprint,
             **(stepper.log() if stepper is not None else {}),
             "elapsed": time.perf_counter() - began,
         }
@@ -1040,7 +1119,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         if (iteration + 1) % args.checkpoint_every == 0 or iteration + 1 == args.iterations:
             state = {
                 "iteration": iteration + 1,
-                "games_started": collector.games_started(),
+                "games_started": (
+                    counters_before_flight
+                    if next_collect_started is not None
+                    else collector.games_started()
+                ),
                 "net": policy.net.state_dict(),
                 "optimiser": optimiser.state_dict(),
                 "torch_rng": torch.get_rng_state(),
@@ -1089,10 +1172,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             evaluation["ladder"] = ladder(policy, eval_rungs, args)
             print(durable.append_line(log, evaluation), flush=True)
 
-        # Nothing of this iteration is read past here. Let the batch (and
-        # what is left of the episodes) go now, or the next collection runs
-        # with this whole batch still held on the host.
-        batch = episodes = net_before = optimiser_before = None
+        # Nothing of this iteration is read past here. What is left of the
+        # episodes goes now (the batch went before the next collection landed),
+        # or the next collection runs with it still held on the host.
+        episodes = None
         release_memory()
         if torch.device(args.device).type == "cuda":
             # The caching allocator keeps a freed batch's blocks reserved; on
@@ -1101,6 +1184,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if isinstance(collector, ParallelCollector):
         collector.close()
+    if preparer is not None:
+        preparer.close()
     if crew is not None:
         crew.close()
     return 0

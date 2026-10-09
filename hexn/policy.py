@@ -89,6 +89,34 @@ def _entropy(log_probs: Tensor) -> Tensor:
     return -(log_probs.exp() * log_probs).sum(-1)
 
 
+# The precisions `NetworkPolicy.act` can run its forward in (`precision`).
+# "fp32" is no autocast at all. A 16-bit forward's outputs come back to fp32
+# before anything is normalised, so the recorded log-probability is still the
+# exact fp32 log-softmax of the logits the policy sampled from.
+PRECISIONS = {"fp32": None, "bf16": torch.bfloat16}
+
+_GOLDEN64 = np.uint64(0x9E3779B97F4A7C15)
+
+
+def keyed_gumbel(keys: Sequence[int], width: int) -> np.ndarray:
+    """`(len(keys), width)` standard Gumbel noise, each row a pure function of
+    its key (`hexn.selfplay.draw_key`) and each column of its slot.
+
+    splitmix64 over `key + (slot + 1) * golden`, the top 53 bits as a uniform
+    in (0, 1), then -log(-log(u)). numpy's unsigned arithmetic wraps, which
+    is the modular arithmetic the mixer is defined in. Float64 throughout, so
+    the draw does not depend on the policy's own precision.
+    """
+    x = np.asarray(keys, dtype=np.uint64)[:, None] + (
+        np.arange(1, width + 1, dtype=np.uint64)[None, :] * _GOLDEN64
+    )
+    x = (x ^ (x >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+    x = (x ^ (x >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+    x = x ^ (x >> np.uint64(31))
+    u = ((x >> np.uint64(11)).astype(np.float64) + 0.5) * 2.0**-53
+    return -np.log(-np.log(u))
+
+
 @dataclass(frozen=True)
 class Evaluation:
     """What the PPO update needs recomputed under the current parameters."""
@@ -165,10 +193,31 @@ class NetworkPolicy:
         # margin head predicts as final points / 10 in that mode. 0 records
         # the plain value.
         self.vp_reward = 0.0
+        # The precision `act` runs the forward in (`PRECISIONS`). Only `act`:
+        # it is what a collector samples its behaviour from, so it is the one
+        # place a cheaper forward changes nothing but the behaviour policy,
+        # whose log-probabilities it records exactly. `values`, `score` and
+        # `evaluate` stay at the net's own precision.
+        self.precision = "fp32"
 
-    def _sample(self, log_probs: Tensor) -> Tensor:
+    def _forward(self, buffer: Tensor):
+        """The net on a packed batch, under `precision`'s autocast."""
+        dtype = PRECISIONS[self.precision]
+        if dtype is None:
+            return self.net(*unpack(self.layout, buffer))
+        with torch.autocast(self.device.type, dtype=dtype):
+            return self.net(*unpack(self.layout, buffer))
+
+    def _sample(self, log_probs: Tensor, draws: Sequence[int] | None = None) -> Tensor:
         if self.greedy:
             return log_probs.argmax(dim=-1)
+        if draws is not None:
+            # Per-game streams (`hexn.selfplay.SAMPLE_STREAMS`): the Gumbel-max
+            # draw from each row's own key, so the row's action depends on its
+            # distribution and its key and on nothing else in the batch.
+            # Masked slots sit at the fill and never win.
+            noise = torch.from_numpy(keyed_gumbel(draws, log_probs.shape[1]))
+            return (log_probs.double() + noise.to(log_probs.device)).argmax(dim=-1)
         # `multinomial` over probabilities rather than Gumbel over logits: the
         # rows are already normalised by the masked log-softmax, so this needs
         # no second pass and stays one kernel.
@@ -195,40 +244,53 @@ class NetworkPolicy:
             count=len(requests),
         )
         scaled = not self.greedy and bool((temperatures != 1.0).any())
+        draws = [request.draw for request in requests]
+        keyed = draws[0] is not None
+        if any((draw is not None) != keyed for draw in draws):
+            raise ValueError("a batch mixes keyed and unkeyed requests")
 
         with torch.no_grad():
-            prediction = self.net(*unpack(self.layout, buffer.to(self.device)))
+            prediction = self._forward(buffer.to(self.device))
 
-            logits = prediction.logits
+            # Back to fp32 before the softmax and every read; a no-op at fp32.
+            logits = prediction.logits.float()
             if scaled:
                 logits = logits / torch.from_numpy(temperatures).to(
                     self.device, dtype=logits.dtype
                 ).unsqueeze(1)
             log_probs = masked_log_softmax(logits, mask)
-            chosen = self._sample(log_probs)
+            chosen = self._sample(log_probs, draws if keyed else None)
             log_prob = log_probs.gather(1, chosen.unsqueeze(1)).squeeze(1)
 
             # One read-back rather than three. A transfer costs a fixed
             # overhead per tensor whatever its size, so the concatenation is
             # free and the two extra crossings are not.
-            recorded = (
-                prediction.fast[:, : prediction.value.shape[1]]
-                if self.record_fast
-                else prediction.value
-            )
+            if self.precision == "fp32":
+                recorded = (
+                    prediction.fast[:, : prediction.value.shape[1]]
+                    if self.record_fast
+                    else prediction.value
+                )
+            else:
+                # Under a 16-bit forward the heads' softmax ran in 16 bits too;
+                # the recorded value is taken again in fp32 from their logits,
+                # as the log-probability is.
+                recorded = torch.softmax(
+                    (prediction.fast_logits if self.record_fast else prediction.value_logits).float(), dim=-1
+                )[:, : prediction.value.shape[1]]
             if self.vp_reward:
                 now = torch.tensor(
                     [float(request.points) for request in requests],
                     device=recorded.device,
                     dtype=recorded.dtype,
                 )
-                to_come = 10.0 * prediction.margin[:, 0] - now
+                to_come = 10.0 * prediction.margin[:, 0].float() - now
                 recorded = torch.cat(
                     [(recorded[:, 0] + self.vp_reward * to_come).unsqueeze(1), recorded[:, 1:]], dim=1
                 )
             read = torch.cat(
                 [
-                    chosen.unsqueeze(1).to(prediction.value.dtype),
+                    chosen.unsqueeze(1).to(recorded.dtype),
                     log_prob.unsqueeze(1),
                     recorded,
                 ],

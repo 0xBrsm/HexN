@@ -20,7 +20,8 @@ The GPU stays free for the update, and the learner re-syncs weights to every
 worker once per iteration.
 
 What crosses processes is one weights dict per iteration going out and
-finished episodes coming back — never per-tick observations. The other shape
+finished games coming back, each encoded (`hexn.gamefile`) — never per-tick
+observations. The other shape
 considered, SampleFactory-style central inference, was rejected for this
 model: it reintroduces a global tick barrier plus per-tick traffic over the
 pipes, to buy GPU batching that only pays above the batch sizes a shard sees.
@@ -34,7 +35,11 @@ resume safe across a change in worker count.
 `hexn.durable.Partial`, it writes every finished episode there before the
 cohort is done, so a crash mid-iteration loses only the games still in
 flight; the resumed iteration loads the rest and deals only the missing
-indices. The parent never waits on a pipe blindly: it polls, and a worker
+indices. A worker encodes each game once, as it finishes, and from then on
+holds and sends only those bytes: the file it writes is the message it
+sends, and the parent decodes every game the same way whether it came over
+a pipe or off the disk, into one buffer for the whole collection
+(`hexn.gamefile.decode_all`). The parent never waits on a pipe blindly: it polls, and a worker
 that has died, or has gone `STALL_SECONDS` without a tick, fails the run
 with a sentence rather than hanging it. While it waits it writes a
 `heartbeat.json` saying what each worker is doing.
@@ -66,10 +71,14 @@ from hexset.casting import alternating  # noqa: F401
 from hexset.casting import league_rotation, paired
 from hexset.gym.lanes import BoardBots
 from . import runtime
+from . import gamefile
 from .durable import Partial, write_atomic
 from .model import HexNet, ModelConfig, Packing, packing
-from .policy import NetworkPolicy
+from .policy import PRECISIONS, NetworkPolicy
 from .selfplay import BatchPolicy, Collector, Episode, Transition
+
+# The trunks a collect worker's net can run (`WorkerSpec.trunk`).
+TRUNKS = ("reference", "fused")
 
 # How long a busy worker may go without a tick before it counts as wedged. A
 # tick is one decision per lane, searched or not, so this is generous: what it
@@ -995,6 +1004,18 @@ class WorkerSpec:
     # the mover's own belief (`hexset.mcts.Search.worlds`); the tree never
     # roots on the true state here.
     k: int = 1
+    # Where sampling draws come from (`hexn.selfplay.SAMPLE_STREAMS`). "game"
+    # keys every draw on `(seed, index, seat, step)`, so the games a cohort
+    # plays do not depend on the worker count or the lanes.
+    sample_stream: str = "worker"
+    # The worker's forward: `trunk` is the net's path ("reference" message
+    # passing, or "fused", the same numbers as dense GEMMs up to float
+    # reassociation) and `precision` the autocast `act` samples under
+    # (`hexn.policy.PRECISIONS`). Two fields because they answer different
+    # questions: the trunk is speed only, while a 16-bit precision is a
+    # (slightly) different behaviour policy, recorded exactly.
+    trunk: str = "reference"
+    precision: str = "fp32"
 
 
 def _build(spec: WorkerSpec) -> tuple[list[NetworkPolicy], Collector]:
@@ -1032,6 +1053,12 @@ def _build(spec: WorkerSpec) -> tuple[list[NetworkPolicy], Collector]:
     )
     policy.record_fast = spec.fast_win
     policy.vp_reward = spec.vp_reward
+    if spec.trunk not in TRUNKS:
+        raise ValueError(f"trunk must be one of {TRUNKS}, got {spec.trunk!r}")
+    if spec.precision not in PRECISIONS:
+        raise ValueError(f"precision must be one of {tuple(PRECISIONS)}, got {spec.precision!r}")
+    net.fused = spec.trunk == "fused"
+    policy.precision = spec.precision
 
     if spec.learners > 1 and spec.mix:
         # Two separate blockers, and the id space is only the first.
@@ -1078,6 +1105,9 @@ def _build(spec: WorkerSpec) -> tuple[list[NetworkPolicy], Collector]:
                 generator=torch.Generator().manual_seed(spec.torch_seed + 7000 + k),
             )
         )
+        # Every learner a worker drives plays on the same trunk and precision.
+        fellow.fused = net.fused
+        fellow_learners[-1].precision = spec.precision
 
     opponents: list[BatchPolicy | BoardBots] = list(fellow_learners)
     opponents.extend(
@@ -1102,6 +1132,11 @@ def _build(spec: WorkerSpec) -> tuple[list[NetworkPolicy], Collector]:
         caster = paired_caster(caster)
 
     acting: BatchPolicy = policy
+    if spec.simulations > 0 and spec.sample_stream != "worker":
+        # A search draws its worlds and its played move from its own rng, so
+        # keyed draws would cover only part of what makes a searched game.
+        raise ValueError("per-game sample streams cover the plain policy only; "
+                         "a searched worker draws from its own rng")
     if spec.simulations > 0:
         # Imported here rather than at module scope: `hexn.expert` pulls in the
         # search, and a plain PPO worker has no use for it.
@@ -1149,6 +1184,7 @@ def _build(spec: WorkerSpec) -> tuple[list[NetworkPolicy], Collector]:
         ),
         learners=tuple(range(spec.learners)),
         pair_boards=spec.pair_boards,
+        sample_stream=spec.sample_stream,
         game_law=(
             mix_deal(spec.mix, spec.players, spec.seed, pair_boards=spec.pair_boards)
             if spec.learners <= 1 and spec.mix
@@ -1163,133 +1199,6 @@ def _build(spec: WorkerSpec) -> tuple[list[NetworkPolicy], Collector]:
     return [policy, *fellow_learners], collector
 
 
-class Flattened:
-    """A cohort of episodes in wire form: a few large arrays instead of tens of
-    thousands of pickled objects.
-
-    A cohort crosses the worker pipes as ~0.9 GB of per-transition ndarrays —
-    one observation row, one mask, several scalars each — and the parent
-    deserialises all sixteen workers' worth serially, inside `collect_seconds`.
-    `Observation.__reduce__` strips the shared tick buffer on purpose, so every
-    row also arrives as its own allocation and `pack` loses its gather path.
-
-    This container flattens each worker's trajectories into contiguous blocks
-    where the time is parallel, and `episodes()` rebuilds the identical
-    `Episode` objects on the far side. Observations come back as views into one
-    shared `(positions, width)` buffer with `_packed`/`_row` set, so `pack`
-    gathers the whole cohort in one strided copy instead of stacking 145k rows.
-    Same numbers, different container: the rebuilt cohort assembles to a
-    byte-identical `Batch`, and `test_collect` pins that.
-
-    `action`, `aux` and `value` stay object lists: actions carry structured
-    trade bundles, `aux` is whatever the policy attached, and a search policy
-    may record `()` where it evaluated nothing — a ragged column cannot be an
-    array without changing what it holds.
-    """
-
-    def __init__(self, episodes: Sequence[Episode], layout: Packing) -> None:
-        self.layout = layout
-        self.meta = [
-            (e.index, e.seed, e.players, e.outcome, e.cast, e.trades, e.record)
-            for e in episodes
-        ]
-        self.counts = [[len(seat) for seat in e.trajectories] for e in episodes]
-        transitions = [t for e in episodes for seat in e.trajectories for t in seat]
-        n = len(transitions)
-
-        graphs: list = []
-        graph_ids: dict[int, int] = {}
-        graph_index = np.empty(n, dtype=np.int32)
-        for i, t in enumerate(transitions):
-            graph = t.observation.graph
-            slot = graph_ids.get(id(graph))
-            if slot is None:
-                slot = len(graphs)
-                graph_ids[id(graph)] = slot
-                graphs.append(graph)
-            graph_index[i] = slot
-        self.graphs = graphs
-        self.graph_index = graph_index
-
-        self.buffer = np.empty((n, layout.width), dtype=np.float32)
-        for name, start, stop, shape in layout.blocks:
-            destination = self.buffer[:, start:stop].reshape(n, *shape)
-            for i, t in enumerate(transitions):
-                destination[i] = getattr(t.observation, name)
-        self.mask = (
-            np.stack([t.mask for t in transitions])
-            if transitions
-            else np.empty((0, 0), dtype=bool)
-        )
-        self.seat = np.array([t.seat for t in transitions], dtype=np.int64)
-        self.step = np.array([t.step for t in transitions], dtype=np.int64)
-        self.chosen = np.array([t.index for t in transitions], dtype=np.int64)
-        self.log_prob = np.array([t.log_prob for t in transitions], dtype=np.float64)
-        self.action = [t.action for t in transitions]
-        self.value = [t.value for t in transitions]
-        self.aux = [t.aux for t in transitions]
-        self.points = np.array([t.points for t in transitions], dtype=np.int64)
-
-    def episodes(self) -> list[Episode]:
-        """The identical episodes back, observations as views into one buffer."""
-        out: list[Episode] = []
-        cursor = 0
-        for (index, seed, players, outcome, cast, trades, record), counts in zip(
-            self.meta, self.counts
-        ):
-            trajectories = []
-            for count in counts:
-                seat_transitions = []
-                for k in range(cursor, cursor + count):
-                    row = self.buffer[k]
-                    components = {
-                        name: row[start:stop].reshape(shape)
-                        for name, start, stop, shape in self.layout.blocks
-                    }
-                    seat_transitions.append(
-                        Transition(
-                            seat=int(self.seat[k]),
-                            step=int(self.step[k]),
-                            observation=Observation(
-                                graph=self.graphs[self.graph_index[k]],
-                                _packed=self.buffer,
-                                _row=k,
-                                **components,
-                            ),
-                            mask=self.mask[k],
-                            action=self.action[k],
-                            index=int(self.chosen[k]),
-                            log_prob=float(self.log_prob[k]),
-                            value=self.value[k],
-                            aux=self.aux[k],
-                            points=int(self.points[k]),
-                        )
-                    )
-                trajectories.append(tuple(seat_transitions))
-                cursor += count
-            out.append(
-                Episode(
-                    index=index,
-                    seed=seed,
-                    players=players,
-                    trajectories=tuple(trajectories),
-                    outcome=outcome,
-                    cast=cast,
-                    trades=trades,
-                    record=record,
-                )
-            )
-        return out
-
-
-def _flat(episodes: list[Episode], policy) -> object:
-    """Wrap for the pipe when the worker's policy carries a layout."""
-    layout = getattr(policy, "layout", None)
-    if layout is None:
-        return episodes
-    return Flattened(episodes, layout)
-
-
 def release_memory() -> None:
     """Hand freed memory back: collect cycles, then ask glibc to return free
     heap to the system (a cohort is millions of small allocations, which
@@ -1302,6 +1211,21 @@ def release_memory() -> None:
         pass
 
 
+class _Keep:
+    """A worker's sink: each finished game encoded once, written to the
+    partial when there is one, and handed back to the collector to hold in
+    the episode's place -- so a worker never holds its cohort as objects."""
+
+    def __init__(self, partial: Partial | None) -> None:
+        self.partial = partial
+
+    def __call__(self, episode: Episode) -> bytes:
+        game = gamefile.encode(episode)
+        if self.partial is not None:
+            self.partial.write(game)
+        return game
+
+
 def _serve(spec: WorkerSpec, connection, beat=None) -> None:
     """The worker loop: build once, then answer commands until told to stop.
 
@@ -1309,7 +1233,7 @@ def _serve(spec: WorkerSpec, connection, beat=None) -> None:
     command and every tick, which is how the parent tells a slow worker from
     a wedged one. A collection command's payload is `(count, partial)`: a
     `Partial` to keep each finished game in, or None. A bare count is the
-    same with no partial.
+    same with no partial. Either way the answer is the games, encoded.
     """
 
     def stamp() -> None:
@@ -1348,17 +1272,16 @@ def _serve(spec: WorkerSpec, connection, beat=None) -> None:
                     "cohort": collector.cohort,
                     "listed": collector.listed,
                 }[kind]
-                collector.sink = None if partial is None else partial.keep
+                collector.sink = _Keep(partial)
                 try:
-                    episodes = play(count)
+                    games = play(count)
                 finally:
                     collector.sink = None
-                # The games are on disk (the partial) and, once sent, the
-                # parent's: none of them is held between commands.
-                flat = _flat(episodes, policy)
-                del episodes
-                connection.send(("episodes", flat))
-                del flat
+                # Encoded the tick each finished, and held only as bytes since:
+                # on disk (the partial) and, once sent, the parent's. None of
+                # them is held between commands.
+                connection.send(("games", games))
+                del games
                 release_memory()
             elif kind == "upcoming":
                 connection.send(("upcoming", collector.upcoming(payload)))
@@ -1391,7 +1314,12 @@ class ParallelCollector:
     `heartbeat`, when given, is a JSON file rewritten every `POLL_SECONDS`
     while the parent waits on its workers: each one's pid, whether it is
     alive, busy and how long since it last ticked, and how many games the
-    collection in flight has kept so far."""
+    collection in flight has kept so far.
+
+    `observations` is the dtype of the buffer a finished collection's
+    observations are decoded into (`hexn.gamefile.decode_all`): float32, or
+    float16 for a trainer whose update runs under fp16 autocast and reads
+    nothing else from them."""
 
     def __init__(
         self,
@@ -1399,6 +1327,7 @@ class ParallelCollector:
         *,
         heartbeat: Path | None = None,
         stall_seconds: float = STALL_SECONDS,
+        observations=np.float32,
     ) -> None:
         if not specs:
             raise ValueError("a parallel collector needs at least one worker")
@@ -1409,7 +1338,8 @@ class ParallelCollector:
         self.heartbeat = heartbeat
         self.stall_seconds = stall_seconds
         self._pending: list[bool] | None = None
-        self._kept: list[Episode] = []
+        self.observations = observations
+        self._kept: list[bytes] = []
         self._partial: Partial | None = None
         self._collect_started = 0.0
         self._connections = []
@@ -1550,14 +1480,16 @@ class ParallelCollector:
         if self._pending is not None:
             raise RuntimeError("collection is already in flight")
         workers = len(self._connections)
-        kept: list[Episode] = []
+        # The partial's games stay encoded until `finish_collect` decodes the
+        # whole collection at once.
+        kept: list[bytes] = []
         if partial is None:
             commands = [
                 (self._command, quota) if quota else None
                 for quota in self._quotas(episodes)
             ]
         elif self._command == "cohort":
-            kept = partial.done()
+            kept = partial.games()
             plan = partial.plan()
             if plan is None and kept:
                 raise ValueError(f"{partial.directory} holds games but no plan")
@@ -1566,14 +1498,14 @@ class ParallelCollector:
                 partial.write_plan(self._upcoming(quotas))
                 commands = [("cohort", (q, partial)) if q else None for q in quotas]
             else:
-                finished = {episode.index for episode in kept}
+                finished = {gamefile.index_of(game) for game in kept}
                 missing = [index for index in plan if index not in finished]
                 commands = [
                     ("listed", (share, partial)) if share else None
                     for share in (missing[w::workers] for w in range(workers))
                 ]
         else:
-            kept = partial.done()
+            kept = partial.games()
             commands = [
                 ("collect", (q, partial)) if q else None
                 for q in self._quotas(max(0, episodes - len(kept)))
@@ -1598,23 +1530,37 @@ class ParallelCollector:
         return plan
 
     def finish_collect(self) -> list[Episode]:
-        """Wait for the cohort dispatched by `start_collect`."""
+        """Wait for the cohort dispatched by `start_collect`; its games in
+        index order, decoded into one buffer of `observations`' dtype."""
+        return self.decode(self.receive())
+
+    def receive(self) -> list[bytes]:
+        """Wait for the cohort dispatched by `start_collect`; its games still
+        encoded. The workers are free again when this returns, so a trainer
+        can dispatch the next cohort before it decodes this one (`decode`)."""
         if self._pending is None:
             raise RuntimeError("there is nothing in flight to finish")
         pending = self._pending
-        out: list[Episode] = list(self._kept)
+        games: list[bytes] = list(self._kept)
         try:
             for worker, busy in enumerate(pending):
                 if busy:
-                    payload = self._hear(worker, "episodes")
-                    out.extend(
-                        payload.episodes() if isinstance(payload, Flattened) else payload
-                    )
+                    games.extend(self._hear(worker, "games"))
         finally:
             self._pending = None
             self._kept = []
             self._partial = None
         self.last_collect_seconds = time.perf_counter() - self._collect_started
+        return games
+
+    def decode(self, games: list[bytes]) -> list[Episode]:
+        """Games `receive` returned, in index order, decoded into one buffer of
+        `observations`' dtype. In index order so a batch assembled in game
+        order is the buffer's own row order and `hexn.model.pack` can take it
+        without a copy."""
+        games.sort(key=gamefile.index_of)
+        out = gamefile.decode_all(games, self.observations)
+        games.clear()
         self.games += len(out)
         return out
 

@@ -78,6 +78,71 @@ def test_a_config_missing_a_parameter_is_refused_rather_than_defaulted(tmp_path)
         run.load(tmp_path / "unit")
 
 
+def _frozen_ppo(tmp_path, *argv):
+    return run.freeze("ppo", "unit", tmp_path / "unit", list(argv), repo=tmp_path)
+
+
+def _drop(tmp_path, mode, *keys):
+    path = tmp_path / "unit" / "config" / f"{mode}.json"
+    config = json.loads(path.read_text())
+    for key in keys:
+        del config[key]
+    path.write_text(json.dumps(config))
+    return path
+
+
+def test_a_parameter_added_after_the_freeze_loads_with_its_old_behaviour(tmp_path):
+    """Not today's default: the value the code ran with before the flag. A new
+    freeze samples per game; a run frozen before the flag keeps the worker
+    stream it was collected with, and the load says what it filled."""
+    written = _frozen_ppo(tmp_path, "--decided-cut", "0.1")
+    assert written.config["sample_stream"] == "game"
+    path = _drop(tmp_path, "ppo", "sample_stream", "setup_weight")
+    on_disk = path.read_text()
+
+    read = run.load(tmp_path / "unit")
+
+    assert read.config["sample_stream"] == "worker"
+    assert read.config["setup_weight"] == 1
+    assert read.config["decided_cut"] == 0.1  # what was frozen stands
+    assert read.meta["filled"] == {"sample_stream": "worker", "setup_weight": 1}
+    assert path.read_text() == on_disk  # the frozen file is never rewritten
+    assert set(read.config) == run.parameters("ppo")
+
+
+def test_a_complete_freeze_fills_nothing(tmp_path):
+    _frozen_ppo(tmp_path)
+    assert "filled" not in run.load(tmp_path / "unit").meta
+
+
+def test_a_parameter_without_an_old_behaviour_value_is_still_refused(tmp_path):
+    """`init` has no fill: it predates the current warm start."""
+    _frozen_ppo(tmp_path)
+    _drop(tmp_path, "ppo", "init", "sample_stream")
+    with pytest.raises(SystemExit, match="init"):
+        run.load(tmp_path / "unit")
+
+
+def test_a_config_without_runtime_loads_naming_no_runtime(tmp_path):
+    """A run that names no bot plays as it did; one that does would fail at
+    startup, since no runtime provides the bot."""
+    _frozen_ppo(tmp_path)
+    _drop(tmp_path, "ppo", "runtime")
+    read = run.load(tmp_path / "unit")
+    assert read.config["runtime"] == []
+    assert read.meta["filled"] == {"runtime": []}
+
+
+@pytest.mark.parametrize("mode", sorted(run.manifest.ADDED))
+def test_every_fill_names_a_real_parameter_and_a_value_its_parser_accepts(mode):
+    parser = run.manifest._parser_for(mode)
+    actions = {a.dest: a for a in parser._actions}
+    for key, value in run.manifest.ADDED[mode].items():
+        assert key in actions, f"{mode} has no parameter {key}"
+        choices = actions[key].choices
+        assert choices is None or value in choices, f"{mode} {key}={value!r}"
+
+
 def test_a_config_carrying_an_unknown_parameter_is_refused(tmp_path):
     freeze(tmp_path)
     path = tmp_path / "unit" / "config" / "league.json"

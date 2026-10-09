@@ -75,8 +75,45 @@ __all__ = [
     "RandomPolicy",
     "Request",
     "Transition",
+    "SAMPLE_STREAMS",
+    "draw_key",
     "owned",
 ]
+
+# Where a sampling policy's randomness comes from. "worker": the policy's own
+# generator, consumed in batch order, so a game's sampled actions depend on
+# which other games shared its batches -- on the worker count, the lane count
+# and the order lanes finish in. "game": every decision carries its own key,
+# `draw_key(seed, index, seat, step)`, and a sampling policy draws from that
+# key alone, so a game is a pure function of its `(seed, index)` and the
+# weights, however the games are sharded or batched.
+SAMPLE_STREAMS = ("worker", "game")
+
+_MASK64 = (1 << 64) - 1
+_GOLDEN64 = 0x9E3779B97F4A7C15
+
+
+def _mix64(x: int) -> int:
+    """splitmix64's finaliser: a bijection on 64-bit integers that spreads
+    every input bit over the output."""
+    x &= _MASK64
+    x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & _MASK64
+    x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & _MASK64
+    return x ^ (x >> 31)
+
+
+def draw_key(seed: int, index: int, seat: int, step: int) -> int:
+    """The 64-bit key of one decision's sampling draw under per-game streams.
+
+    `step` indexes the game's whole action stream, so `(index, step)` alone
+    names a decision; `seat` is folded in as well so a key can never be
+    shared by two seats. Pure Python integers: the same on every platform and
+    every numpy or torch version.
+    """
+    key = _mix64(seed + _GOLDEN64)
+    for part in (index, seat, step):
+        key = _mix64((key ^ (part & _MASK64)) + _GOLDEN64)
+    return key
 
 
 @dataclass(frozen=True)
@@ -120,6 +157,10 @@ class Request:
     # (its own, so known to it); read by a policy recording a per-VP reward's
     # value (`hexn.policy.NetworkPolicy.vp_reward`) and kept on the transition.
     points: int = 0
+    # This decision's sampling key under per-game streams (`draw_key`), None
+    # under the policy's own generator. A sampling policy that is handed keys
+    # draws from them alone; a greedy or scripted one ignores them.
+    draw: int | None = None
 
 
 @dataclass(frozen=True)
@@ -420,6 +461,7 @@ class Collector:
         temperatures: Callable[[int], Sequence[float]] | None = None,
         game_law: Callable[[int], tuple[GameType, frozenset[int]]] | None = None,
         coalition: Callable[[int], object] | None = None,
+        sample_stream: str = "worker",
     ) -> None:
         """`first_game` is where the game counter starts.
 
@@ -449,9 +491,15 @@ class Collector:
         `fill=False` leaves the collector empty until `cohort` deals one, which
         is what a PPO iteration wants; anything else deals its lanes here.
 
+        `sample_stream` is `SAMPLE_STREAMS`' choice: "game" hands every request
+        its `draw_key`, so a game's sampled actions no longer depend on
+        `lanes`, `stride` or which games shared a batch.
+
         `sink`, when set, is handed every episode the tick it finishes -- what
         keeps a game on disk before the batch it belongs to ends
-        (`hexn.durable.Partial.keep`). `beat`, when set, is called once a
+        (`hexn.durable.Partial.keep`). A sink that returns something other
+        than None replaces the episode with it in everything this collector
+        returns (`hexn.collect`'s workers hand back the encoded game). `beat`, when set, is called once a
         tick, so a process watching this one can tell slow from wedged.
         """
         if lanes < 1:
@@ -460,6 +508,8 @@ class Collector:
             raise ValueError("a collector cannot be asked to deal nothing")
         if stride < 1:
             raise ValueError("a collector cannot deal backwards or stand still")
+        if sample_stream not in SAMPLE_STREAMS:
+            raise ValueError(f"sample_stream must be one of {SAMPLE_STREAMS}, got {sample_stream!r}")
         if caster is not None and not opponents:
             raise ValueError("a caster without opponents has nobody to cast")
         if pair_boards and board is not None:
@@ -469,6 +519,7 @@ class Collector:
                 "would compare nothing"
             )
         self.policy = policy
+        self.sample_stream = sample_stream
         self.opponents = tuple(opponents)
         self.caster = caster
         # Game index -> per-seat sampling temperature, pure in the index like
@@ -635,6 +686,7 @@ class Collector:
         observations = encode_batch(
             [request.game for request in asked], [request.seat for request in asked]
         )
+        keyed = self.sample_stream == "game"
         return [
             Request(
                 lane=request.lane,
@@ -648,6 +700,11 @@ class Collector:
                     1.0
                     if self.temperatures is None
                     else float(self.temperatures(request.index)[request.seat])
+                ),
+                draw=(
+                    draw_key(self.seed, request.index, request.seat, request.step)
+                    if keyed
+                    else None
                 ),
             )
             for request, observation in zip(asked, observations, strict=True)
@@ -769,8 +826,13 @@ class Collector:
         self.games += len(finished)
         episodes = [self._episode(played) for played in finished]
         if self.sink is not None:
-            for episode in episodes:
-                self.sink(episode)
+            # What the sink hands back, when it hands anything back, is what
+            # this collector holds and returns in the episode's place: a
+            # collector worker keeps each game encoded, not as objects.
+            episodes = [
+                episode if (kept := self.sink(episode)) is None else kept
+                for episode in episodes
+            ]
         if self.beat is not None:
             self.beat()
         return episodes

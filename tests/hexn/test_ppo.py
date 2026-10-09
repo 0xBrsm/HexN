@@ -985,6 +985,43 @@ def test_an_fp16_update_tracks_the_fp32_update_it_stands_in_for(collected):
     assert full.amp_skipped == 0 and full.amp_scale == 0.0
 
 
+def test_an_fp16_batch_trains_to_the_bit_of_a_float32_batch_under_fp16_autocast(collected):
+    """`observation_dtype`'s claim: under fp16 autocast a batch may hold its
+    observations in float16 and the update cannot tell. The input embeddings
+    are the only readers of the observations, and autocast rounds a float32
+    input to the same half values the host cast stores, so the proximal
+    log-probs, the prior, every gauge and every weight come out identical."""
+    policy, episodes = collected
+    config = PPOConfig(epochs=2, minibatch=256, amp="fp16", decoupled=True, prior_kl=0.1)
+    narrow = assemble(episodes, policy.layout, config)
+    wide = assemble(episodes, policy.layout, dataclasses.replace(config, amp=""))
+    assert narrow.buffer.dtype == torch.float16 and wide.buffer.dtype == torch.float32
+    assert torch.equal(narrow.buffer, wide.buffer.half())
+    results = []
+    for batch in (wide, narrow):
+        student = a_student(policy)
+        batch = ppo.attach_prior(batch, policy, policy.layout, chunk=64, amp="fp16")
+        batch = ppo.attach_proximal(batch, student, chunk=64, amp="fp16")
+        optimiser = torch.optim.Adam(student.net.parameters(), lr=1e-3)
+        stats = update(
+            student,
+            optimiser,
+            batch,
+            config,
+            generator=torch.Generator().manual_seed(0),
+            scaler=torch.amp.GradScaler("cpu"),
+        )
+        results.append((batch, stats, student.net.state_dict()))
+    (a, first, one), (b, second, other) = results
+    assert torch.equal(a.prior_log_probs, b.prior_log_probs)
+    assert torch.equal(a.prox_log_prob, b.prox_log_prob)
+    assert dataclasses.asdict(first) == dataclasses.asdict(second)
+    assert all(torch.equal(one[k], other[k]) for k in one)
+    # And the update moved: identical because both stepped alike, not because
+    # neither stepped.
+    assert any(not torch.equal(one[k], policy.net.state_dict()[k]) for k in one)
+
+
 def test_the_prior_under_fp16_matches_the_fp32_prior(collected):
     policy, episodes = collected
     batch = assemble(episodes, policy.layout, PPOConfig())
@@ -993,3 +1030,68 @@ def test_the_prior_under_fp16_matches_the_fp32_prior(collected):
     legal = batch.mask
     assert half.prior_log_probs.dtype == torch.float32
     assert torch.allclose(half.prior_log_probs[legal], full.prior_log_probs[legal], atol=2e-2)
+
+
+def _decoupled_update(student, batch, config, seed=0):
+    optimiser = torch.optim.Adam(student.net.parameters(), lr=1e-4)
+    if config.decoupled:
+        batch = ppo.attach_proximal(batch, student)
+    return update(student, optimiser, batch, config, generator=torch.Generator().manual_seed(seed))
+
+
+def test_decoupled_ppo_on_fresh_data_is_plain_ppo(collected):
+    # The learner is the policy that played, so the proximal log-probs are the
+    # recorded ones, every behaviour weight is one and the step is PPO's own.
+    policy, episodes = collected
+    batch = assemble(episodes, policy.layout, PPOConfig())
+    config = PPOConfig(epochs=1, minibatch=256)
+    plain, decoupled = a_student(policy), a_student(policy)
+    a = _decoupled_update(plain, batch, config)
+    b = _decoupled_update(decoupled, batch, dataclasses.replace(config, decoupled=True))
+    assert b.policy_loss == pytest.approx(a.policy_loss, abs=1e-6)
+    assert b.approx_kl == pytest.approx(a.approx_kl, abs=1e-7)
+    for x, y in zip(plain.net.parameters(), decoupled.net.parameters()):
+        assert torch.allclose(x, y, atol=1e-6)
+
+
+def test_decoupled_ppo_centres_the_clip_on_the_learner_not_the_stale_player(collected):
+    # Move a learner one update away from the policy that played the batch:
+    # plain PPO starts that next update already off its anchor, decoupled PPO
+    # starts on it, and the staleness gauge reads the gap.
+    policy, episodes = collected
+    batch = assemble(episodes, policy.layout, PPOConfig())
+    moved = a_student(policy)
+    update(moved, torch.optim.Adam(moved.net.parameters(), lr=1e-2), batch, PPOConfig(epochs=1, minibatch=256))
+    config = PPOConfig(epochs=1, minibatch=256)
+    plain = _decoupled_update(a_student(moved), batch, config)
+    decoupled = _decoupled_update(a_student(moved), batch, dataclasses.replace(config, decoupled=True))
+    assert plain.approx_kl_first_minibatch > 1e-5
+    assert decoupled.approx_kl_first_minibatch < 1e-7
+    assert ppo.staleness(ppo.attach_proximal(batch, moved)) > 1e-5
+
+
+def test_the_behaviour_weight_is_capped(collected):
+    policy, episodes = collected
+    batch = assemble(episodes[:1], policy.layout, PPOConfig())
+    prox = ppo.attach_proximal(batch, policy).prox_log_prob
+    terms, advantage = _terms(policy, batch, PPOConfig())
+
+    def policy_term(old):
+        return ppo.minibatch_terms(
+            policy, batch.buffer, batch.mask, batch.chosen, old, advantage,
+            batch.value_target, batch.margin_target, PPOConfig(), prox_log_prob=prox,
+        ).policy_loss
+    # Played by a policy that all but never chose these moves: each weight
+    # would be e**10 uncapped, and is DECOUPLED_CAP.
+    assert policy_term(prox - 10.0) == pytest.approx(ppo.DECOUPLED_CAP * policy_term(prox), rel=1e-5)
+
+
+def test_decoupled_and_the_proximal_log_probs_come_together(collected):
+    policy, episodes = collected
+    batch = assemble(episodes, policy.layout, PPOConfig())
+    student = a_student(policy)
+    optimiser = torch.optim.Adam(student.net.parameters(), lr=1e-4)
+    with pytest.raises(ValueError):
+        update(student, optimiser, batch, PPOConfig(decoupled=True))
+    with pytest.raises(ValueError):
+        update(student, optimiser, ppo.attach_proximal(batch, student), PPOConfig())
