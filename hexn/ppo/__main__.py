@@ -205,6 +205,14 @@ def build_parser() -> argparse.ArgumentParser:
     # advantage or a trade gate at any weight. Exposed for experimentation,
     # not a recommended setting.
     parser.add_argument("--aux-margin-weight", type=float, default=0.0)
+    # What that head learns (`PPOConfig.aux_target`): "relative", every
+    # seat's `relative_points` by squared error, or "loss", the own slot as
+    # the logit of losing victory points before acting again after this
+    # turn, by cross-entropy with positives weighted --aux-pos-weight, or
+    # "points", the points head: every seat's change in victory points until
+    # the decider acts again after its turn, by squared error.
+    parser.add_argument("--aux-target", choices=("relative", "loss", "points"), default="relative")
+    parser.add_argument("--aux-pos-weight", type=float, default=1.0)
     # Pay for fast wins (`PPOConfig.fast_win`): a JSON file holding a list of
     # weights, entry r-1 for a win in round r, or an object with a "weights"
     # list. Builds the net with its fast-win head; `--init` from a checkpoint
@@ -588,6 +596,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         value_coefficient=args.value_coefficient,
         entropy_coefficient=args.entropy,
         aux_margin_weight=args.aux_margin_weight,
+        aux_target=args.aux_target,
+        aux_pos_weight=args.aux_pos_weight,
         max_grad_norm=args.max_grad_norm,
         epochs=args.epochs,
         minibatch=args.minibatch,

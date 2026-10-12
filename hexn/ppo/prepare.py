@@ -167,7 +167,7 @@ def prepare_columns(columns, layout, config: PPOConfig, players: int):
     from hexset.encoding import global_columns, to_frame
     from hexset.victory import relative_points
 
-    from ..rewards import win_loss
+    from ..rewards import points_lost_next, points_next_round, win_loss
     from . import SETUP_PHASES, advantages
 
     if config.critic != "gae" or config.pair_baseline or config.fast_win or config.vp_reward:
@@ -189,6 +189,31 @@ def prepare_columns(columns, layout, config: PPOConfig, players: int):
         i_index, i_log_prob, i_value = at["index"], at["log_prob"], at["value"]
         wins = win_loss(outcome)
         margins = relative_points(outcome.points)
+        lost = moved = None
+        if config.aux_target in ("loss", "points"):
+            seat_rows, k = [], 0
+            for count in game["counts"]:
+                seat_rows.append(game["rows"][k : k + count])
+                k += count
+            seat_steps = [np.asarray([row[at["step"]] for row in rows], dtype=np.int64) for rows in seat_rows]
+            if config.aux_target == "loss":
+                lost = points_lost_next(
+                    seat_steps,
+                    [np.asarray([row[at["points"]] for row in rows], dtype=np.int64) for rows in seat_rows],
+                    outcome.points,
+                )
+            else:
+                if "seat_points" not in at or any(len(row[at["seat_points"]]) != len(wins) for row in game["rows"]):
+                    raise ValueError(
+                        "aux_target 'points' needs every transition's seat_points; this game "
+                        "was collected without them"
+                    )
+                moved = points_next_round(
+                    seat_steps,
+                    [np.asarray([row[at["seat_points"]] for row in rows], dtype=np.float32).reshape(len(rows), len(wins))
+                     for rows in seat_rows],
+                    outcome.points,
+                )
         phase = global_columns(len(wins))["phase"]
         phase_cols = slice(globals_start + phase.start, globals_start + phase.stop)
         winner = outcome.winner
@@ -208,7 +233,14 @@ def prepare_columns(columns, layout, config: PPOConfig, players: int):
             estimates = np.array(own_estimates, dtype=np.float32)
             advantage_blocks.append(advantages(estimates, np.float32(to_frame(wins, seat)[0]), config.lam, None))
             seat_targets.append(np.asarray(to_frame(wins, seat), dtype=np.float32))
-            seat_margins.append(np.asarray(to_frame(margins, seat), dtype=np.float32))
+            if moved is not None:
+                seat_margins.append(np.roll(moved[seat], -seat, axis=1))
+            elif lost is None:
+                seat_margins.append(np.repeat(np.asarray(to_frame(margins, seat), dtype=np.float32)[None], count, axis=0))
+            else:
+                block = np.zeros((count, len(wins)), dtype=np.float32)
+                block[:, 0] = lost[seat]
+                seat_margins.append(block)
             seat_lengths.append(count)
             id_blocks.append(np.arange(first, first + count, dtype=np.intp))
             chosen.extend(row[i_index] for row in seat_rows)
@@ -239,7 +271,7 @@ def prepare_columns(columns, layout, config: PPOConfig, players: int):
     advantage = np.concatenate(advantage_blocks)
     ids = np.concatenate(id_blocks)
     targets = np.repeat(np.stack(seat_targets), seat_lengths, axis=0)
-    margin_targets = np.repeat(np.stack(seat_margins), seat_lengths, axis=0)
+    margin_targets = np.concatenate(seat_margins)
     chosen = np.asarray(chosen, dtype=np.int64)
     log_probs = np.asarray(log_probs, dtype=np.float64)
     if weighed:

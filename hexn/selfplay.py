@@ -116,6 +116,12 @@ def draw_key(seed: int, index: int, seat: int, step: int) -> int:
     return key
 
 
+
+def _seat_points(game: Game) -> tuple[int, ...]:
+    """Every seat's true victory points, board order (`Request.seat_points`)."""
+    state = game.state(0, hidden=False)
+    return tuple(victory_points(state, seat) for seat in range(state.num_players))
+
 @dataclass(frozen=True)
 class Request:
     """One lane's decision, put to the policy alongside every other lane's.
@@ -157,6 +163,10 @@ class Request:
     # (its own, so known to it); read by a policy recording a per-VP reward's
     # value (`hexn.policy.NetworkPolicy.vp_reward`) and kept on the transition.
     points: int = 0
+    # Every seat's true victory points at this decision, board order, hidden VP
+    # cards included: a training target only (`hexn.rewards.points_next_round`),
+    # never an input, so reading the truth here leaks nothing to the policy.
+    seat_points: tuple[int, ...] = ()
     # This decision's sampling key under per-game streams (`draw_key`), None
     # under the policy's own generator. A sampling policy that is handed keys
     # draws from them alone; a greedy or scripted one ignores them.
@@ -238,6 +248,9 @@ class Transition:
     aux: object = None
     # The seat's own victory points at this decision (`Request.points`).
     points: int = 0
+    # Every seat's, board order (`Request.seat_points`); empty in games
+    # collected before it was recorded.
+    seat_points: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -696,6 +709,7 @@ class Collector:
                 options=request.options,
                 game=request.game,
                 points=victory_points(request.game.state(request.seat, hidden=False), request.seat),
+                seat_points=_seat_points(request.game),
                 temperature=(
                     1.0
                     if self.temperatures is None
@@ -765,6 +779,7 @@ class Collector:
                         value=tuple(choice.value),
                         aux=choice.aux,
                         points=request.points,
+                        seat_points=request.seat_points,
                     )
                 )
             trajectories.append(tuple(row))

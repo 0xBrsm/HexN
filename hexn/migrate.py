@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: GPL-3.0-only
 """Migrate a contract-5 checkpoint onto contract 6, without changing what it
-computes on a position whose dropped columns read zero.
+computes on a position whose dropped columns read zero. The result reads
+today's globals: the blocks contract 7 appended after the ledger tail get zero
+columns, exactly as `hexn.migrate_globals` gives a contract-6 checkpoint.
 
 Contract 6 carries two independent changes that happened to land together
 (`hexset.onnx_record.
@@ -106,10 +108,16 @@ def _valuation(players: int) -> int:
     return players * NUM_RESOURCES
 
 
+def _contract_6_globals(players: int) -> int:
+    """Contract 6's globals width: today's up to the end of the ledger tail.
+    Contract 7 appended its blocks after it (`hexn.migrate_globals`)."""
+    return global_columns(players)["ledger"].stop
+
+
 def source_globals(players: int) -> int:
     """Contract 5's own globals width: contract 6's plus the twenty-float
     (at 4 players) public valuation block `hexset.trading` deleted."""
-    return global_features(players) + _valuation(players)
+    return _contract_6_globals(players) + _valuation(players)
 
 
 def _global_columns(players: int) -> list[int]:
@@ -136,7 +144,7 @@ def _global_columns(players: int) -> list[int]:
     old_total = prefix + valuation + ledger
     columns = list(range(prefix))
     columns.extend(range(prefix + valuation, old_total))
-    new_total = global_features(players)
+    new_total = _contract_6_globals(players)
     if len(columns) != new_total:
         raise AssertionError(
             f"built {len(columns)} contract-6 global columns, expected {new_total}"
@@ -145,7 +153,10 @@ def _global_columns(players: int) -> list[int]:
 
 
 def _recolumn(tensor: Tensor, target: torch.Size, columns: Sequence[int]) -> Tensor:
-    if tensor.shape[0] != target[0] or target[1] != len(columns):
+    """Contract 6's columns selected from contract 5's, then zero columns
+    for the blocks contract 7 appended after them, so a contract-5 checkpoint
+    lands on today's width in one hop."""
+    if tensor.shape[0] != target[0] or target[1] < len(columns):
         raise ValueError(
             f"embed_global.weight: {tuple(tensor.shape)} -> {tuple(target)} is "
             f"not a map onto contract 6's {len(columns)} global columns"
@@ -155,7 +166,7 @@ def _recolumn(tensor: Tensor, target: torch.Size, columns: Sequence[int]) -> Ten
             f"embed_global.weight: {tensor.shape[1]} global features is not "
             "wide enough for the columns this migration reads"
         )
-    out = torch.empty(target, dtype=tensor.dtype)
+    out = torch.zeros(target, dtype=tensor.dtype)
     for new, old in enumerate(columns):
         out[:, new] = tensor[:, old]
     return out
@@ -334,15 +345,20 @@ def compare(migrated: HexNet, columns: Sequence[int], observations: list, player
     batch = collate(observations)
     globals_ = batch[3]
     old_width = source_globals(players)
+    kept = len(columns)
     padded = torch.zeros(globals_.shape[0], old_width, dtype=globals_.dtype)
-    padded[:, columns] = globals_
+    padded[:, columns] = globals_[:, :kept]
 
     weight = migrated.embed_global.weight
     bias = migrated.embed_global.bias
     old_weight = torch.zeros(weight.shape[0], old_width, dtype=weight.dtype)
-    old_weight[:, columns] = weight
+    old_weight[:, columns] = weight[:, :kept]
     restricted = torch.nn.functional.linear(padded, old_weight, bias)
-    actual = migrated.embed_global(globals_)
+    # At contract 6's own width: the columns contract 7 appended are zero
+    # here, and `hexn.migrate_globals.compare` is the check of that hop.
+    if weight[:, kept:].any():
+        raise AssertionError("the columns contract 7 appended are not zero")
+    actual = torch.nn.functional.linear(globals_[:, :kept], weight[:, :kept], bias)
     return {
         "max_abs_embed_delta_on_zero_valuation_positions": float(
             (restricted - actual).abs().max()
@@ -539,7 +555,7 @@ def migrate_checkpoint(
             "global_features_from": old_width,
             "global_features_to": new_width,
             "contract_from": "5",
-            "contract_to": "6",
+            "contract_to": "7",
             "report": report,
         },
     }

@@ -78,6 +78,7 @@ from typing import TYPE_CHECKING, Iterator, Sequence
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 from hexset.encoding import global_columns, to_frame
@@ -87,7 +88,7 @@ from ..policy import NetworkPolicy, masked_log_softmax
 
 if TYPE_CHECKING:
     from ..steps import Steps
-from ..rewards import relative_points, win_loss
+from ..rewards import points_lost_next, points_next_round, relative_points, win_loss
 from ..selfplay import Episode, Transition
 
 # Not a configurable. See the module docstring and `hexn.rewards`.
@@ -131,6 +132,21 @@ class PPOConfig:
     # reaches the advantage or a trade gate -- both read `Prediction.value`
     # alone.
     aux_margin_weight: float = 0.0
+    # What the auxiliary margin head learns at `aux_margin_weight > 0`.
+    # "relative": every slot, `relative_points` by squared error (the head's
+    # original target). "loss": the head's own slot (slot 0) only, as the
+    # logit that the deciding seat loses victory points before it acts again
+    # after its current turn (`hexn.rewards.points_lost_next`), by binary
+    # cross-entropy with the positives weighted `aux_pos_weight`; the other
+    # slots get no gradient. Award losses are rare, and a squared error on
+    # the expected points change nets them against the likelier gains, so a
+    # head trained that way reads ~0 before a loss. "points": the points head,
+    # every slot, each seat's change in victory points from the decision to
+    # the decider's next decision after its turn (`hexn.rewards.
+    # points_next_round`), viewer's frame, by squared error; it needs games
+    # that record `Transition.seat_points`.
+    aux_target: str = "relative"
+    aux_pos_weight: float = 1.0
     clip: float = 0.2
     value_coefficient: float = 0.5
     entropy_coefficient: float = 0.01
@@ -278,9 +294,29 @@ class PPOConfig:
             raise ValueError(
                 f"aux_margin_weight cannot be negative, got {self.aux_margin_weight}"
             )
+        if self.aux_target not in ("relative", "loss", "points"):
+            raise ValueError(f"unknown aux_target {self.aux_target!r}; expected 'relative', 'loss' or 'points'")
+        if self.aux_pos_weight <= 0.0:
+            raise ValueError(f"aux_pos_weight must be positive, got {self.aux_pos_weight}")
+        if self.aux_target != "relative" and self.vp_reward:
+            raise ValueError(
+                f"vp_reward reads the margin head as a final-points critic; aux_target {self.aux_target!r} trains it on something else"
+            )
         if self.prior_kl < 0.0:
             raise ValueError(f"prior_kl cannot be negative, got {self.prior_kl}")
 
+
+
+def seat_points_of(trajectory: Sequence[Transition], seats: int) -> np.ndarray:
+    """A trajectory's `Transition.seat_points` as a `(decisions, seats)` array,
+    refusing a game collected before they were recorded: the points head's
+    target cannot be rebuilt from a seat's own points alone."""
+    if any(len(t.seat_points) != seats for t in trajectory):
+        raise ValueError(
+            "aux_target 'points' needs every transition's seat_points; this game "
+            "was collected without them"
+        )
+    return np.asarray([t.seat_points for t in trajectory], dtype=np.float32).reshape(len(trajectory), seats)
 
 @dataclass(frozen=True)
 class Stats:
@@ -338,7 +374,8 @@ class Stats:
     # `value_loss` is the pinball loss and this is the only column on which
     # two configurations can be compared directly. Never differentiated.
     value_mse: float = 0.0
-    # The auxiliary VP-margin head's own MSE against `relative_points`,
+    # The auxiliary VP-margin head's own loss (`PPOConfig.aux_target`: MSE
+    # against `relative_points`, or the weighted cross-entropy of "loss"),
     # logged unconditionally (even at `aux_margin_weight=0.0`, where the head
     # trains on nothing but still reads as an untrained head's error) so a
     # run that later turns the weight on has a baseline to compare against.
@@ -416,7 +453,9 @@ class Batch:
     # label to mix towards -- see the module docstring).
     value_target: Tensor
     # The auxiliary margin head's target: `relative_points`, rotated the same
-    # way. Read only by `minibatch_terms`'s aux term; never by the advantage.
+    # way, or under `aux_target="loss"` the 0/1 label of
+    # `hexn.rewards.points_lost_next` in slot 0 (zeros elsewhere), per
+    # decision. Read only by `minibatch_terms`'s aux term; never by the advantage.
     margin_target: Tensor
     # A fixed prior policy's masked log-softmax over every action, one row per
     # position, for `PPOConfig.prior_kl`. `None` unless `attach_prior` filled
@@ -655,6 +694,24 @@ def assemble(
                     "complete pairs"
                 )
         phase = global_columns(len(wins))["phase"]
+        lost = (
+            points_lost_next(
+                [np.asarray([t.step for t in trajectory]) for trajectory in episode.trajectories],
+                [np.asarray([t.points for t in trajectory]) for trajectory in episode.trajectories],
+                episode.outcome.points,
+            )
+            if config.aux_target == "loss"
+            else None
+        )
+        moved = (
+            points_next_round(
+                [np.asarray([t.step for t in trajectory]) for trajectory in episode.trajectories],
+                [seat_points_of(trajectory, len(wins)) for trajectory in episode.trajectories],
+                episode.outcome.points,
+            )
+            if config.aux_target == "points"
+            else None
+        )
         for seat, trajectory in enumerate(episode.trajectories):
             if not trajectory:
                 continue
@@ -716,12 +773,17 @@ def assemble(
                 if config.fast_win
                 else None
             )
-            for transition in trajectory:
+            for i, transition in enumerate(trajectory):
                 observations.append(transition.observation)
                 masks.append(transition.mask)
                 chosen.append(transition.index)
                 log_probs.append(transition.log_prob)
                 targets.append(target)
+                if lost is not None:
+                    margin_target = np.zeros(len(wins), dtype=np.float32)
+                    margin_target[0] = lost[seat][i]
+                elif moved is not None:
+                    margin_target = np.roll(moved[seat][i], -seat)
                 margin_targets.append(margin_target)
                 if fast_target is not None:
                     fast_targets.append(fast_target)
@@ -909,7 +971,16 @@ def minibatch_terms(
         value_loss_total = value_loss + fast_loss
     else:
         value_loss_total = value_loss
-    margin_loss = (evaluation.margin - margin_target).pow(2).mean()
+    if config.aux_target == "loss":
+        # The own slot only: the logit that this seat loses points before it
+        # acts again after this turn, positives weighted up (`aux_pos_weight`).
+        margin_loss = F.binary_cross_entropy_with_logits(
+            evaluation.margin[:, 0].float(),
+            margin_target[:, 0].float(),
+            pos_weight=torch.tensor(config.aux_pos_weight, device=margin_target.device),
+        )
+    else:
+        margin_loss = (evaluation.margin - margin_target).pow(2).mean()
     margin_term = config.aux_margin_weight * margin_loss
     entropy = evaluation.entropy.mean()
     # Under critic="none" the value term is absent from the loss, so no

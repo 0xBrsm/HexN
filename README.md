@@ -128,12 +128,12 @@ Start with [training.md](docs/training.md); the rest are listed by name.
   bumped whenever that shape changes: the record fields it reads, the
   action space it emits over, and the metadata `hexn.export_onnx` writes
   into an ONNX file. This is not internal shorthand: HexSet's own
-  `docs/onnx.md` defines the currently-served contract (`CONTRACT_VERSION`)
-  and rejects a file naming any other. This package's own module docstrings
+  `docs/onnx.md` defines the current contract (`CONTRACT_VERSION`) and the
+  ones it still serves, and rejects a file naming any other. This package's own module docstrings
   cite specific numbers (`contract 5`, `contract 6`) as shorthand for
   "before/after that shape changed," most often around the trading
-  redesign that motivated the last bump. `hexn.migrate` is the tool that
-  carries a checkpoint across one.
+  redesign. `hexn.migrate` carries a checkpoint from contract 5, and
+  `hexn.migrate_globals` from contract 6 to contract 7.
 - **Vector value, not scalar.** This game has four players and one winner,
   so the value head returns one number per seat rather than a zero-sum
   scalar. Every output is trained from every position, which lets a search

@@ -2,6 +2,49 @@
 
 All notable changes to the `hexn` package are recorded here.
 
+## 0.40.0
+
+### Breaking
+
+- **Contract 7: the network reads `2 * players` more global features (8 at
+  four seats).** HexSet's observation appends, after the ledger tail, each
+  seat's roads to take Longest Road over `ROADS_TO_TAKE_CAP` and a one-hot
+  of the seat to move, both seat-relative, and its record adds the
+  `roads_to_take` and `to_move` fields. `HexNet`'s `embed_global` reads
+  `global_features(players)` (75 at four seats). A contract-6 checkpoint
+  still loads: `HexNet` pads its `embed_global.weight` with zero columns on
+  load, so it computes what it did; `python -m hexn.migrate_globals
+  --checkpoint old.pt --out new.pt` writes the same net to a file, with its
+  Adam moments widened so a run can resume from it. `hexn.export_onnx` writes contract 7:
+  `RecordEncoder` and the export take the two new record inputs and append
+  the same features `hexset.encoding` does. Contract-6 `.onnx` files keep
+  serving in HexSet.
+
+### Added
+
+- `--aux-target points`: the points head. The margin head's four outputs learn, by squared error, every seat's
+  change in victory points from a decision to the decider's next decision after its turn
+  (`hexn.rewards.points_next_round`), in the decider's frame. Self-play now records every seat's true points at
+  each decision (`Request.seat_points`, `Transition.seat_points`, board order; a training target, never an
+  input). A game collected before that has none, and the points target refuses it.
+
+- `--aux-target loss` (`PPOConfig.aux_target`, with `--aux-pos-weight`): the
+  auxiliary margin head's own slot learns the logit that the deciding seat
+  loses victory points before it acts again after its current turn, by binary
+  cross-entropy with the positives weighted up; the other slots get no
+  gradient. The label is `hexn.rewards.points_lost_next`, computed from the
+  points every recorded decision already carries, so collection is
+  unchanged. `--aux-target relative` (the default) is the old
+  `relative_points` squared error, and a manifest frozen before the flag
+  loads with it.
+
+- `hexn.migrate_globals`: carries a contract-6 checkpoint onto contract 7 by
+  appending zero columns to `embed_global.weight` (and to its Adam moments),
+  changing nothing else, so the migrated net computes exactly what the old
+  one did. It checks that on real positions from every seat before writing
+  and stores the largest output difference in the checkpoint.
+  `hexn.migrate` (contract 5) now lands on the contract-7 width the same way.
+
 ## 0.39.0
 
 ### Breaking

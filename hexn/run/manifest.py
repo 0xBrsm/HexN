@@ -107,6 +107,8 @@ ADDED: dict[str, dict[str, Any]] = {
         "prior_kl": 0.0,
         "lag_rung": 0,
         "aux_margin_weight": 0.0,
+        "aux_target": "relative",
+        "aux_pos_weight": 1.0,
     },
     "exit": {
         "k": 1,

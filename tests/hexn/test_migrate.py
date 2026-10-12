@@ -24,7 +24,7 @@ torch = pytest.importorskip("torch")
 from hexset.actions import ActionType, space_for
 from hexset.board.board import random_base_board
 from hexset.board.terrain import NUM_RESOURCES
-from hexset.encoding import encode, global_features, static_graph
+from hexset.encoding import encode, global_columns, global_features, static_graph
 from hexset.game import is_over, start
 from hexn.migrate import (
     NEW_KEYS,
@@ -41,7 +41,7 @@ from hexset.play import step_randomly
 
 PLAYERS = 4
 SPAN = PLAYERS + 1  # num_players + 1: MOVE_ROBBER's, and contract 5's PLAY_KNIGHT's, per-hex stride
-CONTRACT_6_GLOBALS = global_features(PLAYERS)
+CONTRACT_6_GLOBALS = global_columns(PLAYERS)["ledger"].stop
 CONTRACT_5_GLOBALS = source_globals(PLAYERS)
 
 
@@ -159,6 +159,9 @@ def test_migration_drops_exactly_the_valuation_columns():
     assert weight.shape == template["embed_global.weight"].shape
     for new, source in enumerate(columns):
         assert torch.equal(weight[:, new], old["embed_global.weight"][:, source])
+    # Contract 7's appended blocks read nothing yet.
+    assert weight.shape[1] == global_features(PLAYERS) > CONTRACT_6_GLOBALS
+    assert not weight[:, CONTRACT_6_GLOBALS:].any()
 
 
 def test_an_unrelated_globals_slot_keeps_its_own_row():

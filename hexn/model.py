@@ -44,6 +44,7 @@ from hexset.encoding import (
     Observation,
     StaticGraph,
     edge_features,
+    global_columns,
     global_features,
     vertex_features,
 )
@@ -455,6 +456,11 @@ class HexNet(nn.Module):
         self.embed_vertex = nn.Linear(vertex_features(players), width)
         self.embed_edge = nn.Linear(edge_features(players), width)
         self.embed_global = nn.Linear(global_features(players), width)
+        # A checkpoint written before the globals gained their last
+        # `2 * players` columns (roads to take Longest Road, the seat to move:
+        # record contract 7) loads with those columns zero, which is exactly
+        # what `hexn.migrate_globals` writes: the net computes what it did.
+        self._register_load_state_dict_pre_hook(self._pad_globals)
 
         self.rounds = nn.ModuleList(Round(width) for _ in range(self.config.rounds))
 
@@ -651,6 +657,18 @@ class HexNet(nn.Module):
             pooled = (torch.softmax(scores, -1).unsqueeze(-1) * v).sum(1)
             return torch.cat([g, pooled], -1)
         return g
+
+    def _pad_globals(self, state_dict, prefix, *args) -> None:
+        """Widen a narrower `embed_global.weight` in `state_dict` by zero
+        columns, where it reads the globals up to the end of the ledger tail
+        (the contract-6 width) and this net reads more."""
+        key = prefix + "embed_global.weight"
+        weight = state_dict.get(key)
+        wanted = self.embed_global.in_features
+        if weight is None or weight.dim() != 2 or weight.shape[1] == wanted:
+            return
+        if weight.shape[1] == global_columns(self.players)["ledger"].stop:
+            state_dict[key] = torch.cat([weight, weight.new_zeros(weight.shape[0], wanted - weight.shape[1])], dim=1)
 
     def _read_value(
         self, g: Tensor, h: Tensor, v: Tensor, e: Tensor

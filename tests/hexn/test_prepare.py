@@ -78,6 +78,10 @@ def test_the_trainer_is_told_when_the_helper_read_other_games(cohort, tmp_path):
         (PPOConfig(lam=0.95, decided_cut=0.05, setup_weight=2), "float32"),
         (PPOConfig(lam=0.9), "float32"),
         (PPOConfig(lam=0.95, setup_weight=3, amp="fp16"), "float16"),
+        (PPOConfig(lam=0.95, aux_margin_weight=0.5, aux_target="loss", aux_pos_weight=68.0), "float32"),
+        (PPOConfig(lam=0.95, decided_cut=0.05, setup_weight=2, aux_target="loss", amp="fp16"), "float16"),
+        (PPOConfig(lam=0.95, aux_margin_weight=0.5, aux_target="points"), "float32"),
+        (PPOConfig(lam=0.95, decided_cut=0.05, setup_weight=2, aux_target="points", amp="fp16"), "float16"),
     ],
 )
 def test_columnar_assembly_is_the_object_assembly_bit_for_bit(cohort, config, dtype):

@@ -100,6 +100,34 @@ published a nonzero valuation.
 `--players`. The tool refuses a checkpoint already on contract 6, and
 refuses one on neither. `--out` must not already exist unless `--force`.
 
+The result reads today's globals: the blocks contract 7 appended get zero
+columns, as below.
+
+## Migrating a contract-6 checkpoint onto contract 7 (`hexn.migrate_globals`)
+
+```bash
+python -m hexn.migrate_globals --checkpoint runs/example/iter-00200.pt \
+    --out runs/example/iter-00200-c7.pt
+```
+
+Contract 7 appends `2 * players` global features after the ledger tail
+(8 at four seats): each seat's roads to take Longest Road over
+`ROADS_TO_TAKE_CAP`, then a one-hot of the seat to move, both seat-relative.
+Every earlier column keeps its offset. The tool appends that many zero
+columns to `embed_global.weight` and changes nothing else in the net, so the
+migrated net computes exactly what the source did on every position; training
+then learns what the new columns are worth. The optimiser's Adam moments for
+that weight get zero columns too, so `--resume` continues from the migrated
+file, and everything else in the checkpoint passes through.
+
+Before writing, it checks the claim on `--observations` positions (default
+64, each from every seat): the source net on the contract-6 encoding against
+the migrated net on the full one, and prints the largest absolute difference
+of each output (zero up to float reassociation). The report is stored under
+the checkpoint's `migrate_globals` key. A checkpoint already at today's width
+is refused, as is one at neither width; `--out` must not already exist unless
+`--force`.
+
 ## Widening a checkpoint (`hexn.widen`)
 
 ```bash

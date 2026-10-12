@@ -139,6 +139,40 @@ def test_record_encoder_matches_encode_batch():
         assert_exact(tuple(g[i] for g in got), obs)
 
 
+def test_record_encoder_matches_encode_off_turn_and_with_longest_road_held():
+    """The two contract-7 blocks where they carry information: a perspective
+    that is not the seat to move (the mover one-hot off slot 0) and a seat
+    holding Longest Road (its roads-to-take entry 0), from every seat, single
+    and batched."""
+    from hexset.roads import roads_to_take_all
+    from hexset.state import NO_OWNER
+
+    games = [a_game(seed=seed, steps=400) for seed in range(40)]
+    live = [g for g in games if not is_over(g)]
+    held = [g for g in live if g._state.longest_road_holder != NO_OWNER]
+    if len(held) < 2:  # hand the card out where random play did not
+        for game, seat in zip(live[:2], (1, 3)):
+            game._state.longest_road_holder = seat
+        held = live[:2]
+    space = space_for(live[0])
+    graph = static_graph(live[0].state(0, hidden=False).board.topology)
+    encoder = RecordEncoder(graph, players=4)
+    encoder.eval()
+
+    pairs = [(game, seat) for game in held + live[:6] for seat in range(4)]
+    assert any(seat != to_move(game) for game, seat in pairs)
+    assert any(0 in roads_to_take_all(game._state) for game, _ in pairs)
+    for game, seat in pairs:
+        record = record_from_game(game, seat, space)
+        got = run_encoder(encoder, {k: v[None] for k, v in record.items()})
+        assert_exact(tuple(g[0] for g in got), encode(game, seat))
+
+    record = record_batch(pairs, space)
+    got = run_encoder(encoder, record)
+    for i, obs in enumerate(encode_batch([g for g, _ in pairs], [s for _, s in pairs])):
+        assert_exact(tuple(g[i] for g in got), obs)
+
+
 def a_checkpoint(path, *, players: int = 4, max_offers: int | None = 3, seed: int = 0):
     """A checkpoint in the shape `hexn.loop.save` writes, tiny enough to
     export quickly. Mirrors `test_netbot.py::a_checkpoint` — kept as its own
@@ -235,7 +269,7 @@ def test_the_graph_is_shaped_the_way_hexset_feeds_and_reads_it_v2(tmp_path):
             assert prior[row].sum() == pytest.approx(1.0, abs=1e-4)
 
 
-def test_the_exported_metadata_says_contract_6_and_matches_the_checkpoints_own_args(tmp_path):
+def test_the_exported_metadata_says_contract_7_and_matches_the_checkpoints_own_args(tmp_path):
     checkpoint = tmp_path / "latest.pt"
     board = a_checkpoint(checkpoint, players=3, max_offers=5)
     out = tmp_path / "latest.onnx"
@@ -244,7 +278,7 @@ def test_the_exported_metadata_says_contract_6_and_matches_the_checkpoints_own_a
 
     session = ort.InferenceSession(str(out), providers=["CPUExecutionProvider"])
     meta = session.get_modelmeta().custom_metadata_map
-    assert meta["contract"] == "6"
+    assert meta["contract"] == "7"
     assert meta["players"] == "3"
     assert meta["max_offers"] == "5"
     assert meta["iteration"] == "7"
@@ -290,7 +324,7 @@ def test_a_search_export_declares_itself_in_the_keys_hexset_reads(tmp_path):
     meta = ort.InferenceSession(
         str(out), providers=["CPUExecutionProvider"]
     ).get_modelmeta().custom_metadata_map
-    assert meta["contract"] == "6"
+    assert meta["contract"] == "7"
     assert meta["search"] == "mcts"
     assert meta["simulations"] == "256"
     assert meta["wave"] == "32"
@@ -309,7 +343,7 @@ def test_a_gate_plies_export_declares_itself_in_the_keys_hexset_reads(tmp_path):
     meta = ort.InferenceSession(
         str(out), providers=["CPUExecutionProvider"]
     ).get_modelmeta().custom_metadata_map
-    assert meta["contract"] == "6"
+    assert meta["contract"] == "7"
     assert meta["gate_plies"] == "8"
     assert "search" not in meta
 

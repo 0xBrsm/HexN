@@ -43,8 +43,16 @@ action space (`PLAY_KNIGHT` only spends the card now; the robber move it
 used to name directly runs through the same `MOVE_ROBBER` decision a rolled
 seven already uses), 550 -> 456. `globals` is 67.
 
+**Contract 7** adds two record fields, `roads_to_take` (per seat, the new
+roads it needs to take Longest Road, `hexset.roads.roads_to_take_all`) and
+`to_move` (the seat whose decision it is), and appends their encoding after
+the ledger tail: `players` floats of roads to take over `ROADS_TO_TAKE_CAP`,
+then a `players`-wide one-hot of the mover, both seat-relative. `globals` is
+75 at four seats; every earlier column keeps its offset, so a contract-6
+checkpoint migrates by appending zero input columns (`hexn.migrate_globals`).
+
 * **Inputs**, a dynamic leading batch axis, named exactly
-  `hexset.onnx_record.RECORD_FIELDS` (24 names: board, position, information
+  `hexset.onnx_record.RECORD_FIELDS` (26 names: board, position, information
   set, legality — see that module's docstring). All int64 except
   `action_mask`, which is the only bool one. `B` is
   1 for a single decision and a whole wave of leaves for the UI's MCTS
@@ -52,13 +60,13 @@ seven already uses), 550 -> 456. `globals` is 67.
 * **Outputs**, in this order: `action_index` (`(B,)` int64, argmax over the
   masked distribution), `prior` `(B, space.size)` (float32, normalised over
   legal entries, zero elsewhere), and `value` `(B, players)` (float32,
-  **board-seat order**, already un-rotated). Contract 6's value head is a win
+  **board-seat order**, already un-rotated). The value head is a win
   head (`hexn.model.Prediction`): `value` is each seat's own win
   probability, nonnegative and summing to one across the row, not a points
   margin. One forward serves both callers:
   `NetworkBot` reads the index, a search reads the two distributions.
 * **Metadata props** (`hexset.clients._modelmeta` and `onnxbot._load_cached`):
-  `contract` is `hexset.onnx_record.CONTRACT_VERSION` (`"6"`); `players` and the
+  `contract` is `hexset.onnx_record.CONTRACT_VERSION` (`"7"`); `players` and the
   `num_hexes`/`num_vertices`/
   `num_edges` fingerprint are required; `max_offers` (`""` for none) and
   `iteration` are read with defaults; and only when asked for on the command
@@ -129,6 +137,7 @@ from .model import HexNet, config_from_args
 from hexset.cards import DECK_SIZE
 from hexset.onnx_record import RECORD_FIELDS, record_batch, record_shapes
 from hexset.play import step_randomly
+from hexset.roads import ROADS_TO_TAKE_CAP
 from hexset.state import NO_OWNER
 from .policy import masked_log_softmax
 
@@ -137,10 +146,9 @@ _OUTPUT_NAMES = ("action_index", "prior", "value")
 _BATCH = "batch"
 
 # What the graph stamps as `contract`: the engine's own constant. The record
-# layout and this export's tuple move together again now that
-# `hexset.onnx_record.CONTRACT_VERSION` is "6" (the knight is one slot; the
-# trading redesign shares the same contract), so importing it is what keeps a
-# deployed file's number equal to the record it speaks.
+# layout and this export's tuple move together, so importing
+# `hexset.onnx_record.CONTRACT_VERSION` is what keeps a deployed file's number
+# equal to the record it speaks.
 from hexset.onnx_record import CONTRACT_VERSION as _CONTRACT_VERSION
 from . import runtime
 from .trade import recorded_budget
@@ -291,6 +299,8 @@ class RecordEncoder(nn.Module):
         free_roads: Tensor,
         deck_size: Tensor,
         turns: Tensor,
+        roads_to_take: Tensor,
+        to_move: Tensor,
         perspective: Tensor,
         own_hand: Tensor,
         hand_totals: Tensor,
@@ -407,6 +417,20 @@ class RecordEncoder(nn.Module):
                 (gather_seat(ledger_unknown, seats[i]).to(torch.float32) / HAND_SCALE).unsqueeze(-1)
             )
 
+        # --- appended after the ledger, `encoding._roads_to_take_parts`
+        # then the mover one-hot: each seat's roads to take Longest Road over
+        # the cap, seat-relative, and whose decision it is.
+        parts.append(
+            torch.stack(
+                [
+                    gather_seat(roads_to_take, seats[i]).to(torch.float32) / ROADS_TO_TAKE_CAP
+                    for i in range(players)
+                ],
+                dim=1,
+            )
+        )
+        parts.append(_onehot(_rotate_slot(to_move, perspective, players), players))
+
         globals_ = torch.cat(parts, dim=-1)
 
         return hexes, vertices, edges, globals_
@@ -444,6 +468,8 @@ class _ExportWrapper(nn.Module):
         free_roads: Tensor,
         deck_size: Tensor,
         turns: Tensor,
+        roads_to_take: Tensor,
+        to_move: Tensor,
         perspective: Tensor,
         own_hand: Tensor,
         hand_totals: Tensor,
@@ -470,6 +496,8 @@ class _ExportWrapper(nn.Module):
             free_roads,
             deck_size,
             turns,
+            roads_to_take,
+            to_move,
             perspective,
             own_hand,
             hand_totals,

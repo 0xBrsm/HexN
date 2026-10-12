@@ -1095,3 +1095,74 @@ def test_decoupled_and_the_proximal_log_probs_come_together(collected):
         update(student, optimiser, batch, PPOConfig(decoupled=True))
     with pytest.raises(ValueError):
         update(student, optimiser, ppo.attach_proximal(batch, student), PPOConfig())
+
+
+def test_the_loss_target_is_the_own_slot_label_and_a_weighted_cross_entropy(collected):
+    """`aux_target="loss"`: slot 0 of the margin target is
+    `points_lost_next`'s label for that decision, zeros elsewhere, and the
+    aux term is the weighted binary cross-entropy of the own slot's logit."""
+    from hexn.rewards import points_lost_next
+
+    policy, episodes = collected
+    config = PPOConfig(aux_margin_weight=0.5, aux_target="loss", aux_pos_weight=40.0)
+    batch = assemble(episodes, policy.layout, config)
+    want = []
+    for episode in episodes:
+        lost = points_lost_next(
+            [np.asarray([t.step for t in tr]) for tr in episode.trajectories],
+            [np.asarray([t.points for t in tr]) for tr in episode.trajectories],
+            episode.outcome.points,
+        )
+        for seat in range(len(episode.trajectories)):
+            want.extend(lost[seat])
+    assert torch.equal(batch.margin_target[:, 0], torch.tensor(want, dtype=torch.float32))
+    assert torch.equal(batch.margin_target[:, 1:], torch.zeros_like(batch.margin_target[:, 1:]))
+
+    terms, _ = _terms(policy, batch, config)
+    evaluation = policy.evaluate(batch.buffer, batch.mask, batch.chosen)
+    expected = torch.nn.functional.binary_cross_entropy_with_logits(
+        evaluation.margin[:, 0], batch.margin_target[:, 0], pos_weight=torch.tensor(40.0))
+    assert torch.allclose(terms.margin_loss, expected)
+    assert torch.allclose(terms.margin_term, 0.5 * expected)
+
+
+def test_the_loss_target_is_refused_where_it_cannot_mean_what_it_says():
+    with pytest.raises(ValueError, match="aux_target"):
+        PPOConfig(aux_target="score")
+    with pytest.raises(ValueError, match="aux_pos_weight"):
+        PPOConfig(aux_target="loss", aux_pos_weight=0.0)
+    with pytest.raises(ValueError, match="final-points critic"):
+        PPOConfig(aux_target="loss", vp_reward=0.1, aux_margin_weight=1.0)
+    with pytest.raises(ValueError, match="final-points critic"):
+        PPOConfig(aux_target="points", vp_reward=0.1, aux_margin_weight=1.0)
+
+
+def test_the_points_target_is_every_seats_next_round_change_in_the_deciders_frame(collected):
+    from hexn.rewards import points_next_round
+
+    policy, episodes = collected
+    config = PPOConfig(aux_margin_weight=0.5, aux_target="points")
+    batch = assemble(episodes, policy.layout, config)
+    want = []
+    for episode in episodes:
+        seats = len(episode.trajectories)
+        assert all(len(t.seat_points) == seats for tr in episode.trajectories for t in tr)
+        moved = points_next_round(
+            [np.asarray([t.step for t in tr]) for tr in episode.trajectories],
+            [np.asarray([t.seat_points for t in tr]).reshape(len(tr), seats) for tr in episode.trajectories],
+            episode.outcome.points,
+        )
+        for seat in range(seats):
+            want.extend(to_frame(tuple(row), seat) for row in moved[seat])
+    assert torch.equal(batch.margin_target, torch.tensor(want, dtype=torch.float32))
+    terms, _ = _terms(policy, batch, config)
+    evaluation = policy.evaluate(batch.buffer, batch.mask, batch.chosen)
+    assert torch.allclose(terms.margin_loss, (evaluation.margin - batch.margin_target).pow(2).mean())
+
+
+def test_the_points_target_refuses_games_collected_without_every_seats_points(collected):
+    policy, episodes = collected
+    stripped = [dataclasses.replace(e, trajectories=tuple(
+        tuple(dataclasses.replace(t, seat_points=()) for t in tr) for tr in e.trajectories)) for e in episodes]
+    with pytest.raises(ValueError, match="seat_points"):
+        assemble(stripped, policy.layout, PPOConfig(aux_margin_weight=0.5, aux_target="points"))
