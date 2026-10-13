@@ -168,7 +168,7 @@ def prepare_columns(columns, layout, config: PPOConfig, players: int):
     from hexset.victory import relative_points
 
     from ..rewards import points_lost_next, points_next_round, win_loss
-    from . import SETUP_PHASES, advantages
+    from . import SETUP_PHASES, advantages, outlook_row
 
     if config.critic != "gae" or config.pair_baseline or config.fast_win or config.vp_reward:
         return None
@@ -235,6 +235,12 @@ def prepare_columns(columns, layout, config: PPOConfig, players: int):
             seat_targets.append(np.asarray(to_frame(wins, seat), dtype=np.float32))
             if moved is not None:
                 seat_margins.append(np.roll(moved[seat], -seat, axis=1))
+            elif config.aux_target == "outlook":
+                if "outlook" not in at or not any(row[at["outlook"]] for row in game["rows"]):
+                    raise ValueError("aux_target 'outlook' needs games collected with Collector(outlook=True)")
+                seat_margins.append(
+                    np.stack([outlook_row(row[at["outlook"]], seat, len(wins)) for row in seat_rows])
+                )
             elif lost is None:
                 seat_margins.append(np.repeat(np.asarray(to_frame(margins, seat), dtype=np.float32)[None], count, axis=0))
             else:

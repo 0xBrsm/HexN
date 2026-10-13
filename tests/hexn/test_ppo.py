@@ -38,7 +38,7 @@ def a_policy(players: int = 4, seed: int = 0):
     return NetworkPolicy(net, space_for(game), packing(graph, players))
 
 
-def some_episodes(policy, games: int = 4, seed: int = 0, lanes: int = 8):
+def some_episodes(policy, games: int = 4, seed: int = 0, lanes: int = 8, outlook: bool = False):
     """Real transitions, trade-free and decided.
 
     Nothing here is about trading, and a width-16 net's gate prices every
@@ -50,7 +50,7 @@ def some_episodes(policy, games: int = 4, seed: int = 0, lanes: int = 8):
     `outcome.winner`.
     """
     episodes = Collector(
-        policy, lanes=lanes, seed=seed, action_cap=400, max_offers=0
+        policy, lanes=lanes, seed=seed, action_cap=400, max_offers=0, outlook=outlook
     ).collect(games)
     return [decided(e) for e in episodes]
 
@@ -1166,3 +1166,71 @@ def test_the_points_target_refuses_games_collected_without_every_seats_points(co
         tuple(dataclasses.replace(t, seat_points=()) for t in tr) for tr in e.trajectories)) for e in episodes]
     with pytest.raises(ValueError, match="seat_points"):
         assemble(stripped, policy.layout, PPOConfig(aux_margin_weight=0.5, aux_target="points"))
+
+
+@pytest.fixture(scope="module")
+def outlooked(collected):
+    """`collected`'s policy's games with the outlook label read."""
+    policy, _ = collected
+    return policy, some_episodes(policy, games=2, seed=17, outlook=True)
+
+
+def test_the_outlook_label_is_the_true_states_count_on_the_turns_own_decisions(outlooked):
+    """A kept decision carries `outlook_of` on the replayed true state where
+    the decider is on turn before the roll, moving the robber or in the main
+    phase, and nothing elsewhere (setup, another seat's discard)."""
+    from hexset.game import Phase
+    from hexset.outlook import outlook_of
+    from hexn.replay import replay_to_ply
+    from hexn.selfplay import _outlook_kept
+
+    _, episodes = outlooked
+    labelled = unlabelled = 0
+    for episode in episodes:
+        for trajectory in episode.trajectories:
+            for t in trajectory[::3]:
+                game = replay_to_ply(episode, t.step)
+                own = t.seat == game.current_player and game.phase in (Phase.ROLL, Phase.ROBBER, Phase.MAIN)
+                if not (own and _outlook_kept(episode.seed, episode.index, t.seat, t.step)):
+                    assert t.outlook == ()
+                    unlabelled += 1
+                    continue
+                rolled = not (game.phase is Phase.ROLL
+                              or (game.phase is Phase.ROBBER and game.resume_phase is Phase.ROLL))
+                want = outlook_of(game.state(0, hidden=False), t.seat, rolled=rolled,
+                                  card_played=game.dev_card_played).can
+                assert t.outlook == want
+                labelled += 1
+    assert labelled and unlabelled
+
+
+def test_the_outlook_target_is_the_label_in_the_deciders_frame_and_its_loss_skips_unlabelled_rows(outlooked):
+    policy, episodes = outlooked
+    config = PPOConfig(aux_margin_weight=0.5, aux_target="outlook")
+    batch = assemble(episodes, policy.layout, config)
+    want = []
+    for episode in episodes:
+        seats = len(episode.trajectories)
+        for seat, trajectory in enumerate(episode.trajectories):
+            for t in trajectory:
+                want.append(to_frame(t.outlook, seat) if t.outlook else (float("nan"),) * seats)
+    want = torch.tensor(want, dtype=torch.float32)
+    rows = ~torch.isnan(want[:, 0])
+    assert torch.equal(torch.isnan(batch.margin_target), torch.isnan(want))
+    assert torch.equal(batch.margin_target[rows], want[rows])
+    assert 0 < int(rows.sum()) < len(rows)
+
+    student = a_student(policy)
+    terms, _ = _terms(student, batch, config)
+    evaluation = student.evaluate(batch.buffer, batch.mask, batch.chosen)
+    expected = (evaluation.margin[rows] - want[rows]).pow(2).mean()
+    assert torch.allclose(terms.margin_loss, expected)
+    terms.margin_term.backward()
+    grads = [p.grad for p in student.net.parameters() if p.grad is not None]
+    assert grads and all(torch.isfinite(g).all() for g in grads)
+
+
+def test_the_outlook_target_refuses_games_collected_without_it(collected):
+    policy, episodes = collected
+    with pytest.raises(ValueError, match="outlook=True"):
+        assemble(episodes, policy.layout, PPOConfig(aux_margin_weight=0.5, aux_target="outlook"))

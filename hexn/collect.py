@@ -1008,6 +1008,9 @@ class WorkerSpec:
     # keys every draw on `(seed, index, seat, step)`, so the games a cohort
     # plays do not depend on the worker count or the lanes.
     sample_stream: str = "worker"
+    # Read the outlook label (`hexn.selfplay.Collector`'s `outlook`), which
+    # `--aux-target outlook` trains the margin head on.
+    outlook: bool = False
     # The worker's forward: `trunk` is the net's path ("reference" message
     # passing, or "fused", the same numbers as dense GEMMs up to float
     # reassociation) and `precision` the autocast `act` samples under
@@ -1185,6 +1188,7 @@ def _build(spec: WorkerSpec) -> tuple[list[NetworkPolicy], Collector]:
         learners=tuple(range(spec.learners)),
         pair_boards=spec.pair_boards,
         sample_stream=spec.sample_stream,
+        outlook=spec.outlook,
         game_law=(
             mix_deal(spec.mix, spec.players, spec.seed, pair_boards=spec.pair_boards)
             if spec.learners <= 1 and spec.mix

@@ -78,6 +78,7 @@ from ..loop import (
 )
 from . import (
     ADAM_EPS,
+    AUX_TARGETS,
     PPOConfig,
     assemble,
     attach_prior,
@@ -210,8 +211,11 @@ def build_parser() -> argparse.ArgumentParser:
     # the logit of losing victory points before acting again after this
     # turn, by cross-entropy with positives weighted --aux-pos-weight, or
     # "points", the points head: every seat's change in victory points until
-    # the decider acts again after its turn, by squared error.
-    parser.add_argument("--aux-target", choices=("relative", "loss", "points"), default="relative")
+    # the decider acts again after its turn, by squared error, or "outlook",
+    # the same head on every seat's `hexset.outlook` count of what it can
+    # score over that round, read by the collector on a share of the turn's
+    # own decisions (`hexn.selfplay.OUTLOOK_SHARE`), by squared error over those.
+    parser.add_argument("--aux-target", choices=AUX_TARGETS, default="relative")
     parser.add_argument("--aux-pos-weight", type=float, default=1.0)
     # Pay for fast wins (`PPOConfig.fast_win`): a JSON file holding a list of
     # weights, entry r-1 for a win in round r, or an object with a "weights"
@@ -795,6 +799,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     parent=args.parent,
                     cohort=args.collect_mode == "cohort",
                     sample_stream=args.sample_stream,
+                    outlook=config.aux_target == "outlook",
                     trunk=args.collect_trunk,
                     precision=args.collect_precision,
                 )
@@ -837,6 +842,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             game_law=mix_deal(mix, args.players, args.seed) if mix else None,
             coalition=mix_coalitions(mix, args.players, args.seed) if mix else None,
             sample_stream=args.sample_stream,
+            outlook=config.aux_target == "outlook",
         )
 
     crew = None

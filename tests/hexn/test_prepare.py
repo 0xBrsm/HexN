@@ -22,6 +22,16 @@ def cohort():
     return policies[0].layout, [gamefile.encode(e) for e in episodes]
 
 
+@pytest.fixture(scope="module")
+def outlook_cohort():
+    """`cohort`'s shard with the outlook label read."""
+    policies, collector = _build(WorkerSpec(seed=5, players=4, lanes=3, action_cap=200, max_offers=0, first_game=0,
+                                            stride=1, width=8, rounds=1, torch_seed=1, mix=(), parent="",
+                                            outlook=True))
+    episodes = collector.cohort(6)
+    return policies[0].layout, [gamefile.encode(e) for e in episodes]
+
+
 CONFIG = PPOConfig(lam=0.95, decided_cut=0.05, setup_weight=2, decoupled=True)
 
 
@@ -101,6 +111,32 @@ def test_columnar_assembly_is_the_object_assembly_bit_for_bit(cohort, config, dt
     assert gauges == want_gauges
     assert [(e.index, e.seed, e.outcome, e.trajectories) for e in episodes] == [
         (e.index, e.seed, e.outcome, e.trajectories) for e in want_episodes]
+
+
+@pytest.mark.parametrize(
+    "config,dtype",
+    [
+        (PPOConfig(lam=0.95, aux_margin_weight=0.5, aux_target="outlook"), "float32"),
+        (PPOConfig(lam=0.95, decided_cut=0.05, setup_weight=2, aux_target="outlook", amp="fp16"), "float16"),
+    ],
+)
+def test_columnar_assembly_of_the_outlook_target_is_the_object_assembly(outlook_cohort, config, dtype):
+    """As above, with the unlabelled rows' NaN targets compared as NaN."""
+    from hexn.ppo.prepare import prepare_columns
+
+    layout, games = outlook_cohort
+    ordered = sorted(games, key=gamefile.index_of)
+    want_batch, want_gauges, _ = prepare(by_index(gamefile.decode_all(ordered, dtype)), layout, config, 4)
+    batch, gauges, _ = prepare_columns(gamefile.decode_columns(ordered, dtype), layout, config, 4)
+    for name in want_batch.__dataclass_fields__:
+        mine, theirs = getattr(want_batch, name), getattr(batch, name)
+        assert (mine is None) == (theirs is None), name
+        if mine is not None:
+            assert mine.dtype == theirs.dtype and mine.shape == theirs.shape, name
+            assert torch.equal(mine.isnan(), theirs.isnan()) if mine.is_floating_point() else True, name
+            assert torch.equal(mine.nan_to_num(), theirs.nan_to_num()) if mine.is_floating_point() else torch.equal(mine, theirs), name
+    assert gauges == want_gauges
+    assert want_batch.margin_target.isnan().any() and not want_batch.margin_target.isnan().all()
 
 
 def test_columnar_assembly_declines_what_it_does_not_cover(cohort):

@@ -509,7 +509,9 @@ def test_the_anchor_holds_the_settled_rows_the_filter_let_go(corpus):
             per_row = -(batch.anchor_slots * slots).sum(-1)
             return float(per_row[settled].mean())
 
-    assert drift(anchor=1.0) < drift(anchor=0.0)
+    # At a weight of 1 the pull on this small corpus is the size of float
+    # noise; at 10 it is clear.
+    assert drift(anchor=10.0) < drift(anchor=0.0)
 
 
 # --- the buffer and the packing -------------------------------------------

@@ -107,6 +107,9 @@ ADAM_EPS = 1e-5
 # the behaviour policy all but never chose cannot dominate a minibatch.
 DECOUPLED_CAP = 2.0
 
+# What the auxiliary margin head can learn (`PPOConfig.aux_target`).
+AUX_TARGETS = ("relative", "loss", "points", "outlook")
+
 
 @dataclass(frozen=True)
 class PPOConfig:
@@ -144,7 +147,12 @@ class PPOConfig:
     # every slot, each seat's change in victory points from the decision to
     # the decider's next decision after its turn (`hexn.rewards.
     # points_next_round`), viewer's frame, by squared error; it needs games
-    # that record `Transition.seat_points`.
+    # that record `Transition.seat_points`. "outlook": the same head, every
+    # slot, on each seat's `hexset.outlook` count of what it can score over
+    # that span (`Transition.outlook`), viewer's frame, by squared error over
+    # the rows that carry one (`hexn.selfplay.OUTLOOK_SHARE` of the turn's own
+    # decisions; every other row's target is NaN and gets no gradient); it
+    # needs games collected with `Collector(outlook=True)`.
     aux_target: str = "relative"
     aux_pos_weight: float = 1.0
     clip: float = 0.2
@@ -294,8 +302,8 @@ class PPOConfig:
             raise ValueError(
                 f"aux_margin_weight cannot be negative, got {self.aux_margin_weight}"
             )
-        if self.aux_target not in ("relative", "loss", "points"):
-            raise ValueError(f"unknown aux_target {self.aux_target!r}; expected 'relative', 'loss' or 'points'")
+        if self.aux_target not in AUX_TARGETS:
+            raise ValueError(f"unknown aux_target {self.aux_target!r}; expected one of {AUX_TARGETS}")
         if self.aux_pos_weight <= 0.0:
             raise ValueError(f"aux_pos_weight must be positive, got {self.aux_pos_weight}")
         if self.aux_target != "relative" and self.vp_reward:
@@ -317,6 +325,17 @@ def seat_points_of(trajectory: Sequence[Transition], seats: int) -> np.ndarray:
             "was collected without them"
         )
     return np.asarray([t.seat_points for t in trajectory], dtype=np.float32).reshape(len(trajectory), seats)
+
+
+def outlook_row(outlook: Sequence[float], seat: int, seats: int) -> np.ndarray:
+    """One decision's `--aux-target outlook` target in `seat`'s frame: its
+    `Transition.outlook` rotated so `seat` is slot 0, or NaN in every slot
+    where the decision carries none (the loss skips those rows)."""
+    if not outlook:
+        return np.full(seats, np.nan, dtype=np.float32)
+    if len(outlook) != seats:
+        raise ValueError(f"an outlook label has {len(outlook)} seats, the game {seats}")
+    return np.roll(np.asarray(outlook, dtype=np.float32), -seat)
 
 @dataclass(frozen=True)
 class Stats:
@@ -712,6 +731,12 @@ def assemble(
             if config.aux_target == "points"
             else None
         )
+        if config.aux_target == "outlook" and not any(
+            t.outlook for trajectory in episode.trajectories for t in trajectory
+        ):
+            # Every game has turn-own decisions, so a game with no label was
+            # collected without them, and would train nothing silently.
+            raise ValueError("aux_target 'outlook' needs games collected with Collector(outlook=True)")
         for seat, trajectory in enumerate(episode.trajectories):
             if not trajectory:
                 continue
@@ -784,6 +809,8 @@ def assemble(
                     margin_target[0] = lost[seat][i]
                 elif moved is not None:
                     margin_target = np.roll(moved[seat][i], -seat)
+                elif config.aux_target == "outlook":
+                    margin_target = outlook_row(transition.outlook, seat, len(wins))
                 margin_targets.append(margin_target)
                 if fast_target is not None:
                     fast_targets.append(fast_target)
@@ -979,6 +1006,16 @@ def minibatch_terms(
             margin_target[:, 0].float(),
             pos_weight=torch.tensor(config.aux_pos_weight, device=margin_target.device),
         )
+    elif config.aux_target == "outlook":
+        # The mean over the rows that carry a label, without a host sync: the
+        # NaN targets are zeroed before the difference (a NaN there would
+        # reach the gradient through the masked branch) and their rows
+        # weighted 0; a batch with none adds exactly nothing.
+        labelled = ~torch.isnan(margin_target[:, :1])
+        error = (evaluation.margin - torch.nan_to_num(margin_target)).pow(2)
+        margin_loss = torch.where(labelled, error, 0.0).sum() / (
+            labelled.sum() * margin_target.shape[1]
+        ).clamp(min=1)
     else:
         margin_loss = (evaluation.margin - margin_target).pow(2).mean()
     margin_term = config.aux_margin_weight * margin_loss

@@ -2,6 +2,20 @@
 
 All notable changes to the `hexn` package are recorded here.
 
+## 0.41.0
+
+### Added
+
+- **`--aux-target outlook`: the margin head on every seat's `hexset.outlook`
+  count.** `Collector(outlook=True)` (`WorkerSpec.outlook`, set by the trainer
+  for this target) records `Transition.outlook`, every seat's `Outlook.can`
+  read on the true state, on a fixed `OUTLOOK_SHARE` (a tenth) of the turn's
+  own decisions: before the roll, moving the robber, the main phase. The head
+  learns it in the decider's frame by squared error over those rows; every
+  other row's target is NaN and gets no gradient. Assembly refuses games
+  collected without the label. `hexn.ppo.AUX_TARGETS` lists the targets and
+  `hexn.ppo.outlook_row` builds one row's target.
+
 ## 0.40.0
 
 ### Breaking

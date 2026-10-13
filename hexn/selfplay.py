@@ -46,13 +46,14 @@ from hexset.actions import Action, ActionSpace, mask_of, space_for
 from hexset.arena import MAX_ACTIONS, deal_board, deal_game
 from hexset.board.board import Board
 from hexset.encoding import Observation, encode_batch
-from hexset.game import MAX_TURNS, Game
+from hexset.game import MAX_TURNS, Game, Phase
 # `_Lane` is internal to HexSet (an underscore name, outside `__all__`), used
 # knowingly: `RuledLaneEnv` and `_Listed` deal their own games through
 # `LaneEnv`'s `_fresh`, `_next`, `_stop`, `_cast` and `_seat_gates`, which a
 # HexSet release may change without notice. Check them at every repin.
 from hexset.gym.lanes import BoardBots, LaneEnv, Outcome, _Lane
 from hexset.gym.lanes import Episode as LaneEpisode
+from hexset.outlook import outlook_of
 from hexset.victory import victory_points
 from hexset.gym.lanes import Request as LaneRequest
 from hexset.record import Record, Tape, recording
@@ -122,6 +123,36 @@ def _seat_points(game: Game) -> tuple[int, ...]:
     state = game.state(0, hidden=False)
     return tuple(victory_points(state, seat) for seat in range(state.num_players))
 
+
+# The phases of the turn under way an outlook label is read in: before the
+# roll, moving the robber, and the main phase. Setup has no round to read and
+# a discard is another seat's decision mid-roll.
+_OUTLOOK_PHASES = frozenset((Phase.ROLL, Phase.ROBBER, Phase.MAIN))
+# The share of those decisions labelled. A label costs several times what the
+# rest of a decision's collection does (batched across lanes), so labelling
+# them all would slow collection several-fold; a tenth adds about a tenth and
+# still labels far more rows an iteration than the head needs. Which ones is a
+# pure function of the decision (`_outlook_kept`), so it does not depend on
+# lanes or workers.
+OUTLOOK_SHARE = 0.10
+_OUTLOOK_SALT = 0x6F75746C6F6F6B21  # keeps the choice apart from `draw_key`'s draws
+
+
+def _outlook_kept(seed: int, index: int, seat: int, step: int) -> bool:
+    return (draw_key(seed ^ _OUTLOOK_SALT, index, seat, step) >> 11) < OUTLOOK_SHARE * (1 << 53)
+
+
+def _outlook(game: Game, seat: int) -> tuple[float, ...]:
+    """Every seat's `hexset.outlook.Outlook.can` on the true state, board order
+    (`Request.outlook`), or empty where the decision is not the turn's own: a
+    seat other than the one on turn, or a phase outside `_OUTLOOK_PHASES`."""
+    if seat != game.current_player or game.phase not in _OUTLOOK_PHASES:
+        return ()
+    # A knight played before the roll moves the robber with the roll still to
+    # come: `resume_phase` is ROLL then.
+    rolled = not (game.phase is Phase.ROLL or (game.phase is Phase.ROBBER and game.resume_phase is Phase.ROLL))
+    return outlook_of(game.state(0, hidden=False), seat, rolled=rolled, card_played=game.dev_card_played).can
+
 @dataclass(frozen=True)
 class Request:
     """One lane's decision, put to the policy alongside every other lane's.
@@ -167,6 +198,12 @@ class Request:
     # cards included: a training target only (`hexn.rewards.points_next_round`),
     # never an input, so reading the truth here leaks nothing to the policy.
     seat_points: tuple[int, ...] = ()
+    # Every seat's `hexset.outlook.Outlook.can` at this decision, board order,
+    # read on the true state: a training target only (`--aux-target outlook`),
+    # never an input. Empty unless the collector reads it (`Collector.outlook`),
+    # the decision is the turn's own (`_outlook`) and among the `OUTLOOK_SHARE`
+    # kept.
+    outlook: tuple[float, ...] = ()
     # This decision's sampling key under per-game streams (`draw_key`), None
     # under the policy's own generator. A sampling policy that is handed keys
     # draws from them alone; a greedy or scripted one ignores them.
@@ -251,6 +288,8 @@ class Transition:
     # Every seat's, board order (`Request.seat_points`); empty in games
     # collected before it was recorded.
     seat_points: tuple[int, ...] = ()
+    # `Request.outlook`; empty where it was not read.
+    outlook: tuple[float, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -475,6 +514,7 @@ class Collector:
         game_law: Callable[[int], tuple[GameType, frozenset[int]]] | None = None,
         coalition: Callable[[int], object] | None = None,
         sample_stream: str = "worker",
+        outlook: bool = False,
     ) -> None:
         """`first_game` is where the game counter starts.
 
@@ -508,6 +548,9 @@ class Collector:
         its `draw_key`, so a game's sampled actions no longer depend on
         `lanes`, `stride` or which games shared a batch.
 
+        `outlook` reads `Request.outlook`, the `--aux-target outlook` label, on
+        `OUTLOOK_SHARE` of the turn's own decisions; off, it costs nothing.
+
         `sink`, when set, is handed every episode the tick it finishes -- what
         keeps a game on disk before the batch it belongs to ends
         (`hexn.durable.Partial.keep`). A sink that returns something other
@@ -533,6 +576,7 @@ class Collector:
             )
         self.policy = policy
         self.sample_stream = sample_stream
+        self.outlook = outlook
         self.opponents = tuple(opponents)
         self.caster = caster
         # Game index -> per-seat sampling temperature, pure in the index like
@@ -710,6 +754,11 @@ class Collector:
                 game=request.game,
                 points=victory_points(request.game.state(request.seat, hidden=False), request.seat),
                 seat_points=_seat_points(request.game),
+                outlook=(
+                    _outlook(request.game, request.seat)
+                    if self.outlook and _outlook_kept(self.seed, request.index, request.seat, request.step)
+                    else ()
+                ),
                 temperature=(
                     1.0
                     if self.temperatures is None
@@ -780,6 +829,7 @@ class Collector:
                         aux=choice.aux,
                         points=request.points,
                         seat_points=request.seat_points,
+                        outlook=request.outlook,
                     )
                 )
             trajectories.append(tuple(row))
