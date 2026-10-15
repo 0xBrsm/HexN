@@ -2,6 +2,17 @@
 
 All notable changes to the `hexn` package are recorded here.
 
+## 0.42.0
+
+### Changed
+
+- The fused graph trunk keeps node-first features across message-passing
+  layers and restores batch-first outputs at the heads. Parameter names and
+  checkpoint shapes are unchanged.
+
+- Training uses fused Adam on CUDA/HIP parameters, including after loading
+  optimizer checkpoints, and ordinary Adam on CPU.
+
 ## 0.41.0
 
 ### Added
@@ -233,6 +244,15 @@ All notable changes to the `hexn` package are recorded here.
 
 ### Fixed
 
+- The PPO surrogate caps the log-ratio it exponentiates at 20
+  (`RATIO_LOG_CAP`). A net with wide logits could move a position past
+  float32's `exp` range within an update, and an infinite ratio times a zero
+  behaviour weight made the loss NaN.
+
+- A `--mix` that seats only the learner, such as `duel(self)=1.0`, trains.
+  Its collectors refused to build ("a caster without opponents has nobody to
+  cast"); they now run without a caster, which seats the learner everywhere,
+  and the mix still deals its duel-variant games.
 - `hexn.coalition` documents what `Targeted` does without a claim about
   how tables behave.
 - The coalition-mix tests skip without PyTorch, like the rest of the

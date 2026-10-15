@@ -46,6 +46,7 @@ from .collect import ParallelCollector, WorkerSpec, release_memory
 from hexset.encoding import static_graph
 from .model import VALUE_HEADS, HexNet, ModelConfig, packing, quantile_warm_start
 from .policy import NetworkPolicy
+from .optim import adam
 from .ppo import PPOConfig, assemble, update
 from .rewards import reward
 from .selfplay import owned
@@ -375,6 +376,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     optimisers: list[torch.optim.Adam] = []
     for k, config in enumerate(configs):
         net = HexNet(space, graph, args.players, model_config).to(args.device)
+        net.fused = torch.device(args.device).type == "cuda"
         weights = (seat_states[k] if seat_states else state)["net"]
         if model_config.value_head == "quantile" and base_head != "quantile":
             # Every level starts at the scalar head's own prediction, so the
@@ -387,7 +389,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         policies.append(
             NetworkPolicy(net, space, packing(graph, args.players), device=args.device)
         )
-        optimiser = torch.optim.Adam(net.parameters(), lr=config.learning_rate, eps=config.adam_eps)
+        optimiser = adam(net.parameters(), lr=config.learning_rate, eps=config.adam_eps)
         if seat_states and "optimiser" in seat_states[k]:
             optimiser.load_state_dict(seat_states[k]["optimiser"])
         optimisers.append(optimiser)

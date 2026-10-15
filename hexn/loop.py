@@ -42,6 +42,7 @@ from hexset.gym.lanes import BoardBots
 from hexset.trading import UNLIMITED, TradeParams
 from .model import POLICY_HEADS, VALUE_HEADS, HexNet, ModelConfig, packing
 from .policy import NetworkPolicy
+from .optim import adam
 from .ppo import ADAM_EPS
 from .rewards import reward
 from .selfplay import BatchPolicy, Episode
@@ -492,7 +493,7 @@ def build(args) -> tuple[NetworkPolicy, torch.optim.Optimizer, object]:
     # hand-built namespaces from the test fixtures and from `hexn.exit`,
     # whose parsers know nothing about a knob added for PPO. A missing attribute
     # should mean "the standard value", not an AttributeError three frames down.
-    optimiser = torch.optim.Adam(
+    optimiser = adam(
         net.parameters(),
         lr=args.learning_rate,
         eps=getattr(args, "adam_eps", ADAM_EPS),

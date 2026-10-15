@@ -422,7 +422,7 @@ def _mean_adjacency(dest: Tensor, src: Tensor, rows: int, cols: int) -> Tensor:
     return out / out.sum(-1, keepdim=True).clamp(min=1.0)
 
 
-def _split(linear: nn.Linear, width: int) -> list[Tensor]:
+def _split(linear: nn.Linear, width: int) -> tuple[Tensor, ...]:
     """The first trunk linear's weight, as per-input-block column views.
 
     `cat([a, b, c], -1) @ W.T` is `a @ Wa.T + b @ Wb.T + c @ Wc.T` for the
@@ -431,11 +431,12 @@ def _split(linear: nn.Linear, width: int) -> list[Tensor]:
     per batch instead of once per node. Views, not copies: the parameters and
     their state_dict keys are untouched.
     """
-    weight = linear.weight
-    return [weight[:, i : i + width] for i in range(0, weight.shape[1], width)]
+    return linear.weight.split(width, dim=1)
 
 
 class HexNet(nn.Module):
+    FUSED_EXECUTION = "node_major_v1"
+
     def __init__(
         self,
         space: ActionSpace,
@@ -696,15 +697,27 @@ class HexNet(nn.Module):
     def forward(
         self, hexes: Tensor, vertices: Tensor, edges: Tensor, globals_: Tensor
     ) -> Prediction:
+        if self.fused:
+            # Nodes first lets each adjacency multiply one [nodes, batch *
+            # width] matrix. Keep that layout throughout the trunk, then
+            # restore the batch-first contract the heads read.
+            h = self.embed_hex(hexes.transpose(0, 1).contiguous())
+            v = self.embed_vertex(vertices.transpose(0, 1).contiguous())
+            e = self.embed_edge(edges.transpose(0, 1).contiguous())
+            g = self.embed_global(globals_)
+            for round_ in self.rounds:
+                h, v, e, g = self._fused_round(round_, h, v, e, g)
+            return self._emit(
+                h.transpose(0, 1).contiguous(),
+                v.transpose(0, 1).contiguous(),
+                e.transpose(0, 1).contiguous(),
+                g, globals_,
+            )
+
         h = self.embed_hex(hexes)
         v = self.embed_vertex(vertices)
         e = self.embed_edge(edges)
         g = self.embed_global(globals_)
-
-        if self.fused:
-            for round_ in self.rounds:
-                h, v, e, g = self._fused_round(round_, h, v, e, g)
-            return self._emit(h, v, e, g, globals_)
 
         for round_ in self.rounds:
             v_from_h = self._pass(
@@ -738,10 +751,16 @@ class HexNet(nn.Module):
         the global block's linear applied once per batch rather than once per
         node. All four messages read the pre-round features and `g` reads the
         post-update means, exactly as the reference loop orders it."""
-        v_from_h = torch.matmul(self.A_vh, h)
-        h_from_v = torch.matmul(self.A_hv, v)
-        e_from_v = torch.matmul(self.A_ev, v)
-        v_from_e = torch.matmul(self.A_ve, e)
+        def aggregate(adjacency: Tensor, features: Tensor) -> Tensor:
+            nodes, batch, width = features.shape
+            return (adjacency @ features.reshape(nodes, batch * width)).reshape(
+                adjacency.shape[0], batch, width
+            )
+
+        v_from_h = aggregate(self.A_vh, h)
+        h_from_v = aggregate(self.A_hv, v)
+        e_from_v = aggregate(self.A_ev, v)
+        v_from_e = aggregate(self.A_ve, e)
 
         width = self.config.width
         hex_first, vertex_first, edge_first = (
@@ -756,18 +775,18 @@ class HexNet(nn.Module):
         pre_h = (
             h @ hw[0].T
             + h_from_v @ hw[1].T
-            + (g @ hw[2].T + hex_first.bias).unsqueeze(1)
+            + (g @ hw[2].T + hex_first.bias).unsqueeze(0)
         )
         pre_v = (
             v @ vw[0].T
             + v_from_h @ vw[1].T
             + v_from_e @ vw[2].T
-            + (g @ vw[3].T + vertex_first.bias).unsqueeze(1)
+            + (g @ vw[3].T + vertex_first.bias).unsqueeze(0)
         )
         pre_e = (
             e @ ew[0].T
             + e_from_v @ ew[1].T
-            + (g @ ew[2].T + edge_first.bias).unsqueeze(1)
+            + (g @ ew[2].T + edge_first.bias).unsqueeze(0)
         )
         # [1] is each MLP's own SiLU, [2] its second linear: the modules the
         # reference path runs, minus the first linear this method just applied
@@ -775,7 +794,7 @@ class HexNet(nn.Module):
         h = h + round_.hex[2](round_.hex[1](pre_h))
         v = v + round_.vertex[2](round_.vertex[1](pre_v))
         e = e + round_.edge[2](round_.edge[1](pre_e))
-        g = g + round_.globe(torch.cat([g, h.mean(1), v.mean(1), e.mean(1)], -1))
+        g = g + round_.globe(torch.cat([g, h.mean(0), v.mean(0), e.mean(0)], -1))
         return h, v, e, g
 
     def _emit(

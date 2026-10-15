@@ -458,6 +458,53 @@ def test_the_fused_forward_trains_the_same_parameters():
     assert unused == []
 
 
+@pytest.mark.parametrize("players,value_head,detach", [
+    (2, "linear", False), (4, "pooled", False),
+    (4, "attn", True), (4, "quantile", False),
+])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_node_first_fused_trunk_matches_reference_outputs_and_gradients(players, value_head, detach, dtype):
+    import copy
+    from hexset.actions import build_space
+
+    torch.manual_seed(17)
+    graph = static_graph(random_base_board(random.Random(7)).topology)
+    space = build_space(graph.num_vertices, graph.num_edges, graph.num_hexes, players)
+    reference = HexNet(space, graph, players, ModelConfig(
+        width=16, rounds=2, value_head=value_head, fast_win=True,
+    )).to(dtype=dtype)
+    reference.detach_value = detach
+    if dtype == torch.float64:
+        # The buffers start in fp32. Rebuild their means at this test's
+        # precision so it isolates layout/reassociation, not coefficient
+        # rounding inherited from initialization.
+        for name in ("A_vh", "A_hv", "A_ev", "A_ve"):
+            incidence = (getattr(reference, name) != 0).to(dtype)
+            setattr(reference, name, incidence / incidence.sum(-1, keepdim=True).clamp(min=1))
+    fused = copy.deepcopy(reference)
+    fused.fused = True
+    batch = [torch.randn(3, *shape, dtype=dtype) for shape in (
+        (graph.num_hexes, reference.embed_hex.in_features),
+        (graph.num_vertices, reference.embed_vertex.in_features),
+        (graph.num_edges, reference.embed_edge.in_features),
+        (reference.embed_global.in_features,),
+    )]
+    outputs = [net(*batch) for net in (reference, fused)]
+    tolerance = {"rtol": 2e-4, "atol": 3e-5} if dtype == torch.float32 else {"rtol": 1e-9, "atol": 1e-10}
+    for name in ("logits", "value_logits", "margin", "fast_logits", "quantiles"):
+        left, right = (getattr(out, name) for out in outputs)
+        if left is not None:
+            torch.testing.assert_close(left, right, **tolerance)
+    for out in outputs:
+        (out.logits.square().mean() + out.value_logits.square().mean()
+         + out.margin.square().mean() + out.fast_logits.square().mean()).backward()
+    for (name, left), (_, right) in zip(reference.named_parameters(), fused.named_parameters()):
+        assert (left.grad is None) == (right.grad is None), name
+        if left.grad is not None:
+            torch.testing.assert_close(left.grad, right.grad, **tolerance)
+    assert tuple(reference.state_dict()) == tuple(fused.state_dict())
+
+
 # ---------------------------------------------------------------------------
 # The quantile value head.
 # ---------------------------------------------------------------------------
