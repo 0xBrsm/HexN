@@ -223,3 +223,17 @@ def test_freeze_reads_provenance_before_it_writes_the_run_directory(tmp_path, mo
     )
     assert seen["existed"] is False, "provenance ran after the directory appeared"
     assert out.meta["git_dirty"] is False
+
+
+def test_a_contract_9_run_frozen_before_decisions_were_grouped_is_refused(tmp_path):
+    """`c9_clip` fills a contract-8 manifest (contract 8 never reads it), but
+    no value reproduces a contract-9 run that credited every option alone."""
+    _frozen_ppo(tmp_path)
+    _drop(tmp_path, "ppo", "c9_clip")
+    assert run.load(tmp_path / "unit").meta["filled"] == {"c9_clip": "per-decision"}
+    nine = tmp_path / "nine"
+    nine.mkdir()
+    _frozen_ppo(nine, "--contract", "9", "--messages", "pooled")
+    _drop(nine, "ppo", "c9_clip")
+    with pytest.raises(SystemExit, match="c9_clip"):
+        run.load(nine / "unit")

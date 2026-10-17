@@ -1019,6 +1019,58 @@ class WorkerSpec:
     # (slightly) different behaviour policy, recorded exactly.
     trunk: str = "reference"
     precision: str = "fp32"
+    # The network contract (`hexn.selfplay.CONTRACTS`). Under "9" the worker
+    # builds `hexn.model9.HexNet` from `net9` (`hexn.model9.ModelConfig`'s
+    # fields bar width and rounds, which are this spec's own) and plays it
+    # with `hexn.policy9.NetworkPolicy9`, asked for whole decisions.
+    contract: str = "8"
+    net9: tuple[tuple[str, object], ...] = ()
+    # How a seven's discards are ordered (`hexset.gym.lanes.DISCARD_ORDERS`).
+    discard_order: str = "seat"
+
+
+def _build9(spec: WorkerSpec) -> tuple[list, Collector]:
+    """`_build` for a contract-9 shard: the learner on every seat, or beside
+    the scripted bots a mix names."""
+    from hexset.actions import space_for
+    from hexset.arena import deal_game
+
+    from .model9 import HexNet as HexNet9, ModelConfig as ModelConfig9
+    from .policy9 import NetworkPolicy9
+
+    unbuilt = {"learners": spec.learners > 1, "simulations": spec.simulations > 0, "fast_win": spec.fast_win,
+               "vp_reward": bool(spec.vp_reward), "outlook": spec.outlook, "trader": spec.trader is not None,
+               "pair_boards": spec.pair_boards, "precision": spec.precision != "fp32"}
+    if any(unbuilt.values()):
+        raise ValueError(f"not built for a contract-9 worker: {sorted(k for k, v in unbuilt.items() if v)}")
+    game = deal_game(spec.seed, 0, spec.players)
+    net = HexNet9(space_for(game), game._state.board.topology, spec.players,
+                  ModelConfig9(width=spec.width, rounds=spec.rounds, **dict(spec.net9)))
+    net.fused = spec.trunk == "fused"
+    policy = NetworkPolicy9(net.eval(), space_for(game), device="cpu",
+                            generator=torch.Generator().manual_seed(spec.torch_seed))
+    board = random_base_board(random.Random(spec.seed))
+    opponents = mix_opponents(spec.mix, seed=spec.seed, lanes=spec.lanes, parent=None, board=board,
+                              players=spec.players, device="cpu", torch_seed=spec.torch_seed)
+    collector = Collector(
+        policy,
+        lanes=spec.lanes,
+        fill=not spec.cohort,
+        players=spec.players,
+        seed=spec.seed,
+        action_cap=spec.action_cap,
+        max_offers=spec.max_offers,
+        first_game=spec.first_game,
+        stride=spec.stride,
+        opponents=opponents,
+        caster=mix_caster(spec.mix, spec.players, spec.seed) if spec.mix else None,
+        sample_stream=spec.sample_stream,
+        game_law=mix_deal(spec.mix, spec.players, spec.seed) if spec.mix else None,
+        coalition=mix_coalitions(spec.mix, spec.players, spec.seed) if spec.mix else None,
+        contract="9",
+        discard_order=spec.discard_order,
+    )
+    return [policy], collector
 
 
 def _build(spec: WorkerSpec) -> tuple[list[NetworkPolicy], Collector]:
@@ -1027,6 +1079,10 @@ def _build(spec: WorkerSpec) -> tuple[list[NetworkPolicy], Collector]:
     torch.set_num_threads(1)
     torch.manual_seed(spec.torch_seed)
     runtime.load(spec.runtime)
+    if spec.trunk not in TRUNKS:
+        raise ValueError(f"trunk must be one of {TRUNKS}, got {spec.trunk!r}")
+    if spec.contract == "9":
+        return _build9(spec)
 
     board = random_base_board(random.Random(spec.seed))
     topology = board.topology
@@ -1056,8 +1112,6 @@ def _build(spec: WorkerSpec) -> tuple[list[NetworkPolicy], Collector]:
     )
     policy.record_fast = spec.fast_win
     policy.vp_reward = spec.vp_reward
-    if spec.trunk not in TRUNKS:
-        raise ValueError(f"trunk must be one of {TRUNKS}, got {spec.trunk!r}")
     if spec.precision not in PRECISIONS:
         raise ValueError(f"precision must be one of {tuple(PRECISIONS)}, got {spec.precision!r}")
     net.fused = spec.trunk == "fused"
@@ -1191,6 +1245,7 @@ def _build(spec: WorkerSpec) -> tuple[list[NetworkPolicy], Collector]:
         pair_boards=spec.pair_boards,
         sample_stream=spec.sample_stream,
         outlook=spec.outlook,
+        discard_order=spec.discard_order,
         game_law=(
             mix_deal(spec.mix, spec.players, spec.seed, pair_boards=spec.pair_boards)
             if spec.learners <= 1 and spec.mix

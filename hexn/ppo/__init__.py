@@ -72,6 +72,7 @@ alongside and never differentiated.
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Iterator, Sequence
@@ -89,7 +90,7 @@ from ..policy import NetworkPolicy, masked_log_softmax
 if TYPE_CHECKING:
     from ..steps import Steps
 from ..rewards import points_lost_next, points_next_round, relative_points, win_loss
-from ..selfplay import Episode, Transition
+from ..selfplay import Episode, Transition, Transition9
 
 # Not a configurable. See the module docstring and `hexn.rewards`.
 GAMMA = 1.0
@@ -117,7 +118,14 @@ DECOUPLED_CAP = 2.0
 RATIO_LOG_CAP = 20.0
 
 # What the auxiliary margin head can learn (`PPOConfig.aux_target`).
-AUX_TARGETS = ("relative", "loss", "points", "outlook")
+AUX_TARGETS = ("relative", "loss", "points", "outlook", "zero_sum")
+
+# How a contract-9 decision's ratio is clipped (`PPOConfig.c9_clip`).
+C9_CLIPS = ("per-decision", "per-part")
+
+# Contract 9's clip gauge by decision length: lengths 1 .. CLIP_LENGTHS, the
+# last bucket holding every longer decision too (`Stats.clip_by_parts`).
+CLIP_LENGTHS = 6
 
 
 @dataclass(frozen=True)
@@ -262,6 +270,21 @@ class PPOConfig:
     # On fresh data the two policies are one and the update is plain PPO;
     # with `--async-collect` it keeps the trust region where the policy is.
     decoupled: bool = False
+    # The network contract the batch is in (`hexn.selfplay.CONTRACTS`). Under
+    # "9" a row is a whole decision (`hexn.selfplay.Transition9`): its
+    # log-probability and entropy are over every legal option of the decision
+    # (`hexn.model9.decision_scores`), and the auxiliary head is the points
+    # head, trained under `aux_target="zero_sum"`.
+    contract: str = "8"
+    # `aux_target="zero_sum"`'s per-round discount (`zero_sum_targets`).
+    zero_sum: float = 0.6
+    # Contract 9's clip (`C9_CLIPS`). A decision is a run of options, its
+    # log-probability the sum of its parts'. "per-decision": the ratio is the
+    # decision's, `exp(sum new - sum old)`, clipped once. "per-part": each
+    # part's conditional ratio is clipped on its own, every part weighted by
+    # the decision's advantage, and the parts' surrogates summed; the same
+    # gradient on-policy, a tighter trust region over a long run.
+    c9_clip: str = "per-decision"
 
     def __post_init__(self) -> None:
         if self.amp not in ("", "fp16"):
@@ -321,6 +344,27 @@ class PPOConfig:
             )
         if self.prior_kl < 0.0:
             raise ValueError(f"prior_kl cannot be negative, got {self.prior_kl}")
+        if self.contract not in ("8", "9"):
+            raise ValueError(f"unknown contract {self.contract!r}")
+        if self.c9_clip not in C9_CLIPS:
+            raise ValueError(f"unknown c9_clip {self.c9_clip!r}: {C9_CLIPS}")
+        if not 0.0 < self.zero_sum <= 1.0:
+            raise ValueError(f"zero_sum discounts a round by a factor in (0, 1], got {self.zero_sum}")
+        if self.aux_target == "zero_sum" and self.contract != "9":
+            raise ValueError("aux_target 'zero_sum' trains contract 9's points head")
+        if self.contract == "9":
+            if self.aux_target != "zero_sum" and self.aux_margin_weight:
+                raise ValueError("a contract-9 net's one auxiliary head is the points head: aux_target 'zero_sum'")
+            # What the contract-9 batch is not built for: each is a field of
+            # contract 8's own rows (a prior's full log-softmax row, a phase
+            # read off the observation, a margin head) or of `assemble`.
+            unbuilt = {
+                "prior_kl": self.prior_kl > 0, "fast_win": bool(self.fast_win), "vp_reward": bool(self.vp_reward),
+                "pair_baseline": self.pair_baseline, "decided_cut": bool(self.decided_cut),
+                "setup_weight": self.setup_weight != 1, "critic": self.critic != "gae",
+            }
+            if any(unbuilt.values()):
+                raise ValueError(f"not built for contract 9: {sorted(k for k, v in unbuilt.items() if v)}")
 
 
 
@@ -345,6 +389,36 @@ def outlook_row(outlook: Sequence[float], seat: int, seats: int) -> np.ndarray:
     if len(outlook) != seats:
         raise ValueError(f"an outlook label has {len(outlook)} seats, the game {seats}")
     return np.roll(np.asarray(outlook, dtype=np.float32), -seat)
+
+def zero_sum_targets(
+    steps: np.ndarray, turns: np.ndarray, seat_points: np.ndarray, final: Sequence[int], gamma: float
+) -> np.ndarray:
+    """`(decisions, seats)`, board order, one row per decision in the order
+    given: every seat's later changes in its relative points (its points less
+    the mean of the others'), each weighted `gamma ** r` with `r` the rounds
+    (`(turns[u] - turns[t]) // seats`) from the decision `t` to the decision
+    `u` it changed in, summed to the game's end. Each row sums to zero over
+    seats. The points head's target (`aux_target="zero_sum"`).
+
+    `seat_points` is every seat's true points at each decision
+    (`Transition9.seat_points`), `turns` the turn count then, `final` the
+    game's last points. A change between two decisions is the earlier one's:
+    the turn count moves only at an end of turn, which changes no points, so
+    over a game in which every decision is recorded this is the target each
+    move's own replay gives."""
+    order = np.argsort(steps, kind="stable")
+    seats = seat_points.shape[1]
+    points = np.concatenate([seat_points[order], np.asarray(final, dtype=np.float64)[None]]).astype(np.float64)
+    relative = points - (points.sum(1, keepdims=True) - points) / (seats - 1)
+    change = relative[1:] - relative[:-1]
+    clock = np.asarray(turns, dtype=np.int64)[order]
+    rounds = (clock[None, :] - clock[:, None]) // seats
+    weights = np.where(np.arange(len(clock))[None, :] >= np.arange(len(clock))[:, None],
+                       gamma ** np.maximum(rounds, 0), 0.0)
+    out = np.empty((len(clock), seats), dtype=np.float32)
+    out[order] = weights @ change
+    return out
+
 
 @dataclass(frozen=True)
 class Stats:
@@ -419,6 +493,14 @@ class Stats:
     # in the scaled gradients), and its scale when the update finished.
     amp_skipped: int = 0
     amp_scale: float = 0.0
+    # Contract 9: the decisions the update drew its minibatches from
+    # (`positions` counts their parts), and the clip fraction by decision
+    # length, every minibatch of every epoch, as `{"1": {"decisions": n,
+    # "parts": m, "decision": fraction, "part": fraction}, ..., "6+": ...}`:
+    # the share of decisions whose summed ratio left the clip range and the
+    # share of parts whose own did, whichever `c9_clip` the update used.
+    decisions: int = 0
+    clip_by_parts: dict = dataclasses.field(default_factory=dict)
 
 
 def win_round(outcome, players: int) -> int:
@@ -496,36 +578,65 @@ class Batch:
     # The learner's own log-probability of each chosen action when the update
     # starts, for `PPOConfig.decoupled`. `None` unless `attach_proximal` filled it.
     prox_log_prob: Tensor | None = None
+    # Contract 9 (`prepare_columns9`). A row is one part of a decision (a run
+    # of options, `hexset.decisions.closes`), and decision `d`'s parts are rows
+    # `dec_off[d]:dec_off[d + 1]`. Per row: `mask` the part's flat block,
+    # `chosen` the index of the option taken within its `kind`
+    # (`hexset.decisions.DecisionKind`), `log_prob` and `prox_log_prob` the
+    # part's conditional log-probability; `setup` the setup masks of the rows
+    # with one, `setup_row` each row's index there (-1 for none); `rb`/`disc`
+    # the Road Building and discard candidates end to end, row `r`'s at
+    # `rb_off[r]:rb_off[r + 1]` (`decision_rows` gathers a minibatch's). Per
+    # decision: `advantage`, `value_target` and `margin_target` (the points
+    # head's under `aux_target="zero_sum"`), read at its first part's
+    # position, the only one a value row is taken at. All `None` under
+    # contract 8.
+    kind: Tensor | None = None
+    setup: Tensor | None = None
+    setup_row: Tensor | None = None
+    rb: Tensor | None = None
+    rb_off: Tensor | None = None
+    disc: Tensor | None = None
+    disc_off: Tensor | None = None
+    dec_off: Tensor | None = None
 
     def __len__(self) -> int:
         return self.buffer.shape[0]
 
+    def units(self) -> int:
+        """What a minibatch draws: rows, or a contract-9 batch's decisions."""
+        return len(self) if self.dec_off is None else len(self.dec_off) - 1
+
     def to(self, device: torch.device | str) -> "Batch":
-        return Batch(
-            **{
-                name: getattr(self, name).to(device)
-                for name in (
-                    "buffer",
-                    "mask",
-                    "chosen",
-                    "log_prob",
-                    "advantage",
-                    "value_target",
-                    "margin_target",
-                )
-            },
-            prior_log_probs=(
-                None
-                if self.prior_log_probs is None
-                else self.prior_log_probs.to(device)
-            ),
-            fast_target=(
-                None if self.fast_target is None else self.fast_target.to(device)
-            ),
-            prox_log_prob=(
-                None if self.prox_log_prob is None else self.prox_log_prob.to(device)
-            ),
-        )
+        return Batch(**{
+            field.name: None if (value := getattr(self, field.name)) is None else value.to(device)
+            for field in dataclasses.fields(self)
+        })
+
+
+def decision_rows(batch: Batch, rows: Tensor, device: torch.device | str) -> dict[str, Tensor]:
+    """The contract-9 decisions of `rows` of `batch` as `hexn.model9.collate`
+    states a batch (`NetworkPolicy9.evaluate`'s `decisions`): the setup masks
+    and the ragged candidates gathered by each row's offsets, each candidate
+    beside its position in `rows` and its index within its own row."""
+    rows = rows.to(batch.kind.device)
+    out = {"tkind": batch.kind[rows]}
+    at = batch.setup_row[rows]
+    setup = torch.zeros(len(rows), batch.setup.shape[1], dtype=torch.bool, device=rows.device)
+    has = at >= 0
+    setup[has] = batch.setup[at[has]]
+    out["setup"] = setup
+    for name in ("rb", "disc"):
+        values, offsets = getattr(batch, name), getattr(batch, f"{name}_off")
+        starts = offsets[rows]
+        lengths = offsets[rows + 1] - starts
+        position = torch.repeat_interleave(torch.arange(len(rows), device=rows.device), lengths)
+        within = torch.arange(len(position), device=rows.device) - torch.repeat_interleave(
+            lengths.cumsum(0) - lengths, lengths)
+        out[name] = values[starts[position] + within].long()
+        out[f"{name}_row"] = position
+        out[f"{name}_index"] = within
+    return {k: v.to(device) for k, v in out.items()}
 
 
 def autocast(device: torch.device | str, amp: str):
@@ -552,6 +663,8 @@ def attach_prior(
     `PPOConfig.amp`: the prior's forward runs under the same autocast as the
     update's, its logits back in fp32 before the log-softmax.
     """
+    if getattr(batch, "kind", None) is not None:
+        raise ValueError("a prior's divergence is not built for contract 9")
     if prior.layout != layout:
         raise ValueError("the prior packs positions differently from the batch")
     rows = []
@@ -578,11 +691,14 @@ def attach_proximal(
     with torch.no_grad():
         for start in range(0, len(batch), chunk):
             take = slice(start, start + chunk)
+            extra = () if getattr(batch, "kind", None) is None else (
+                decision_rows(batch, torch.arange(start, min(start + chunk, len(batch))), policy.device),)
             with autocast(policy.device, amp):
                 evaluation = policy.evaluate(
                     batch.buffer[take].to(policy.device),
                     batch.mask[take].to(policy.device),
                     batch.chosen[take].to(policy.device),
+                    *extra,
                 )
             rows.append(evaluation.log_prob.float().to(batch.buffer.device))
     return replace(batch, prox_log_prob=torch.cat(rows))
@@ -671,6 +787,8 @@ def assemble(
     the value head is never bootstrapped, so there is nothing to learn from a
     partial trajectory. `Collector.collect` returns exactly the finished ones.
     """
+    if any(isinstance(t, Transition9) for e in episodes for seat in e.trajectories for t in seat):
+        raise ValueError("a contract-9 collection is assembled from its columns (hexn.ppo.prepare)")
     observations = []
     masks: list[np.ndarray] = []
     chosen: list[int] = []
@@ -935,6 +1053,133 @@ class Terms:
     prior_kl: Tensor | None = None
     # The fast-win head's cross-entropy, detached; `None` without a target.
     fast_loss: Tensor | None = None
+    # Contract 9: `(4, CLIP_LENGTHS)` counts by decision length, summed, not
+    # averaged: decisions, decisions whose summed ratio left the clip range,
+    # parts, parts whose own ratio did (`Stats.clip_by_parts`).
+    clip_by_parts: Tensor | None = None
+
+
+def decision_surrogate(
+    log_prob: Tensor, anchor: Tensor, old: Tensor, owner: Tensor, count: int, advantage: Tensor,
+    config: PPOConfig, decoupled: bool,
+) -> Tensor:
+    """Each contract-9 decision's clipped surrogate, `(count,)`, from its
+    parts' log-probabilities: `log_prob` the learner's, `anchor` the
+    proximal's (the behaviour policy's without decoupling), `old` the
+    behaviour policy's, `owner` each part's decision. Under
+    `c9_clip="per-decision"` the ratio is the decision's, the exponent of its
+    parts' summed log-ratios, clipped once, and under decoupling weighted by
+    the decision's proximal-to-behaviour ratio; under "per-part" each part's
+    ratio is clipped and weighted on its own, with the decision's advantage,
+    and the parts' terms are summed."""
+    def by_decision(x: Tensor) -> Tensor:
+        return x.new_zeros(count).index_add(0, owner, x)
+
+    low, high = 1 - config.clip, 1 + config.clip
+    if config.c9_clip == "per-decision":
+        ratio = (by_decision(log_prob) - by_decision(anchor)).clamp(max=RATIO_LOG_CAP).exp()
+        surrogate = torch.min(ratio * advantage, ratio.clamp(low, high) * advantage)
+        if decoupled:
+            surrogate = (by_decision(anchor) - by_decision(old)).exp().clamp(max=DECOUPLED_CAP).detach() * surrogate
+        return surrogate
+    ratio = (log_prob - anchor).clamp(max=RATIO_LOG_CAP).exp()
+    shared = advantage[owner]
+    surrogate = torch.min(ratio * shared, ratio.clamp(low, high) * shared)
+    if decoupled:
+        surrogate = (anchor - old).exp().clamp(max=DECOUPLED_CAP).detach() * surrogate
+    return by_decision(surrogate)
+
+
+def decision_terms(
+    policy,
+    buffer: Tensor,
+    mask: Tensor,
+    chosen: Tensor,
+    decisions: dict[str, Tensor],
+    old_log_prob: Tensor,
+    prox_log_prob: Tensor | None,
+    owner: Tensor,
+    heads: Tensor,
+    lengths: Tensor,
+    advantage: Tensor,
+    value_target: Tensor,
+    margin_target: Tensor,
+    config: PPOConfig,
+) -> Terms:
+    """`minibatch_terms` for contract 9, whose unit is a decision, a run of
+    options (`hexset.decisions.closes`): the minibatch's parts are rows
+    (`buffer` .. `prox_log_prob`, one forward each, `owner` each part's
+    decision), `advantage` (normalised), `value_target` and `margin_target`
+    are the decisions', and `heads` each decision's first part, the one row
+    the win and points heads are trained on. A decision's log-probability and
+    entropy are its parts' sums; the surrogate is `decision_surrogate`'s. Every
+    mean is over decisions."""
+    evaluation = policy.evaluate(buffer, mask, chosen, decisions)
+    count = len(lengths)
+
+    def by_decision(x: Tensor) -> Tensor:
+        return x.new_zeros(count).index_add(0, owner, x)
+
+    anchor = old_log_prob if prox_log_prob is None else prox_log_prob
+    surrogate = decision_surrogate(evaluation.log_prob, anchor, old_log_prob, owner, count, advantage, config,
+                                   prox_log_prob is not None)
+    policy_loss = -surrogate.mean()
+    value_logits = evaluation.value_logits[heads]
+    value_loss = -(value_target * torch.log_softmax(value_logits, dim=-1)).sum(-1).mean()
+    value = evaluation.value[heads]
+    with torch.no_grad():
+        value_mse = (value - value_target).pow(2).mean()
+    if config.aux_target == "zero_sum":
+        if evaluation.points is None:
+            raise ValueError("aux_target 'zero_sum' trains the points head; this net has none")
+        margin_loss = (evaluation.points[heads] - margin_target).pow(2).mean()
+    else:
+        margin_loss = advantage.new_zeros(())
+    margin_term = config.aux_margin_weight * margin_loss
+    entropy = by_decision(evaluation.entropy).mean()
+    value_term = config.value_coefficient * value_loss
+    loss = policy_loss + value_term + margin_term - config.entropy_coefficient * entropy
+    with torch.no_grad():
+        log_ratio = by_decision(evaluation.log_prob) - by_decision(anchor)
+        kl = (torch.expm1(log_ratio) - log_ratio).mean()
+        decision_out = (log_ratio.exp() - 1).abs().gt(config.clip)
+        part_out = ((evaluation.log_prob - anchor).exp() - 1).abs().gt(config.clip)
+        clipped = (decision_out if config.c9_clip == "per-decision" else part_out).float().mean()
+        bucket = lengths.clamp(max=CLIP_LENGTHS) - 1
+        tally = torch.zeros(4, CLIP_LENGTHS, device=lengths.device)
+        tally[0].index_add_(0, bucket, torch.ones_like(bucket, dtype=tally.dtype))
+        tally[1].index_add_(0, bucket, decision_out.to(tally.dtype))
+        tally[2].index_add_(0, bucket, lengths.to(tally.dtype))
+        tally[3].index_add_(0, bucket[owner], part_out.to(tally.dtype))
+    return Terms(
+        loss=loss,
+        value=value.detach(),
+        policy_term=policy_loss,
+        value_term=value_term,
+        entropy_term=-config.entropy_coefficient * entropy,
+        margin_term=margin_term,
+        policy_loss=policy_loss.detach(),
+        value_loss=value_loss.detach(),
+        value_mse=value_mse.detach(),
+        margin_loss=margin_loss.detach(),
+        entropy=entropy.detach(),
+        approx_kl=kl,
+        clip_fraction=clipped,
+        clip_by_parts=tally,
+    )
+
+
+def decision_parts(dec_off: Tensor, decisions: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """The parts of `decisions` (indices into a contract-9 batch's
+    decisions): their rows in order, each part's position among `decisions`,
+    each decision's first part's position among those rows, and each
+    decision's length."""
+    starts = dec_off[decisions]
+    lengths = dec_off[decisions + 1] - starts
+    owner = torch.repeat_interleave(torch.arange(len(decisions), device=decisions.device), lengths)
+    heads = lengths.cumsum(0) - lengths
+    rows = starts[owner] + torch.arange(len(owner), device=decisions.device) - heads[owner]
+    return rows, owner, heads, lengths
 
 
 def minibatch_terms(
@@ -950,6 +1195,7 @@ def minibatch_terms(
     prior_log_probs: Tensor | None = None,
     fast_target: Tensor | None = None,
     prox_log_prob: Tensor | None = None,
+    decisions: dict[str, Tensor] | None = None,
 ) -> Terms:
     """The clipped surrogate, win-head loss, auxiliary margin loss and
     entropy for one minibatch -- plus, when `prior_log_probs` is given, the
@@ -958,9 +1204,13 @@ def minibatch_terms(
 
     `advantage` arrives already normalised — the caller owns that, because a
     sharded worker only holds a slice of the minibatch and cannot compute the
-    minibatch's own mean and std.
+    minibatch's own mean and std. `decisions` carries a contract-9 batch's
+    decisions (`decision_rows`) to its policy's `evaluate`.
     """
-    evaluation = policy.evaluate(buffer, mask, chosen)
+    if decisions is None:
+        evaluation = policy.evaluate(buffer, mask, chosen)
+    else:
+        evaluation = policy.evaluate(buffer, mask, chosen, decisions)
     # Decoupled PPO: the ratio and its clip are taken against the proximal
     # policy, and the behaviour weight (no gradient) stands in for the games'
     # having been played by an older one. Without `prox_log_prob` the anchor is
@@ -1007,7 +1257,17 @@ def minibatch_terms(
         value_loss_total = value_loss + fast_loss
     else:
         value_loss_total = value_loss
-    if config.aux_target == "loss":
+    if config.aux_target == "zero_sum":
+        # Contract 9's points head, every seat, the decider first, by squared
+        # error (`zero_sum_targets`).
+        if evaluation.points is None:
+            raise ValueError("aux_target 'zero_sum' trains the points head; this net has none")
+        margin_loss = (evaluation.points - margin_target).pow(2).mean()
+    elif evaluation.margin is None:
+        # A net without a margin head (contract 9 with no points target):
+        # nothing to train, and `aux_margin_weight` is 0 (`PPOConfig`).
+        margin_loss = advantage.new_zeros(())
+    elif config.aux_target == "loss":
         # The own slot only: the logit that this seat loses points before it
         # acts again after this turn, positives weighted up (`aux_pos_weight`).
         margin_loss = F.binary_cross_entropy_with_logits(
@@ -1112,6 +1372,20 @@ def _stack_mean(values: Sequence[Tensor]) -> float:
     return float(torch.stack(list(values)).double().mean())
 
 
+def _clip_by_parts(tallies: Sequence[Tensor]) -> dict:
+    """`Stats.clip_by_parts` from an update's `Terms.clip_by_parts`, read back once."""
+    if not tallies:
+        return {}
+    decisions, out_d, parts, out_p = torch.stack(list(tallies)).double().sum(0).cpu().tolist()
+    out = {}
+    for k in range(CLIP_LENGTHS):
+        if decisions[k]:
+            name = f"{k + 1}+" if k == CLIP_LENGTHS - 1 else str(k + 1)
+            out[name] = {"decisions": int(decisions[k]), "parts": int(parts[k]),
+                         "decision": out_d[k] / decisions[k], "part": out_p[k] / parts[k]}
+    return out
+
+
 def _stack_median(values: Sequence[Tensor]) -> float:
     """`np.median`'s linear-interpolation convention, over device tensors read
     back once. `torch.quantile(0.5)` uses the same interpolation numpy's
@@ -1142,6 +1416,8 @@ def _terms_for(
     and on the policy's device. The rows are gathered where the batch lives
     and moved to the device (a no-op when the batch is already there)."""
     device = policy.device
+    if batch.dec_off is not None:
+        return _decision_terms_for(policy, batch, rows, advantage, config)
 
     def take(field: Tensor | None) -> Tensor | None:
         return None if field is None else field[rows].to(device)
@@ -1160,6 +1436,25 @@ def _terms_for(
             prior_log_probs=take(batch.prior_log_probs),
             fast_target=take(batch.fast_target),
             prox_log_prob=take(batch.prox_log_prob),
+            decisions=None if getattr(batch, "kind", None) is None else decision_rows(batch, rows, device),
+        )
+
+
+def _decision_terms_for(policy, batch: Batch, decisions: Tensor, advantage: Tensor, config: PPOConfig) -> Terms:
+    """`_terms_for` on a contract-9 batch: `decisions` are its decisions,
+    gathered with their parts."""
+    device = policy.device
+    rows, owner, heads, lengths = decision_parts(batch.dec_off, decisions)
+
+    def take(field: Tensor | None) -> Tensor | None:
+        return None if field is None else field[rows].to(device)
+
+    with autocast(device, config.amp):
+        return decision_terms(
+            policy, take(batch.buffer), take(batch.mask), take(batch.chosen), decision_rows(batch, rows, device),
+            take(batch.log_prob), take(batch.prox_log_prob), owner.to(device), heads.to(device),
+            lengths.to(device), advantage, batch.value_target[decisions].to(device),
+            batch.margin_target[decisions].to(device), config,
         )
 
 
@@ -1200,7 +1495,10 @@ def _accumulate(
                 got = share * got.detach()
                 sums[field] = got if start == 0 else sums[field] + got
         values.append(terms.value)
-    return Terms(value=torch.cat(values), **sums)
+        if terms.clip_by_parts is not None:
+            tally = terms.clip_by_parts if start == 0 else tally + terms.clip_by_parts
+    return Terms(value=torch.cat(values), **sums,
+                 clip_by_parts=tally if batch.dec_off is not None else None)
 
 
 # Every `Terms` field but `value`: the row means `_accumulate` weights by share.
@@ -1249,7 +1547,8 @@ def update(
     # is used, so the device holds one slice rather than the whole batch.
     if not (config.micro_batch and config.micro_batch < config.minibatch):
         batch = batch.to(policy.device)
-    size = len(batch)
+    # A contract-9 minibatch draws whole decisions, `config.minibatch` of them.
+    size = batch.units()
 
     # Every per-step gauge, as device tensors read back once at the end, in
     # one dict so a step file can carry them (`hexn.steps`).
@@ -1258,7 +1557,7 @@ def update(
         for name in (
             "policy_losses", "value_losses", "entropies", "kls", "clipped",
             "value_mses", "margin_losses", "prior_kls", "fast_losses",
-            "grad_norms", "epoch_kls", "epoch_clips",
+            "grad_norms", "epoch_kls", "epoch_clips", "clip_tallies",
         )
     }
     g["variance"] = None
@@ -1324,6 +1623,8 @@ def update(
             g["clipped"].append(terms.clip_fraction)
             g["epoch_kls"][epoch].append(terms.approx_kl)
             g["epoch_clips"][epoch].append(terms.clip_fraction)
+            if terms.clip_by_parts is not None:
+                g.setdefault("clip_tallies", []).append(terms.clip_by_parts)
             g["variance"] = (terms.value, rows)
             cursor.stepped()
 
@@ -1351,7 +1652,9 @@ def update(
             )
 
     return Stats(
-        positions=size,
+        positions=len(batch),
+        decisions=size if batch.dec_off is not None else 0,
+        clip_by_parts=_clip_by_parts(g.get("clip_tallies") or []),
         policy_loss=_stack_mean(g["policy_losses"]),
         value_loss=_stack_mean(g["value_losses"]),
         entropy=_stack_mean(g["entropies"]),

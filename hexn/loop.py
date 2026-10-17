@@ -436,6 +436,53 @@ def add_head_flags(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_net9_flags(parser: argparse.ArgumentParser) -> None:
+    """The contract and contract 9's architecture (`hexn.model9.ModelConfig`
+    bar width and rounds, which `--width`/`--rounds` give), under the names
+    `net9_config` reads them by. Inert under contract 8."""
+    parser.add_argument(
+        "--contract",
+        choices=("8", "9"),
+        default="8",
+        help="the network contract: 8, hexn.model.HexNet on hexset.encoding and one action a decision; 9, "
+        "hexn.model9.HexNet on hexset.contract9, asked for whole decisions (hexset.decisions)",
+    )
+    parser.add_argument("--heads", choices=("linear", "mlp"), default="linear",
+                        help="contract 9: every head one linear layer, or each with a hidden layer")
+    parser.add_argument("--discard-head", choices=("linear", "mlp"), default="mlp",
+                        help="contract 9: the discard head's shape apart from the others")
+    parser.add_argument("--norm", action=argparse.BooleanOptionalAction, default=True,
+                        help="contract 9: LayerNorm before each round's update and before the heads")
+    parser.add_argument("--messages", choices=("separate", "pooled"), default="separate",
+                        help="contract 9: each message a token reads its own input, or a kind's pooled into one")
+    parser.add_argument("--attention", action=argparse.BooleanOptionalAction, default=True,
+                        help="contract 9: one attention over the seat tokens each round")
+    parser.add_argument("--points-head", action=argparse.BooleanOptionalAction, default=False,
+                        help="contract 9: the points head beside the win head (trained under "
+                        "--aux-target zero_sum at --aux-margin-weight)")
+
+
+def net9_config(args) -> dict:
+    """`hexn.model9.ModelConfig`'s fields bar width and rounds, from the flags
+    `add_net9_flags` adds. Self-play chooses the snake seat's double turn as
+    two setup turns (`double_turn="parts"`), so a checkpoint it saves is read
+    the same way by `hexn.netbot.load`."""
+    return {"heads": args.heads, "discard": args.discard_head, "norm": bool(args.norm),
+            "messages": args.messages, "attention": bool(args.attention), "points": bool(args.points_head),
+            "double_turn": "parts"}
+
+
+def model_record(policy) -> dict:
+    """What a checkpoint carries beside `args` for `hexn.netbot.load` to
+    rebuild its net: a contract-9 net's `model_config`, nothing for contract 8
+    (whose shape `args` records)."""
+    if getattr(policy.net, "CONTRACT", "8") != "9":
+        return {}
+    from dataclasses import asdict
+
+    return {"model_config": {**asdict(policy.net.config), "contract": "9"}}
+
+
 def resolve_fused(args) -> bool:
     """`--fused` as the run uses it: the flag when given, else on for a GPU
     device. A frozen config from before the default (`false`, or no key at all)
@@ -452,6 +499,16 @@ def build(args) -> tuple[NetworkPolicy, torch.optim.Optimizer, object]:
     game = start(board, args.players, rng)
     space = space_for(game)
     graph = static_graph(board.topology)
+    if str(getattr(args, "contract", "8")) == "9":
+        from .model9 import HexNet as HexNet9, ModelConfig as ModelConfig9
+        from .policy9 import NetworkPolicy9
+
+        torch.manual_seed(args.seed)
+        net9 = HexNet9(space, board.topology, args.players,
+                       ModelConfig9(width=args.width, rounds=args.rounds, **net9_config(args))).to(args.device)
+        net9.fused = resolve_fused(args)
+        optimiser = adam(net9.parameters(), lr=args.learning_rate, eps=getattr(args, "adam_eps", ADAM_EPS))
+        return NetworkPolicy9(net9, space, device=args.device), optimiser, space
 
     torch.manual_seed(args.seed)
     # `getattr` on the head shapes for the same reason `adam_eps` uses it below:

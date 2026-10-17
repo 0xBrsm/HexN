@@ -922,3 +922,105 @@ def test_a_config_frozen_before_the_defaults_keeps_its_values():
                           collect_workers=26, update_workers=0)
     ppo_main.resolve_defaults(new)
     assert (new.fused, new.amp, new.async_collect, new.decoupled) == (True, "fp16", True, True)
+
+
+# --- contract 9 -------------------------------------------------------------------------
+
+C9 = ["--contract", "9", "--messages", "pooled", "--no-attention", "--points-head", "--aux-target", "zero_sum",
+      "--aux-margin-weight", "0.1", "--action-cap", "400"]
+
+
+def test_a_contract_9_init_from_a_joint_checkpoint_drops_the_joint_head(tmp_path, capsys):
+    """A contract-9 BC checkpoint ("joint") carries the double turn's first,
+    second and pair heads; the net PPO trains ("parts") has none. `--init`
+    drops them, says so, and the run's checkpoints carry no such key."""
+    from hexn.model9 import JOINT_HEADS, config_of, without_joint_head
+
+    # A "parts" run of the shape below, to learn the net's shape, then a
+    # "joint" checkpoint of that shape as a BC trainer would write it.
+    source = tmp_path / "source"
+    assert run(source, 1, C9 + ["--checkpoint-every", "1", "--seed", "5"]) == 0
+    state = torch.load(source / "latest.pt", weights_only=False)
+    assert state["model_config"]["double_turn"] == "parts"
+    assert not any(k.startswith(JOINT_HEADS) for k in state["net"])
+    from hexset.arena import deal_game
+    from hexn.model9 import HexNet as HexNet9
+    from hexset.actions import build_space
+
+    game = deal_game(0, 0, 4)
+    topology = game._state.board.topology
+    space = build_space(topology.num_vertices, topology.num_edges, topology.num_hexes, 4)
+    torch.manual_seed(7)
+    joint = HexNet9(space, topology, 4, config_of({**state["model_config"], "double_turn": "joint"}))
+    assert any(k.startswith(JOINT_HEADS) for k in joint.state_dict())
+    bc = source / "bc.pt"
+    torch.save({"net": joint.state_dict(), "args": state["args"],
+                "model_config": {**state["model_config"], "double_turn": "joint"}}, bc)
+
+    warm = tmp_path / "warm"
+    assert run(warm, 1, C9 + ["--checkpoint-every", "1", "--learning-rate", "0", "--init", str(bc)]) == 0
+    assert "dropped the joint double-turn head from --init" in capsys.readouterr().err
+    seeded = torch.load(warm / "latest.pt", weights_only=False)["net"]
+    kept, dropped = without_joint_head(joint.state_dict())
+    assert dropped == 2 * (2 * state["model_config"]["width"] + 1) + state["model_config"]["width"] ** 2
+    assert set(seeded) == set(kept) and all(torch.equal(seeded[k], v) for k, v in kept.items())
+
+
+def test_a_contract_9_run_trains_its_points_head_and_saves_what_netbot_loads(tmp_path):
+    assert run(tmp_path, 2, C9 + ["--keep-every", "1"]) == 0
+    lines = [json.loads(line) for line in (tmp_path / "log.jsonl").read_text().splitlines()]
+    assert [line["iteration"] for line in lines] == [0, 1]
+    assert all(line["positions"] > 0 and line["margin_loss"] > 0 for line in lines)
+    assert all(line["decisions"] < line["positions"] and line["clip_by_parts"] for line in lines)
+    state = torch.load(tmp_path / "latest.pt", weights_only=False)
+    assert state["model_config"]["contract"] == "9" and state["model_config"]["points"] is True
+    # Self-play chose the double turn as two setup turns, and the checkpoint reads it so.
+    assert state["model_config"]["double_turn"] == "parts"
+    from hexset.arena import deal_game
+    from hexn import netbot
+    from hexn.policy9 import Policy9
+
+    game = deal_game(0, 0, 4)
+    loaded = netbot.load(str(tmp_path / "latest.pt"), game._state.board.topology)
+    assert isinstance(loaded.policy, Policy9) and loaded.iteration == 2
+    assert loaded.policy.net.config.double_turn == "parts"
+    trained = loaded.policy.net.state_dict()
+    assert all(torch.equal(trained[k], v) for k, v in state["net"].items())
+
+
+def test_a_contract_9_run_collects_in_workers_ahead_of_its_update(tmp_path):
+    """Two workers, async, decoupled: the full-speed shape, small."""
+    flags = C9 + ["--collect-workers", "2", "--lanes", "2", "--games-per-iteration", "2", "--async-collect",
+                  "--decoupled", "--collect-trunk", "fused"]
+    assert run(tmp_path, 2, flags) == 0
+    lines = [json.loads(line) for line in (tmp_path / "log.jsonl").read_text().splitlines()]
+    assert [line["games"] for line in lines] == [2, 4]
+    assert lines[0]["staleness_kl"] < 1e-9 < lines[1]["staleness_kl"]
+
+
+def test_a_contract_9_run_clips_each_part_on_request(tmp_path):
+    assert run(tmp_path, 1, C9 + ["--c9-clip", "per-part"]) == 0
+    line = json.loads((tmp_path / "log.jsonl").read_text().splitlines()[0])
+    assert line["clip_by_parts"]["1"]["parts"] == line["clip_by_parts"]["1"]["decisions"]
+    config = json.loads((tmp_path / "config" / "ppo.json").read_text())
+    assert config["c9_clip"] == "per-part"
+
+
+def test_a_contract_9_init_without_a_points_head_starts_the_head_fresh(tmp_path):
+    source = tmp_path / "source"
+    without = [flag for flag in C9 if flag not in ("--points-head", "zero_sum", "--aux-target", "0.1",
+                                                     "--aux-margin-weight")]
+    assert run(source, 1, without) == 0
+    warm = tmp_path / "warm"
+    assert run(warm, 1, C9 + ["--learning-rate", "0", "--init", str(source / "latest.pt")]) == 0
+    given, started = _weights(source / "latest.pt"), _weights(warm / "iter-00000.pt")
+    assert all(torch.equal(started[k], given[k]) for k in given)
+    assert any(k.startswith("points_head.") for k in started)
+    with pytest.raises(RuntimeError):
+        run(tmp_path / "other", 1, C9 + ["--attention", "--init", str(source / "latest.pt")])
+
+
+@pytest.mark.parametrize("flags", [["--eval-every", "1"], ["--parent", "x.pt"], ["--search-rung", "rehex"]])
+def test_a_contract_9_run_refuses_what_it_is_not_built_for(tmp_path, flags):
+    with pytest.raises(SystemExit):
+        run(tmp_path, 1, C9 + flags)

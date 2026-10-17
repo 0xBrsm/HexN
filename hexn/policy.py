@@ -98,18 +98,24 @@ PRECISIONS = {"fp32": None, "bf16": torch.bfloat16}
 _GOLDEN64 = np.uint64(0x9E3779B97F4A7C15)
 
 
-def keyed_gumbel(keys: Sequence[int], width: int) -> np.ndarray:
+def keyed_gumbel(keys: Sequence[int], width: int, start: int = 0) -> np.ndarray:
     """`(len(keys), width)` standard Gumbel noise, each row a pure function of
-    its key (`hexn.selfplay.draw_key`) and each column of its slot.
+    its key (`hexn.selfplay.draw_key`) and each column of its slot, the
+    slots `start .. start + width - 1` (`keyed_gumbel_at`)."""
+    slots = np.arange(start, start + width, dtype=np.uint64)[None, :]
+    return keyed_gumbel_at(np.asarray(keys, dtype=np.uint64)[:, None], slots)
+
+
+def keyed_gumbel_at(keys: np.ndarray, slots: np.ndarray) -> np.ndarray:
+    """Standard Gumbel noise at each `(key, slot)` of two broadcast arrays,
+    each draw a pure function of its key and slot.
 
     splitmix64 over `key + (slot + 1) * golden`, the top 53 bits as a uniform
     in (0, 1), then -log(-log(u)). numpy's unsigned arithmetic wraps, which
     is the modular arithmetic the mixer is defined in. Float64 throughout, so
     the draw does not depend on the policy's own precision.
     """
-    x = np.asarray(keys, dtype=np.uint64)[:, None] + (
-        np.arange(1, width + 1, dtype=np.uint64)[None, :] * _GOLDEN64
-    )
+    x = np.asarray(keys, dtype=np.uint64) + (np.asarray(slots, dtype=np.uint64) + np.uint64(1)) * _GOLDEN64
     x = (x ^ (x >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
     x = (x ^ (x >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
     x = x ^ (x >> np.uint64(31))
@@ -145,6 +151,10 @@ class Evaluation:
     # The fast-win head's raw output (`Prediction.fast_logits`), `None` when
     # the net has none; `hexn.ppo`'s fast-win loss is its only reader.
     fast_logits: Tensor | None = None
+    # Contract 9's points head (`hexn.model9.Prediction.points`), per seat,
+    # the mover first; `None` for a net without one. `margin` is `None` for a
+    # contract-9 net, which has no margin head.
+    points: Tensor | None = None
 
 
 class NetworkPolicy:

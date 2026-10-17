@@ -29,7 +29,7 @@ from typing import Sequence
 import torch
 
 from ..selfplay import Episode
-from . import Batch, PPOConfig, assemble, fast_weight, stakes_gauges, win_round
+from . import Batch, PPOConfig, assemble, fast_weight, observation_dtype, stakes_gauges, win_round
 
 __all__ = [
     "Prepared",
@@ -40,6 +40,8 @@ __all__ = [
     "learner_final_vp",
     "prepare",
     "prepare_columns",
+    "prepare_columns9",
+    "prepare_games",
 ]
 
 # How often the helper looks for the cohort's last game file.
@@ -137,7 +139,17 @@ def prepare(
 ) -> tuple[Batch, dict, list[Episode]]:
     """A cohort's batch, the gauges that read its transitions, and the games
     with their transitions dropped. The trainer's assembly, in one place, so
-    the trainer and the helper cannot assemble differently."""
+    the trainer and the helper cannot assemble differently.
+
+    Contract-9 games are assembled from their columns (`prepare_columns9`):
+    they are encoded once more here (`hexn.gamefile`, exact), which only a
+    collector that hands back objects -- the in-process one -- pays for."""
+    if config.contract == "9":
+        from .. import gamefile
+
+        return prepare_columns9(
+            gamefile.decode_columns([gamefile.encode(e) for e in episodes], observation_dtype(config)), config, players
+        )
     batch = assemble(episodes, layout, config)
     gauges = {
         **(fast_win_gauges(episodes, config.fast_win, players) if config.fast_win else {}),
@@ -167,9 +179,12 @@ def prepare_columns(columns, layout, config: PPOConfig, players: int):
     from hexset.encoding import global_columns, to_frame
     from hexset.victory import relative_points
 
+    from .. import gamefile
     from ..rewards import points_lost_next, points_next_round, win_loss
     from . import SETUP_PHASES, advantages, outlook_row
 
+    if isinstance(columns, gamefile.Columns9):
+        return prepare_columns9(columns, config, players)
     if config.critic != "gae" or config.pair_baseline or config.fast_win or config.vp_reward:
         return None
     weighed = bool(config.decided_cut) or config.setup_weight != 1
@@ -314,6 +329,125 @@ def prepare_columns(columns, layout, config: PPOConfig, players: int):
         else {}
     )
     return batch, gauges, stripped
+
+
+def prepare_columns9(columns, config: PPOConfig, players: int):
+    """A contract-9 collection's batch from `hexn.gamefile.Columns9`, with
+    `prepare_columns`' arithmetic over decisions: a decision is a run of
+    options (`hexset.decisions.closes`), its rows the run's parts, each part
+    one row of the batch (`Batch.dec_off`). GAE runs per seat over its
+    decisions on the mover's win estimate recorded at each decision's first
+    part, and the one-hot winner is the win head's target there; a part past
+    the first carries no value row. Under `aux_target="zero_sum"` the points
+    head's target is `zero_sum_targets` in each decider's frame at the
+    decision's first part, which needs every move of the game recorded, so a
+    game with another policy seated is refused; any other target is zeros
+    (`PPOConfig` holds its weight at 0)."""
+    import numpy as np
+
+    from hexset.encoding import to_frame
+
+    from ..rewards import win_loss
+    from . import advantages, observation_dtype, zero_sum_targets
+
+    if config.contract != "9":
+        raise ValueError("contract-9 columns make a contract-9 batch")
+    zero_sum = config.aux_target == "zero_sum"
+    chosen, kinds, log_probs, advantage_blocks, targets, margins = [], [], [], [], [], []
+    lengths: list[int] = []
+    stripped = []
+    for game in columns.games:
+        fields = game["fields"]
+        outcome = fields["outcome"]
+        at = {name: i for i, name in enumerate(game["names"])}
+        rows = game["rows"]
+        wins = win_loss(outcome)
+        seats = len(wins)
+        if zero_sum and rows:
+            if any(pid != 0 for pid in fields.get("cast") or ()):
+                raise ValueError("aux_target 'zero_sum' needs every decision of a game recorded; "
+                                 f"game {fields['index']} seats another policy")
+            moved = zero_sum_targets(
+                np.asarray([row[at["step"]] for row in rows], dtype=np.int64),
+                np.asarray([row[at["turns"]] for row in rows], dtype=np.int64),
+                np.asarray([row[at["seat_points"]] for row in rows], dtype=np.float64).reshape(len(rows), seats),
+                outcome.points, config.zero_sum,
+            )
+        k = 0
+        for seat, count in enumerate(game["counts"]):
+            if not count:
+                continue
+            seat_rows = rows[k : k + count]
+            starts = _runs(seat_rows, at, fields["index"], seat)
+            heads = [seat_rows[i] for i in starts]
+            if not all(row[at["value"]] for row in heads):
+                raise ValueError(
+                    "a recorded transition has no value estimate; GAE cannot "
+                    "substitute one without silently corrupting the chain"
+                )
+            estimates = np.array([row[at["value"]][0] for row in heads], dtype=np.float32)
+            advantage_blocks.append(advantages(estimates, np.float32(to_frame(wins, seat)[0]), config.lam, None))
+            targets.append(np.repeat(np.asarray(to_frame(wins, seat), dtype=np.float32)[None], len(starts), axis=0))
+            margins.append(np.roll(moved[k + np.asarray(starts, dtype=np.int64)], -seat, axis=1) if zero_sum
+                           else np.zeros((len(starts), seats), dtype=np.float32))
+            lengths.extend(np.diff(np.asarray(starts + [count], dtype=np.int64)).tolist())
+            chosen.extend(row[at["index"]] for row in seat_rows)
+            kinds.extend(row[at["kind"]] for row in seat_rows)
+            log_probs.extend(row[at["log_prob"]] for row in seat_rows)
+            k += count
+        stripped.append(Episode(trajectories=(), **fields))
+    if not chosen:
+        raise ValueError("no transitions to learn from")
+    want = np.dtype(observation_dtype(config))
+    if columns.buffer.dtype == np.float16 and want != np.float16:
+        raise ValueError("float16 observations cannot make a float32 batch")
+    batch = Batch(
+        # Every row, in the columns' own order: the buffer itself.
+        buffer=torch.from_numpy(columns.buffer.astype(want, copy=False)),
+        mask=torch.from_numpy(columns.mask),
+        chosen=torch.tensor(chosen, dtype=torch.int64),
+        log_prob=torch.tensor(log_probs, dtype=torch.float32),
+        advantage=torch.from_numpy(np.concatenate(advantage_blocks)),
+        value_target=torch.from_numpy(np.concatenate(targets)),
+        margin_target=torch.from_numpy(np.ascontiguousarray(np.concatenate(margins))),
+        kind=torch.tensor(kinds, dtype=torch.int8),
+        setup=torch.from_numpy(columns.setup),
+        setup_row=torch.from_numpy(columns.setup_row),
+        rb=torch.from_numpy(columns.rb),
+        rb_off=torch.from_numpy(columns.rb_off),
+        disc=torch.from_numpy(columns.disc),
+        disc_off=torch.from_numpy(columns.disc_off),
+        dec_off=torch.from_numpy(np.concatenate([[0], np.cumsum(lengths)]).astype(np.int64)),
+    )
+    return batch, {}, stripped
+
+
+def _runs(seat_rows, at: dict, game: int, seat: int) -> list[int]:
+    """Where each decision of a seat's rows starts: a run of rows of one
+    `decision_id`, its parts numbered from 0 in order."""
+    starts, previous = [], None
+    for i, row in enumerate(seat_rows):
+        run, part = row[at["decision_id"]], row[at["part"]]
+        if run != previous:
+            starts.append(i)
+            previous = run
+        if part != i - starts[-1]:
+            raise ValueError(f"game {game} seat {seat}: decision {run}'s part {part} is row {i - starts[-1]} of it")
+    return starts
+
+
+def prepare_games(games: Sequence[bytes], dtype, layout, config: PPOConfig, players: int, coalition_plans=None):
+    """`prepare` from a cohort's encoded games, in game order: from their
+    columns where `prepare_columns` covers the configuration, else decoded."""
+    from .. import gamefile
+    from ..steps import by_index
+
+    ordered = sorted(games, key=gamefile.index_of)
+    if coalition_plans is None:
+        prepared = prepare_columns(gamefile.decode_columns(ordered, dtype), layout, config, players)
+        if prepared is not None:
+            return prepared
+    return prepare(by_index(gamefile.decode_all(ordered, dtype)), layout, config, players, coalition_plans)
 
 
 def _serve(layout, config, players, coalition_args, dtype, commands, results) -> None:

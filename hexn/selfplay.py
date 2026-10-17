@@ -42,6 +42,8 @@ from typing import TYPE_CHECKING, Callable, Iterator, Protocol, Sequence
 
 import numpy as np
 
+from hexset import contract9
+from hexset import decisions as D
 from hexset.actions import Action, ActionSpace, mask_of, space_for
 from hexset.arena import MAX_ACTIONS, deal_board, deal_game
 from hexset.board.board import Board
@@ -69,6 +71,7 @@ if TYPE_CHECKING:
 __all__ = [
     "BatchPolicy",
     "BoardBots",
+    "CONTRACTS",
     "Choice",
     "Collector",
     "Episode",
@@ -76,6 +79,7 @@ __all__ = [
     "RandomPolicy",
     "Request",
     "Transition",
+    "Transition9",
     "SAMPLE_STREAMS",
     "draw_key",
     "owned",
@@ -89,6 +93,12 @@ __all__ = [
 # key alone, so a game is a pure function of its `(seed, index)` and the
 # weights, however the games are sharded or batched.
 SAMPLE_STREAMS = ("worker", "game")
+
+# The observation and decision contracts a collector plays (`Collector`'s
+# `contract`): "8" encodes `hexset.encoding` and asks for one atomic action a
+# decision; "9" encodes `hexset.contract9` and asks the learner for whole
+# decisions (`hexset.decisions`, `hexset.gym.lanes.LaneEnv`'s `decisions`).
+CONTRACTS = ("8", "9")
 
 _MASK64 = (1 << 64) - 1
 _GOLDEN64 = 0x9E3779B97F4A7C15
@@ -208,6 +218,17 @@ class Request:
     # under the policy's own generator. A sampling policy that is handed keys
     # draws from them alone; a greedy or scripted one ignores them.
     draw: int | None = None
+    # Contract 9: the decision as `hexset.decisions.tensors` states it, where
+    # `observation` is the `hexset.contract9.flatten`ed row, `mask` the
+    # decision's flat block and `options` empty. None under contract 8.
+    decision: D.Decision | None = None
+    # `Game.turns` at this decision: a training target's clock only
+    # (`hexn.ppo.zero_sum_targets`), read under contract 9.
+    turns: int = 0
+    # Contract 9: the run of options this request is a part of and its place
+    # there (`hexset.gym.lanes.Request.decision_id`, `.part`).
+    decision_id: int = 0
+    part: int = 0
 
 
 @dataclass(frozen=True)
@@ -225,10 +246,15 @@ class Choice:
     no scripted policy notices.
     """
 
-    action: Action
+    action: Action | D.Compound
     log_prob: float = 0.0
     value: tuple[float, ...] = ()
     aux: object = None
+    # Contract 9: where the decision taken sits in its `Request.decision`,
+    # `(hexset.decisions.DecisionKind, index)` as `hexset.decisions.locate`
+    # gives it, and the points head's reading, the mover first.
+    decision: tuple[int, int] | None = None
+    points: tuple[float, ...] = ()
 
 
 class BatchPolicy(Protocol):
@@ -290,6 +316,42 @@ class Transition:
     seat_points: tuple[int, ...] = ()
     # `Request.outlook`; empty where it was not read.
     outlook: tuple[float, ...] = ()
+
+
+@dataclass(frozen=True)
+class Transition9:
+    """One contract-9 decision, filed under the seat that made it: the
+    `Transition` of a whole decision (`hexset.decisions`).
+
+    `step` is the decision's first move in the game's action stream (a
+    compound's later parts are steps of their own in the record, and no row
+    here). `observation` is the `hexset.contract9.flatten`ed row and
+    `decision` the decision's tensors; `kind`/`index` locate the option taken
+    in them (`hexset.decisions.locate`), which is all the update needs to
+    rebuild its log-probability. `value` and `points` are the win and points
+    heads as the behaviour policy read them, the mover first; `seat_points`
+    every seat's true victory points, board order, and `turns` the game's turn
+    count, at this decision: training targets only, never inputs.
+
+    A row is one part of a run of options (`hexset.decisions.closes`):
+    `decision_id` names the run within its game (`hexset.gym.lanes`), `part`
+    the row's place in it, 0 the first. The update credits a run as one
+    decision, its log-probability the sum of its parts'
+    (`hexn.ppo.prepare.prepare_columns9`)."""
+
+    seat: int
+    step: int
+    observation: np.ndarray
+    decision: D.Decision
+    kind: int
+    index: int
+    log_prob: float
+    value: tuple[float, ...]
+    points: tuple[float, ...] = ()
+    seat_points: tuple[int, ...] = ()
+    turns: int = 0
+    decision_id: int = 0
+    part: int = 0
 
 
 @dataclass(frozen=True)
@@ -515,6 +577,8 @@ class Collector:
         coalition: Callable[[int], object] | None = None,
         sample_stream: str = "worker",
         outlook: bool = False,
+        contract: str = "8",
+        discard_order: str = "seat",
     ) -> None:
         """`first_game` is where the game counter starts.
 
@@ -551,6 +615,11 @@ class Collector:
         `outlook` reads `Request.outlook`, the `--aux-target outlook` label, on
         `OUTLOOK_SHARE` of the turn's own decisions; off, it costs nothing.
 
+        `contract` is `CONTRACTS`' choice. Under "9" the learner (policy 0) is
+        asked for whole decisions and files a `Transition9` per decision;
+        beside it sit scripted bots only, which act a move at a time.
+        `discard_order` is `hexset.gym.lanes.DISCARD_ORDERS`' choice.
+
         `sink`, when set, is handed every episode the tick it finishes -- what
         keeps a game on disk before the batch it belongs to ends
         (`hexn.durable.Partial.keep`). A sink that returns something other
@@ -566,6 +635,14 @@ class Collector:
             raise ValueError("a collector cannot deal backwards or stand still")
         if sample_stream not in SAMPLE_STREAMS:
             raise ValueError(f"sample_stream must be one of {SAMPLE_STREAMS}, got {sample_stream!r}")
+        if contract not in CONTRACTS:
+            raise ValueError(f"contract must be one of {CONTRACTS}, got {contract!r}")
+        if contract == "9":
+            if any(not isinstance(o, BoardBots) for o in opponents) or tuple(learners) != (0,):
+                raise ValueError("a contract-9 collector seats scripted bots beside its one learner; "
+                                 "another network would be asked a move at a time")
+            if outlook or temperatures is not None:
+                raise ValueError("a contract-9 collector reads no outlook and plays every seat at 1.0")
         if caster is not None and not opponents:
             raise ValueError("a caster without opponents has nobody to cast")
         if pair_boards and board is not None:
@@ -575,6 +652,8 @@ class Collector:
                 "would compare nothing"
             )
         self.policy = policy
+        self.contract = contract
+        self.discard_order = discard_order
         self.sample_stream = sample_stream
         self.outlook = outlook
         self.opponents = tuple(opponents)
@@ -725,6 +804,8 @@ class Collector:
             # against observation arrays already dwarfing it, so there is no
             # cohort this should be switched off for.
             records=True,
+            discard_order=self.discard_order,
+            decisions=(0,) if self.contract == "9" else (),
             **extra,
         )
 
@@ -740,6 +821,8 @@ class Collector:
         if not asked:
             # Every seat this tick is played by a bot inside the environment.
             return []
+        if self.contract == "9":
+            return self._requests9(asked)
         observations = encode_batch(
             [request.game for request in asked], [request.seat for request in asked]
         )
@@ -772,6 +855,31 @@ class Collector:
             )
             for request, observation in zip(asked, observations, strict=True)
         ]
+
+    def _requests9(self, asked: Sequence[LaneRequest]) -> list[Request]:
+        """Contract 9's tick: every learner decision as `hexset.contract9`
+        encodes it, with the decision's tensors the environment stated."""
+        keyed = self.sample_stream == "game"
+        out = []
+        for request in asked:
+            # The true state's points, every seat's and so the mover's own.
+            seat_points = _seat_points(request.game)
+            out.append(Request(
+                lane=request.lane,
+                seat=request.seat,
+                observation=contract9.flatten(contract9.encode9(request.game, request.seat)),
+                mask=request.decision.flat,
+                options=(),
+                game=request.game,
+                points=seat_points[request.seat],
+                seat_points=seat_points,
+                draw=draw_key(self.seed, request.index, request.seat, request.step) if keyed else None,
+                decision=request.decision,
+                turns=request.game.turns,
+                decision_id=request.decision_id,
+                part=request.part,
+            ))
+        return out
 
     def _answers(
         self, asked: Sequence[LaneRequest], requests: Sequence[Request]
@@ -816,6 +924,26 @@ class Collector:
                 if held is None:
                     continue
                 request, choice = held
+                if request.decision is not None:
+                    kind, index = choice.decision
+                    row.append(
+                        Transition9(
+                            seat=decision.seat,
+                            step=decision.step,
+                            observation=request.observation,
+                            decision=request.decision,
+                            kind=int(kind),
+                            index=int(index),
+                            log_prob=choice.log_prob,
+                            value=tuple(choice.value),
+                            points=tuple(choice.points),
+                            seat_points=request.seat_points,
+                            turns=request.turns,
+                            decision_id=request.decision_id,
+                            part=request.part,
+                        )
+                    )
+                    continue
                 row.append(
                     Transition(
                         seat=decision.seat,

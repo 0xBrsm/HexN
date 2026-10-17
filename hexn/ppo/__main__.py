@@ -66,6 +66,9 @@ from ..collect import (
 )
 from ..loop import (
     add_head_flags,
+    add_net9_flags,
+    model_record,
+    net9_config,
     resolve_fused,
     build,
     ladder,
@@ -79,6 +82,7 @@ from ..loop import (
 from . import (
     ADAM_EPS,
     AUX_TARGETS,
+    C9_CLIPS,
     PPOConfig,
     assemble,
     attach_prior,
@@ -95,7 +99,7 @@ from ..schedule import AdaptiveLR, current_lr, linear_anneal, set_lr
 from ..selfplay import SAMPLE_STREAMS, BatchPolicy, Collector, Episode
 from ..steps import Steps, by_index, fingerprint, remove as remove_steps
 from ..trade import check_trader
-from .prepare import Prepared, Preparer, coalition_gauges, fast_win_gauges, games_digest, learner_final_vp, prepare  # noqa: F401
+from .prepare import Prepared, Preparer, coalition_gauges, fast_win_gauges, games_digest, learner_final_vp, prepare, prepare_games  # noqa: F401
 
 
 # Arbitrary but documented: a single in-process collector saturates around
@@ -153,6 +157,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--width", type=int, default=64)
     parser.add_argument("--rounds", type=int, default=2)
     add_head_flags(parser)
+    add_net9_flags(parser)
+    parser.add_argument(
+        "--discard-order",
+        choices=("seat", "random"),
+        default="random",
+        help="who discards first to a seven when several owe: random, drawn among the owing seats per game "
+        "(the default), each finishing its discard before the next; seat, the lowest first, as every run "
+        "frozen before this flag (hexset.gym.lanes)",
+    )
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--adam-eps", type=float, default=ADAM_EPS)
     parser.add_argument(
@@ -217,6 +230,15 @@ def build_parser() -> argparse.ArgumentParser:
     # own decisions (`hexn.selfplay.OUTLOOK_SHARE`), by squared error over those.
     parser.add_argument("--aux-target", choices=AUX_TARGETS, default="relative")
     parser.add_argument("--aux-pos-weight", type=float, default=1.0)
+    # "zero_sum" (contract 9): the points head, every seat, on its later
+    # relative-points changes discounted --zero-sum per round, by squared
+    # error (`hexn.ppo.zero_sum_targets`).
+    parser.add_argument("--zero-sum", type=float, default=0.6, metavar="GAMMA",
+                        help="--aux-target zero_sum's per-round discount")
+    parser.add_argument("--c9-clip", choices=C9_CLIPS, default="per-decision",
+                        help="contract 9: clip a decision's ratio once, its parts' summed log-ratio "
+                        "(per-decision), or each part's conditional ratio on its own, every part with the "
+                        "decision's advantage (per-part); the log's clip_by_parts reads both by decision length")
     # Pay for fast wins (`PPOConfig.fast_win`): a JSON file holding a list of
     # weights, entry r-1 for a win in round r, or an object with a "weights"
     # list. Builds the net with its fast-win head; `--init` from a checkpoint
@@ -556,6 +578,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             "kill in any other iteration still goes back to latest.pt",
             file=sys.stderr,
         )
+    if args.contract == "9":
+        # What a contract-9 run is not built for: the ladder plays contract-8
+        # nets (reads go through `network:<.pt>` instead), and the sharded
+        # update, a parent and the network trader read contract 8's rows.
+        unbuilt = [flag for flag, on in (
+            ("--eval-every", args.eval_every), ("--eval-at-start", args.eval_at_start), ("--parent", args.parent),
+            ("--rival", args.rival), ("--lag-rung", args.lag_rung), ("--search-rung", args.search_rung),
+            ("--update-workers", args.update_workers > 1), ("--trader", getattr(args, "trader", None)),
+            ("--collect-precision bf16", args.collect_precision != "fp32"),
+        ) if on]
+        if unbuilt:
+            parser.error(f"not built for --contract 9: {', '.join(unbuilt)}")
     if args.kl_break > 0 and args.lr_schedule == "adaptive":
         parser.error("--kl-break truncates the epochs the adaptive controller "
                      "reads its gauge from; run one governor at a time")
@@ -616,6 +650,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         setup_weight=getattr(args, "setup_weight", 1),
         amp=getattr(args, "amp", ""),
         decoupled=getattr(args, "decoupled", False),
+        contract=str(getattr(args, "contract", "8")),
+        zero_sum=getattr(args, "zero_sum", 0.6),
+        c9_clip=getattr(args, "c9_clip", "per-decision"),
     )
     if config.amp and args.update_workers > 1:
         raise SystemExit("--amp is not wired into the sharded update (--update-workers)")
@@ -667,10 +704,30 @@ def main(argv: Sequence[str] | None = None) -> int:
         # the rounds a supervised trunk was trained with, say -- fails here,
         # loudly, rather than training a half-initialised net.
         seed_state = torch.load(args.init, map_location=args.device, weights_only=False)
+        if config.contract == "9" and policy.net.config.double_turn == "parts":
+            # A contract-9 BC checkpoint carries the joint double-turn heads;
+            # this net plays the snake seat a setup turn at a time and has none.
+            from ..model9 import without_joint_head
+            seed_state["net"], dropped = without_joint_head(seed_state["net"])
+            if dropped:
+                print(f"dropped the joint double-turn head from --init ({dropped} parameters): "
+                      "this net plays the snake seat in parts", file=sys.stderr)
         grafted = config.fast_win and not any(
             key.startswith("fast_win.") for key in seed_state["net"]
         )
-        if grafted:
+        fresh_points = (config.contract == "9" and policy.net.points_head is not None
+                        and not any(key.startswith("points_head.") for key in seed_state["net"]))
+        if fresh_points:
+            # A contract-9 checkpoint trained without the points head: every
+            # other key must match, and the head starts as a fresh net's.
+            missing, unexpected = policy.net.load_state_dict(seed_state["net"], strict=False)
+            if unexpected or any(not key.startswith("points_head.") for key in missing):
+                raise SystemExit(
+                    f"--init {args.init} does not match this net: missing {missing}, "
+                    f"unexpected {unexpected}"
+                )
+            print("the points head starts untrained: --init has none", file=sys.stderr)
+        elif grafted:
             # A checkpoint from before the fast-win head: every other key
             # must still match, and the new head starts from the win head.
             missing, unexpected = policy.net.load_state_dict(seed_state["net"], strict=False)
@@ -700,6 +757,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "torch_rng": torch.get_rng_state(),
                     "args": vars(args),
                     "config": asdict(config),
+                    **model_record(policy),
                 },
             )
     elif args.resume:
@@ -802,6 +860,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     outlook=config.aux_target == "outlook",
                     trunk=args.collect_trunk,
                     precision=args.collect_precision,
+                    contract=str(getattr(args, "contract", "8")),
+                    net9=tuple(net9_config(args).items()) if config.contract == "9" else (),
+                    discard_order=getattr(args, "discard_order", "seat"),
                 )
                 for worker in range(args.collect_workers)
             ],
@@ -843,6 +904,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             coalition=mix_coalitions(mix, args.players, args.seed) if mix else None,
             sample_stream=args.sample_stream,
             outlook=config.aux_target == "outlook",
+            contract=config.contract,
+            discard_order=getattr(args, "discard_order", "seat"),
         )
 
     crew = None
@@ -929,6 +992,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             preparer.submit(cohort, durable.partial(collecting, cohort).directory)
         return started
 
+    def assembled_here(games: list[bytes], cohort: int) -> Prepared:
+        """A contract-9 cohort's batch from its encoded games, here: it is
+        assembled from its columns, never decoded into objects."""
+        batch, gauges, stripped = prepare_games(games, collector.observations, policy.layout, config, args.players)
+        collector.games += len(games)
+        games.clear()
+        return Prepared(cohort, "", batch, gauges, stripped)
+
     def land(games: list[bytes], cohort: int):
         """A received cohort: prepared by the helper when its games are the
         ones received, decoded here otherwise."""
@@ -939,6 +1010,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 games.clear()
                 return got
             print(f"helper: {got}; decoding cohort {cohort} here", flush=True)
+        if config.contract == "9":
+            return assembled_here(games, cohort)
         return by_index(collector.decode(games))
 
     if args.async_collect and start_iteration < args.iterations:
@@ -969,10 +1042,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 # The workers act with last iteration's weights until this lands,
                 # so the sync is inside the loop and before the collect, always.
                 collector.sync(policy.net)
-            episodes = by_index(draw(
-                args.games_per_iteration,
-                partial=durable.partial(collecting, iteration),
-            ))
+            if config.contract == "9" and isinstance(collector, ParallelCollector):
+                collector.start_collect(args.games_per_iteration, partial=durable.partial(collecting, iteration))
+                episodes = assembled_here(collector.receive(), iteration)
+            else:
+                episodes = by_index(draw(
+                    args.games_per_iteration,
+                    partial=durable.partial(collecting, iteration),
+                ))
             collected = time.perf_counter() - started
         played = collector.games
 
@@ -1145,6 +1222,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "torch_rng": torch.get_rng_state(),
                 "args": vars(args),
                 "config": asdict(config),
+                **model_record(policy),
                 **({"scaler": scaler.state_dict()} if scaler is not None else {}),
             }
             save(latest, state)

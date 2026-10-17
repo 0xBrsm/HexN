@@ -109,6 +109,8 @@ def load(
     state = torch.load(path, map_location=device, weights_only=False)
     args = state.get("args", {})
     players = int(args.get("players", 4))
+    if str(args.get("contract", "")) == "9":
+        return _load9(state, args, topology, players, device)
     # The head shapes read the same way width and rounds do, and default to the
     # shape every checkpoint written before they existed was trained with. A
     # checkpoint that records a shape has to be rebuilt with it or
@@ -135,6 +137,21 @@ def load(
         max_offers=recorded_budget(args),
         iteration=int(state.get("iteration", 0)),
     )
+
+
+def _load9(state: dict, args: dict, topology: Topology, players: int, device: str) -> Loaded:
+    """A contract-9 checkpoint (`hexn.model9.HexNet`), played by `hexn.policy9.Policy9`.
+    It makes no offers of its own (contract 9 reads no trading inputs yet); its gate
+    still answers the table's."""
+    from .model9 import HexNet as HexNet9, config_of
+    from .policy9 import Policy9
+
+    space = build_space(topology.num_vertices, topology.num_edges, topology.num_hexes, players)
+    net = HexNet9(space, topology, players, config_of(state["model_config"]))
+    net.load_state_dict(state["net"])
+    net = net.to(device).eval()
+    return Loaded(policy=Policy9(net, space, device=device), space=space, players=players,
+                  max_offers=0, iteration=int(state.get("iteration", 0)))
 
 
 # Registered at import, so importing this module is the whole of naming the

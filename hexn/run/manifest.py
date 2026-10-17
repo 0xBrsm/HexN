@@ -109,6 +109,16 @@ ADDED: dict[str, dict[str, Any]] = {
         "aux_margin_weight": 0.0,
         "aux_target": "relative",
         "aux_pos_weight": 1.0,
+        "contract": "8",
+        "heads": "linear",
+        "discard_head": "mlp",
+        "norm": True,
+        "messages": "separate",
+        "attention": True,
+        "points_head": False,
+        "discard_order": "seat",
+        "zero_sum": 0.6,
+        "c9_clip": "per-decision",
     },
     "exit": {
         "k": 1,
@@ -117,6 +127,15 @@ ADDED: dict[str, dict[str, Any]] = {
         "micro_batch": 0,
         "prior_kl": 0.0,
     },
+}
+
+
+# Fills that reproduce the old behaviour only where a frozen key says so:
+# mode -> {added key: (key, value) under which no fill can}. A contract-9
+# manifest frozen before `c9_clip` credited every option on its own, which no
+# value of the new key means, so it is refused (re-freeze it).
+UNFILLABLE: dict[str, dict[str, tuple[str, Any]]] = {
+    "ppo": {"c9_clip": ("contract", "9")},
 }
 
 
@@ -354,6 +373,13 @@ def load(directory: str | Path) -> Manifest:
         for key, value in ADDED.get(mode, {}).items()
         if key in expected and key not in got
     }
+    for key in filled:
+        guard = UNFILLABLE.get(mode, {}).get(key)
+        if guard is not None and str(config.get(guard[0])) == str(guard[1]):
+            raise SystemExit(
+                f"{directory / relative} predates {key!r}, and under {guard[0]}={guard[1]!r} no value of it "
+                f"reproduces what the run meant. Re-freeze it with `hexn.run.init` instead."
+            )
     if missing := expected - got - set(filled):
         raise SystemExit(
             f"{directory / relative} is missing {sorted(missing)}. A frozen config "

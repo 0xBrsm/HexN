@@ -2,6 +2,140 @@
 
 All notable changes to the `hexn` package are recorded here.
 
+## 0.44.0
+
+### Added
+
+- **Contract 9 in PPO self-play** (`--contract 9`). The lanes ask the learner
+  for whole decisions (`hexset.gym.lanes.LaneEnv`'s `decisions`) and
+  `hexn.policy9.NetworkPolicy9` answers a tick in one forward: every legal
+  option of each decision, ordinary and compound, is scored by
+  `hexn.model9.decision_scores` and drawn by Gumbel-max, the noise keyed on
+  the decision's draw key and the option's slot, so a game stays a pure
+  function of its index. Each decision is filed as a
+  `hexn.selfplay.Transition9` (its observation, its decision's tensors, the
+  option taken as `(kind, index)`, the win and points heads' readings). The
+  update recomputes the same log-probability with `NetworkPolicy9.evaluate`
+  and takes each decision's entropy over the same options
+  (`model9.decision_entropy`, `model9.chosen_scores`). `--heads`,
+  `--discard-head`, `--norm`, `--messages`, `--attention` and
+  `--points-head` give the net's shape; checkpoints carry `model_config`,
+  so `hexn.netbot.load` plays them. An `--init` without a points head starts
+  a points-headed run's head fresh.
+
+- **`--aux-target zero_sum`** (contract 9) trains the points head on every
+  seat's later relative-points changes discounted `--zero-sum` (0.6) per
+  round, by squared error at `--aux-margin-weight` (`hexn.ppo.zero_sum_targets`).
+
+- **Contract-9 game files and batches.** `hexn.gamefile` keeps a game of
+  `Transition9`s in a format of its own (the flat masks and the setup masks
+  as bits, the Road Building and discard candidates end to end);
+  `decode_columns` reads it into `gamefile.Columns9`,
+  `hexn.ppo.prepare.prepare_columns9` assembles its batch, and
+  `hexn.ppo.decision_rows` gathers a minibatch's ragged candidates by
+  offsets. `Batch` gains the decision fields, `None` under contract 8.
+  `hexn.ppo.prepare.prepare_games` assembles a cohort from its bytes.
+
+- **`--discard-order`** (`seat` or `random`, the default for a new freeze):
+  how the collection's lanes order a seven's discards. A manifest frozen
+  before it keeps `seat`.
+
+- `hexn.policy.keyed_gumbel` takes a first slot (`start`), and
+  `keyed_gumbel_at` draws at any keys and slots.
+
+- **A points head for contract 9's network** (`hexn.model9.ModelConfig(points=True)`): one number per seat
+  token, read with the table in the win head's shape, the perspective first (`Prediction.points`), for a
+  points target per seat. Off by default; a checkpoint without the field loads without it.
+
+- **`hexn.model9.HexNet`, the contract-9 network.** It reads
+  `hexset.contract9`'s seat, table, hex and vertex tokens with one set of
+  weights for every seat: messages along roads as vertex-vertex links, from a
+  building's or road's owner's seat token, along each seat's reach, and one
+  attention over the four seats. The win head reads each seat's token by one
+  shared head, softmaxed over the four, the perspective first; the policy
+  scores the ordinary actions (a road from its two ends, a robber move from
+  the hex and the victim's token) and `hexset.decisions`' compound decisions
+  as wholes. `decision_log_prob` is the log-probability of the decision taken
+  under the softmax over every legal option, compound and ordinary together;
+  `unpack9` reads a flattened batch. `ModelConfig.heads` is `"linear"` (every head one
+  linear layer) or `"mlp"`; `config_of` reads a checkpoint's, one written before the field as `"mlp"`. `ModelConfig.discard`
+  sets the discard head apart, `"mlp"` by default: a linear score of a kept hand's counts cannot value cards together.
+
+- **A contract-9 checkpoint plays through `hexn.netbot.load`** like any other: `hexn.policy9.Policy9` answers the
+  bot's `act_rows` and `value_rows`, choosing each compound decision whole at its first move and playing the rest
+  from that plan. It makes no offers of its own. `score_rows` (search priors) is not built.
+
+- `hexn.model9.HexNet.fused` (on): the trunk node-major, as `hexn.model.HexNet`'s fused path runs (each neighbour
+  mean one adjacency product, first linears by block, seat messages projected before they are spread); the
+  reference loop is `fused = False`, the same numbers up to float reassociation.
+
+- `hexn.model9.ModelConfig.attention` (on) and `head_context` (`"me"`): without attention the seats meet
+  only through the table and the board; `"trunk"` heads read the trunk's tokens and the table alone.
+
+- `hexn.model9.ModelConfig.messages`: `"separate"` (each message a token reads its own input) or `"pooled"` (a
+  kind's messages summed into one input; the table added once per position).
+
+- `hexn.model9.ModelConfig.norm` (on): LayerNorm on every token before each round's update and once more before the
+  heads; a checkpoint written before the field loads without it.
+
+### Changed
+
+- **A "parts" contract-9 net has no joint double-turn head.** `HexNet`
+  builds the first, second and pair heads only under
+  `ModelConfig.double_turn="joint"` (contract-9 BC); the net PPO trains plays
+  the snake seat a setup turn at a time and carried 4,354 parameters nothing
+  read. `--init` from a BC checkpoint drops them (`model9.without_joint_head`,
+  logged), so a PPO checkpoint holds only what it plays with. The BC
+  checkpoints in the model store are unchanged and still load as "joint".
+
+- **Contract-9 self-play collects for less.** `NetworkPolicy9.act` runs its
+  forward under `torch.inference_mode`; without grad, `model9.HexNet` reads
+  node owners and road ends by `index_select` (`_pick`) rather than advanced
+  indexing, and `decision_scores` skips the Road Building and discard heads
+  on a batch with no such candidates; the keyed draw adds its Gumbel noise to
+  legal options only; and a request's own points are read off the seat
+  points it already carries. The same log-probabilities, values and sampled
+  decisions, bit for bit; the update's forward and gradients are unchanged.
+
+- **Contract-9 PPO credits a decision, not an option.** A decision is a seat's
+  run of options up to the first that shows something or hands the table on
+  (`hexset.decisions.closes`): a turn's builds after the roll, a knight with
+  its robber, the snake seat's two setup turns. Each option is still one
+  forward's choice and one batch row (`Transition9.decision_id`, `.part`);
+  `Batch.dec_off` groups the rows, a minibatch draws whole decisions
+  (`config.minibatch` of them), and a decision's log-probability and entropy
+  are its parts' sums (`hexn.ppo.decision_terms`, `decision_parts`). The win
+  and points heads are trained, and GAE reads its estimate, at a decision's
+  first part only; its advantage and targets are per decision.
+  `--c9-clip per-decision` (the default) clips the decision's ratio once,
+  `exp(sum new - sum old)`; `per-part` clips each part's ratio on its own,
+  every part with the decision's advantage (`decision_surrogate`; the same
+  gradient on-policy). `Stats.decisions` counts the decisions and
+  `Stats.clip_by_parts` logs both clip fractions by decision length. A
+  contract-9 manifest frozen before `c9_clip` is refused
+  (`hexn.run.manifest.UNFILLABLE`); a contract-8 one fills it, unread.
+
+- **Self-play plays the double turn as two setup turns**, the setup head read
+  on the board before the first and again after it, and never reads the
+  double turn's first, second and pair heads. `NetworkPolicy9` refuses a
+  double-turn decision and keys its Gumbel noise over the flat, setup and
+  candidate slots only (`slots()` returns two starts). `ModelConfig.double_turn`
+  (`"joint"`, the default and every BC checkpoint's, or `"parts"`, which
+  self-play's checkpoints record) tells `Policy9` which way to play it; every
+  net has both heads' parameters, so a BC checkpoint loads strictly into the
+  self-play net. `HexNet.setup_scores` scores the setup turns alone, and
+  `decision_scores` takes a batch without `double`. A contract-9 game file is
+  `VERSION9` (2), its rows carrying their run and none a double turn
+  (`Columns9` and `Batch` lose `double`); version 1 is refused.
+
+### Fixed
+
+- The contract-9 surrogate (`decision_surrogate`) caps the log-ratio it
+  exponentiates at `RATIO_LOG_CAP`, as the contract-8 path has since 0.41.0;
+  the two landed in parallel and the cap did not reach the decision path.
+  A decision moved past float32's `exp` range within an update made the
+  loss NaN.
+
 ## 0.43.0
 
 ### Breaking
