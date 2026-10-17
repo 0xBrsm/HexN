@@ -577,6 +577,29 @@ def test_a_worker_plays_duel_variant_games_on_the_live_seats_only():
             assert episode.outcome.winner not in retired
 
 
+def test_a_self_only_duel_records_both_live_seats():
+    """`duel(self)` seats nobody but the learner: the worker builds without a
+    caster to cast from, still deals every game under the duel-variant rules,
+    and records both live seats."""
+    from hexn.collect import mix_deal
+    from hexset.rules import DUEL_VARIANT
+
+    mix = (("duel(self)", 1.0),)
+    collector = ParallelCollector([spec(0, 1, lanes=4, mix=mix)])
+    try:
+        episodes = collector.collect(8)
+    finally:
+        collector.close()
+
+    deal = mix_deal(mix, 4, 5)
+    for episode in episodes:
+        _, retired = deal(episode.index)
+        assert episode.record is not None and episode.record.rules == DUEL_VARIANT
+        assert len(retired) == 2
+        for seat in range(4):
+            assert bool(episode.trajectories[seat]) == (seat not in retired)
+
+
 def test_a_wedged_worker_fails_the_collection_and_a_resume_plays_only_the_rest(
     tmp_path, monkeypatch
 ):

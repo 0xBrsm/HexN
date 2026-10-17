@@ -41,6 +41,7 @@ from torch import Tensor, nn
 from hexset.actions import ActionSpace
 from hexset.encoding import (
     HEX_FEATURES,
+    RULE_BLOCKS,
     Observation,
     StaticGraph,
     edge_features,
@@ -457,11 +458,12 @@ class HexNet(nn.Module):
         self.embed_vertex = nn.Linear(vertex_features(players), width)
         self.embed_edge = nn.Linear(edge_features(players), width)
         self.embed_global = nn.Linear(global_features(players), width)
-        # A checkpoint written before the globals gained their last
-        # `2 * players` columns (roads to take Longest Road, the seat to move:
-        # record contract 7) loads with those columns zero, which is exactly
-        # what `hexn.migrate_globals` writes: the net computes what it did.
-        self._register_load_state_dict_pre_hook(self._pad_globals)
+        # A checkpoint whose input projections read another contract's
+        # inputs is refused by name: contract 8 re-encodes all four, so no
+        # padding computes what an older net did (`hexn.migrate_c8` refits them).
+        # Contract 8.1 only appends globals, so a contract-8 checkpoint is
+        # widened with zero weights on them and refused nowhere.
+        self._register_load_state_dict_pre_hook(self._refuse_other_inputs)
 
         self.rounds = nn.ModuleList(Round(width) for _ in range(self.config.rounds))
 
@@ -659,17 +661,33 @@ class HexNet(nn.Module):
             return torch.cat([g, pooled], -1)
         return g
 
-    def _pad_globals(self, state_dict, prefix, *args) -> None:
-        """Widen a narrower `embed_global.weight` in `state_dict` by zero
-        columns, where it reads the globals up to the end of the ledger tail
-        (the contract-6 width) and this net reads more."""
-        key = prefix + "embed_global.weight"
+    def _refuse_other_inputs(self, state_dict, prefix, *args) -> None:
+        """Raise, naming the widths, where `state_dict`'s input projections
+        read inputs of another width than this net's.
+
+        A contract-8 `embed_global`, which reads every global before
+        `RULE_BLOCKS`, is first widened in place with zero columns for them:
+        the net then computes on every input exactly what it did, but for
+        the points it reads against a game's target, which is the old
+        reading wherever the game is played to 10."""
+        key = f"{prefix}embed_global.weight"
         weight = state_dict.get(key)
-        wanted = self.embed_global.in_features
-        if weight is None or weight.dim() != 2 or weight.shape[1] == wanted:
-            return
-        if weight.shape[1] == global_columns(self.players)["ledger"].stop:
-            state_dict[key] = torch.cat([weight, weight.new_zeros(weight.shape[0], wanted - weight.shape[1])], dim=1)
+        contract8 = global_columns(self.players)[RULE_BLOCKS[0]].start
+        if weight is not None and weight.dim() == 2 and weight.shape[1] == contract8:
+            pad = weight.new_zeros(weight.shape[0], self.embed_global.in_features - contract8)
+            state_dict[key] = torch.cat([weight, pad], dim=1)
+        found, wanted = {}, {}
+        for name in ("embed_hex", "embed_vertex", "embed_edge", "embed_global"):
+            weight = state_dict.get(f"{prefix}{name}.weight")
+            if weight is None or weight.dim() != 2:
+                continue
+            found[name], wanted[name] = weight.shape[1], getattr(self, name).in_features
+        if found != wanted:
+            raise ValueError(
+                f"this checkpoint reads inputs {found}, not this net's {wanted}: it was "
+                "trained on another record contract; `python -m hexn.migrate_c8` carries "
+                "a contract-7 checkpoint onto contract 8"
+            )
 
     def _read_value(
         self, g: Tensor, h: Tensor, v: Tensor, e: Tensor

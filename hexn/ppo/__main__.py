@@ -835,7 +835,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_offers=args.max_offers,
             trader=getattr(args, "trader", None),
             opponents=opponents,
-            caster=mix_caster(mix, args.players, args.seed) if mix else None,
+            caster=mix_caster(mix, args.players, args.seed) if opponents else None,
             temperatures=(
                 mix_temperatures(mix, args.players, args.seed) if mix else None
             ),

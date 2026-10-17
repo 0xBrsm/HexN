@@ -1127,7 +1127,9 @@ def _build(spec: WorkerSpec) -> tuple[list[NetworkPolicy], Collector]:
     )
     if spec.learners > 1:
         caster = league_caster(spec.learners, spec.players, spec.learner_order)
-    elif spec.mix:
+    elif opponents:
+        # A mix that seats nobody but the learner (`duel(self)`) casts id 0
+        # everywhere, which is what no caster does; its game law still deals.
         caster = mix_caster(spec.mix, spec.players, spec.seed)
     else:
         caster = None

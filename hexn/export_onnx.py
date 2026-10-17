@@ -48,13 +48,30 @@ roads it needs to take Longest Road, `hexset.roads.roads_to_take_all`) and
 `to_move` (the seat whose decision it is), and appends their encoding after
 the ledger tail: `players` floats of roads to take over `ROADS_TO_TAKE_CAP`,
 then a `players`-wide one-hot of the mover, both seat-relative. `globals` is
-75 at four seats; every earlier column keeps its offset, so a contract-6
-checkpoint migrates by appending zero input columns (`hexn.migrate_globals`).
+75 at four seats.
 
-* **Inputs**, a dynamic leading batch axis, named exactly
-  `hexset.onnx_record.RECORD_FIELDS` (26 names: board, position, information
-  set, legality — see that module's docstring). All int64 except
-  `action_mask`, which is the only bool one. `B` is
+**Contract 8** re-encodes every input (`hexset.encoding`'s module docstring;
+hex 7, vertex 14, edge 4 and 75 globals at four seats) and adds eight record
+fields: per seat, its reach to each vertex, its expected hand, its card ages,
+and the knights it needs for Largest Army; and
+the perspective's matured cards, whether it has played a card this turn, and
+the cards it has not seen. A contract-8 graph declares the record fields it
+reads (`_INPUT_NAMES`), which are all but six that only contracts 6 and 7
+read. A contract-7 checkpoint is carried over by `hexn.migrate_c8`.
+
+**Contract 8.1** reads every seat's points against the points the game is
+played to, and appends 15 globals (90 at four seats): the table's rules
+(the points the game is played to, the discard limit, the friendly robber,
+the balanced dice) and each sum's chance on the next roll, from five more
+record fields. A contract-8 checkpoint loads onto it with zero weights on
+the new columns (`hexn.model.HexNet`), and so plays a standard game exactly
+as it did.
+
+* **Inputs**, a dynamic leading batch axis, named as
+  `hexset.onnx_record.RECORD_FIELDS` names them, in its order: the 32 of its
+  38 a contract-8.1 graph reads (`_INPUT_NAMES`; board, position, information
+  set, rules, legality — see that module's docstring). All int64 except
+  `expected_hand`, `dev_ages` and `roll_odds` (float32) and `action_mask` (bool). `B` is
   1 for a single decision and a whole wave of leaves for the UI's MCTS
   `LeafEvaluator`, so the axis must really be dynamic.
 * **Outputs**, in this order: `action_index` (`(B,)` int64, argmax over the
@@ -66,7 +83,7 @@ checkpoint migrates by appending zero input columns (`hexn.migrate_globals`).
   margin. One forward serves both callers:
   `NetworkBot` reads the index, a search reads the two distributions.
 * **Metadata props** (`hexset.clients._modelmeta` and `onnxbot._load_cached`):
-  `contract` is `hexset.onnx_record.CONTRACT_VERSION` (`"7"`); `players` and the
+  `contract` is `hexset.onnx_record.CONTRACT_VERSION` (`"8.1"`); `players` and the
   `num_hexes`/`num_vertices`/
   `num_edges` fingerprint are required; `max_offers` (`""` for none) and
   `iteration` are read with defaults; and only when asked for on the command
@@ -123,11 +140,15 @@ from hexset.board.board import pips, random_base_board
 from hexset.board.terrain import NUM_RESOURCES
 from hexset.board.topology import Topology
 from hexset.encoding import (
+    AGE_SCALE,
     BANK_SCALE,
+    DEV_SCALE,
+    ENCODED_PHASES,
+    FREE_ROADS_SCALE,
     HAND_SCALE,
-    NUM_BUILDINGS,
     NUM_PHASES,
-    NUM_TERRAIN,
+    PLAYABLE_KINDS,
+    POINTS_SCALE,
     TURN_SCALE,
     StaticGraph,
     static_graph,
@@ -137,11 +158,18 @@ from .model import HexNet, config_from_args
 from hexset.cards import DECK_SIZE
 from hexset.onnx_record import RECORD_FIELDS, record_batch, record_shapes
 from hexset.play import step_randomly
-from hexset.roads import ROADS_TO_TAKE_CAP
 from hexset.state import NO_OWNER
 from .policy import masked_log_softmax
 
-_INPUT_NAMES = RECORD_FIELDS
+# The record fields a contract-8.1 graph reads, in `RECORD_FIELDS` order: the
+# record keeps the six that only contracts 6 and 7 read (the award holders,
+# `knights_played`, `hand_totals` and the ledger's `known`/`unknown`), and a
+# graph declares only what it reads, so the server feeds it only those.
+_UNREAD = frozenset({
+    "knights_played", "longest_road_holder", "largest_army_holder",
+    "hand_totals", "ledger_known", "ledger_unknown",
+})
+_INPUT_NAMES = tuple(name for name in RECORD_FIELDS if name not in _UNREAD)
 _OUTPUT_NAMES = ("action_index", "prior", "value")
 _BATCH = "batch"
 
@@ -153,12 +181,11 @@ from hexset.onnx_record import CONTRACT_VERSION as _CONTRACT_VERSION
 from . import runtime
 from .trade import recorded_budget
 
-# `action_mask` is the only bool input; every other input is int64 -- there
-# is no float input left now that contract 6 deleted the public valuation
-# vector (`hexset.onnx_record.RECORD_FIELDS` has no field for it). Every
-# output is float32 except `action_index`.
+# `action_mask` is the only bool input; contract 8's expected hands and card
+# ages and contract 8.1's roll odds are float32, and every other input is int64. Every output is float32
+# except `action_index`.
 _BOOL_INPUTS = frozenset({"action_mask"})
-_FLOAT_INPUTS: frozenset[str] = frozenset()
+_FLOAT_INPUTS: frozenset[str] = frozenset({"expected_hand", "dev_ages", "roll_odds"})
 _INT_OUTPUTS = frozenset({"action_index"})
 
 # The only value `hexset.clients._modelmeta.search_config` acts on; anything else in
@@ -218,8 +245,10 @@ def _sample_games(players: int, count: int, seed: int = 0) -> list[tuple[Game, i
 
 def _sample_inputs(space: ActionSpace, players: int, batch: int, seed: int = 0) -> dict[str, np.ndarray]:
     """Real information-set records, for tracing and for the parity check
-    alike — `_sample_games` plus `hexset.onnx_record.record_batch`."""
-    return record_batch(_sample_games(players, batch, seed), space)
+    alike — `_sample_games` plus `hexset.onnx_record.record_batch` — as the
+    graph's inputs: the fields it reads (`_INPUT_NAMES`)."""
+    record = record_batch(_sample_games(players, batch, seed), space)
+    return {name: record[name] for name in _INPUT_NAMES}
 
 
 def _onehot(index: Tensor, num_classes: int) -> Tensor:
@@ -260,17 +289,19 @@ def _pips_table() -> list[float]:
 
 class RecordEncoder(nn.Module):
     """`record -> (hexes, vertices, edges, globals)`: the traceable half of
-    `hexset.encoding.encode`/`encode_batch`, reading `hexset.onnx_record`'s
-    torch-free record.
+    `hexset.encoding.encode`/`encode_batch` (contract 8.1), reading
+    `hexset.onnx_record`'s torch-free record by field name.
 
     No data-dependent control flow -- every branch below is a `where` or a
     comparison evaluated on every row, never a Python `if` on a tensor value
-    -- which is exactly what tracing requires and what the original numpy
-    encoder already had none of.
+    -- which is exactly what tracing requires and what the numpy encoder
+    already has none of. The rules-level reads (reach, expected hands, card
+    ages, knights needed) arrive computed in the record; this only rotates,
+    scales and one-hots them.
 
     Board adjacency (`StaticGraph`) plays no part here: that is baked into
-    `HexNet`'s own buffers, unchanged by this work, and only `num_hexes` is
-    needed, to size the robber one-hot.
+    `HexNet`'s own buffers, and only `num_hexes` is needed, to size the
+    robber column.
     """
 
     def __init__(self, graph: StaticGraph, players: int) -> None:
@@ -280,159 +311,89 @@ class RecordEncoder(nn.Module):
         self.register_buffer(
             "pips_table", torch.tensor(_pips_table(), dtype=torch.float32), persistent=False
         )
+        self.register_buffer(
+            "playable", torch.tensor([int(k) for k in PLAYABLE_KINDS], dtype=torch.long), persistent=False
+        )
 
-    def forward(
-        self,
-        terrain: Tensor,
-        token: Tensor,
-        port_code: Tensor,
-        robber: Tensor,
-        vertex_owner: Tensor,
-        vertex_building: Tensor,
-        edge_owner: Tensor,
-        bank: Tensor,
-        knights_played: Tensor,
-        award_points_: Tensor,
-        longest_road_holder: Tensor,
-        largest_army_holder: Tensor,
-        phase: Tensor,
-        free_roads: Tensor,
-        deck_size: Tensor,
-        turns: Tensor,
-        roads_to_take: Tensor,
-        to_move: Tensor,
-        perspective: Tensor,
-        own_hand: Tensor,
-        hand_totals: Tensor,
-        own_dev: Tensor,
-        dev_totals: Tensor,
-        ledger_known: Tensor,
-        ledger_unknown: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    def forward(self, r: dict[str, Tensor]) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         players = self.players
+        perspective = r["perspective"]
+        f32 = torch.float32
 
-        # --- hexes: terrain one-hot, has-token, pips/5, is-robber ---
-        terrain_onehot = _onehot(terrain, NUM_TERRAIN)
-        has_token = (token != 0).to(torch.float32)
-        pips_scaled = self.pips_table[token]
-        is_robber = _onehot(robber, self.num_hexes)
-        hexes = torch.cat(
-            [
-                terrain_onehot,
-                has_token.unsqueeze(-1),
-                pips_scaled.unsqueeze(-1),
-                is_robber.unsqueeze(-1),
-            ],
-            dim=-1,
-        )
+        # --- hexes: the five producing terrains, pips/5, the robber ---
+        terrain = _onehot(r["terrain"], NUM_RESOURCES)
+        pips_scaled = self.pips_table[r["token"]]
+        is_robber = _onehot(r["robber"], self.num_hexes)
+        hexes = torch.cat([terrain, pips_scaled.unsqueeze(-1), is_robber.unsqueeze(-1)], dim=-1)
 
-        # --- vertices: building one-hot, owner slot one-hot, port block ---
-        building_onehot = _onehot(vertex_building, NUM_BUILDINGS)
-        owner_slot = _rotate_slot(vertex_owner, perspective, players)
-        owner_onehot = _onehot(owner_slot, players + 1)
-        is_generic_port = (port_code == 0).to(torch.float32)
+        # --- vertices: seat_building, ports, seat_reach ---
+        owner_slot = _rotate_slot(r["vertex_owner"], perspective, players)
+        seat_building = _onehot(owner_slot, players) * r["vertex_building"].to(f32).unsqueeze(-1)
+        port_code = r["port_code"]
+        is_generic_port = (port_code == 0).to(f32)
         specific_resource = torch.clamp(port_code - 1, min=0)
-        has_specific_port = (port_code >= 1).to(torch.float32)
-        specific_port_onehot = _onehot(specific_resource, NUM_RESOURCES) * has_specific_port.unsqueeze(-1)
-        vertices = torch.cat(
-            [
-                building_onehot,
-                owner_onehot,
-                is_generic_port.unsqueeze(-1),
-                specific_port_onehot,
-            ],
-            dim=-1,
-        )
+        has_specific_port = (port_code >= 1).to(f32)
+        specific_port = _onehot(specific_resource, NUM_RESOURCES) * has_specific_port.unsqueeze(-1)
 
-        # --- edges: owner slot one-hot ---
-        edge_slot = _rotate_slot(edge_owner, perspective, players)
-        edges = _onehot(edge_slot, players + 1)
-
-        # --- building points, already in seat-relative slot order because
-        # `owner_onehot`'s columns already are: mirrors
-        # `encoding._building_points`, a contraction of the vertex block
-        # rather than a second board walk.
-        building_value = torch.arange(NUM_BUILDINGS, dtype=torch.float32, device=vertices.device)
-        per_vertex_value = building_onehot @ building_value
-        building_points = torch.einsum("bv,bvp->bp", per_vertex_value, owner_onehot[..., :players])
-
-        # --- globals, in exactly `encoding._encode_globals`'s part order ---
         seats = [torch.remainder(perspective + i, players) for i in range(players)]
 
         def gather_seat(values: Tensor, seat: Tensor) -> Tensor:
-            return values.gather(1, seat.unsqueeze(1)).squeeze(1)
-
-        def gather_seat_vec(values: Tensor, seat: Tensor) -> Tensor:
-            """`gather_seat` for a `(B, players, width)` tensor -- the
-            per-seat `width`-wide row instead of a scalar."""
-            width = values.shape[-1]
-            index = seat.view(-1, 1, 1).expand(-1, 1, width)
+            """Board seat `seat`'s row of a `(B, players, ...)` tensor."""
+            index = seat.view(-1, *([1] * (values.dim() - 1))).expand(-1, 1, *values.shape[2:])
             return values.gather(1, index).squeeze(1)
 
-        parts: list[Tensor] = [own_hand.to(torch.float32) / HAND_SCALE]
+        def closeness(n: Tensor) -> Tensor:
+            """`1 / (1 + n)`, and 0 for `-1`, out of reach."""
+            n = n.to(f32)
+            return torch.where(n < 0, torch.zeros_like(n), 1.0 / (1.0 + torch.clamp(n, min=0.0)))
+
+        reach = torch.stack([closeness(gather_seat(r["reach"], seats[i])) for i in range(players)], dim=-1)
+        vertices = torch.cat(
+            [seat_building, is_generic_port.unsqueeze(-1), specific_port, reach], dim=-1
+        )
+
+        # --- edges: per seat, its road ---
+        edges = _onehot(_rotate_slot(r["edge_owner"], perspective, players), players)
+
+        # --- globals, in exactly `encoding._global_parts`'s order ---
+        building_points = seat_building.sum(dim=1)
+        opponents = range(1, players)
+
+        parts: list[Tensor] = [r["own_hand"].to(f32) / HAND_SCALE]
+        parts.append(r["own_dev"].to(f32) / DEV_SCALE)
+        unplayed = (1 - r["dev_card_played"]).to(f32).unsqueeze(-1)
+        parts.append(r["own_matured"].index_select(1, self.playable).to(f32) / DEV_SCALE * unplayed)
+        parts.extend(gather_seat(r["expected_hand"], seats[i]).to(f32) / HAND_SCALE for i in opponents)
         parts.append(
-            torch.stack(
-                [gather_seat(hand_totals, seats[i]).to(torch.float32) / HAND_SCALE for i in range(1, players)],
-                dim=1,
-            )
+            torch.stack([gather_seat(r["dev_totals"], seats[i]).to(f32) / DEV_SCALE for i in opponents], dim=1)
         )
-        parts.append(bank.to(torch.float32) / BANK_SCALE)
-        parts.append(own_dev.to(torch.float32) / 5.0)
-        parts.append(
-            torch.stack(
-                [gather_seat(dev_totals, seats[i]).to(torch.float32) / 5.0 for i in range(1, players)],
-                dim=1,
-            )
-        )
-        parts.append(
-            torch.stack(
-                [gather_seat(knights_played, seats[i]).to(torch.float32) / 5.0 for i in range(players)],
-                dim=1,
-            )
-        )
-        award_seat = torch.stack(
-            [gather_seat(award_points_, seats[i]).to(torch.float32) for i in range(players)], dim=1
-        )
-        parts.append((building_points + award_seat) / 10.0)
+        for i in opponents:
+            ages = gather_seat(r["dev_ages"], seats[i]).to(f32)
+            parts.append(torch.where(ages < 0, torch.zeros_like(ages), (ages + 1.0) / AGE_SCALE))
 
-        for holder in (longest_road_holder, largest_army_holder):
-            parts.append(_onehot(_rotate_slot(holder, perspective, players), players + 1))
+        award = torch.stack([gather_seat(r["award_points"], seats[i]).to(f32) for i in range(players)], dim=1)
+        winning = r["winning_points"].to(f32).unsqueeze(-1)
+        parts.append((building_points + award) / winning)
+        parts.append(torch.stack([closeness(gather_seat(r["roads_to_take"], seats[i])) for i in range(players)], dim=1))
+        parts.append(torch.stack([closeness(gather_seat(r["knights_needed"], seats[i])) for i in range(players)], dim=1))
+        parts.append(_onehot(_rotate_slot(r["to_move"], perspective, players), players)[:, 1:])
 
-        parts.append(_onehot(phase, NUM_PHASES))
-        parts.append((free_roads.to(torch.float32) / 2.0).unsqueeze(-1))
-        parts.append((deck_size.to(torch.float32) / DECK_SIZE).unsqueeze(-1))
-        parts.append(torch.clamp(turns.to(torch.float32) / TURN_SCALE, max=1.0).unsqueeze(-1))
-
-        # There is no public valuation block here any more: contract 6
-        # deleted trading's whole public layer (`hexset.trading`), so
-        # `encoding._encode_globals` goes straight from the three scalars
-        # above to the ledger tail below, and so does this trace.
-
-        # --- the public-knowledge ledger, in exactly `encoding._ledger_parts`'s
-        # order: each opponent's known[5] then unknown, seat-relative, own
-        # seat excluded (own hand is already exact via `own_hand` above).
-        for i in range(1, players):
-            parts.append(gather_seat_vec(ledger_known, seats[i]).to(torch.float32) / HAND_SCALE)
-            parts.append(
-                (gather_seat(ledger_unknown, seats[i]).to(torch.float32) / HAND_SCALE).unsqueeze(-1)
-            )
-
-        # --- appended after the ledger, `encoding._roads_to_take_parts`
-        # then the mover one-hot: each seat's roads to take Longest Road over
-        # the cap, seat-relative, and whose decision it is.
-        parts.append(
-            torch.stack(
-                [
-                    gather_seat(roads_to_take, seats[i]).to(torch.float32) / ROADS_TO_TAKE_CAP
-                    for i in range(players)
-                ],
-                dim=1,
-            )
-        )
-        parts.append(_onehot(_rotate_slot(to_move, perspective, players), players))
+        parts.append(r["bank"].to(f32) / BANK_SCALE)
+        parts.append((r["deck_size"].to(f32) / DECK_SIZE).unsqueeze(-1))
+        unseen = r["unseen_dev"].to(f32)
+        total = unseen.sum(dim=-1, keepdim=True)
+        parts.append(torch.where(total > 0, unseen / torch.clamp(total, min=1.0), torch.zeros_like(unseen)))
+        parts.append(_onehot(r["phase"], NUM_PHASES)[:, :ENCODED_PHASES])
+        parts.append((r["free_roads"].to(f32) / FREE_ROADS_SCALE).unsqueeze(-1))
+        parts.append(torch.clamp(r["turns"].to(f32) / TURN_SCALE, max=1.0).unsqueeze(-1))
+        # Contract 8.1: the table's rules and the next roll's odds.
+        parts.append(winning / POINTS_SCALE)
+        parts.append((r["discard_limit"].to(f32) / HAND_SCALE).unsqueeze(-1))
+        parts.append(r["friendly_robber"].to(f32).unsqueeze(-1))
+        parts.append(r["balanced_dice"].to(f32).unsqueeze(-1))
+        parts.append(r["roll_odds"].to(f32))
 
         globals_ = torch.cat(parts, dim=-1)
-
         return hexes, vertices, edges, globals_
 
 
@@ -450,62 +411,12 @@ class _ExportWrapper(nn.Module):
         self.net = net
         self.players = players
 
-    def forward(
-        self,
-        terrain: Tensor,
-        token: Tensor,
-        port_code: Tensor,
-        robber: Tensor,
-        vertex_owner: Tensor,
-        vertex_building: Tensor,
-        edge_owner: Tensor,
-        bank: Tensor,
-        knights_played: Tensor,
-        award_points: Tensor,
-        longest_road_holder: Tensor,
-        largest_army_holder: Tensor,
-        phase: Tensor,
-        free_roads: Tensor,
-        deck_size: Tensor,
-        turns: Tensor,
-        roads_to_take: Tensor,
-        to_move: Tensor,
-        perspective: Tensor,
-        own_hand: Tensor,
-        hand_totals: Tensor,
-        own_dev: Tensor,
-        dev_totals: Tensor,
-        ledger_known: Tensor,
-        ledger_unknown: Tensor,
-        action_mask: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        hexes, vertices, edges, globals_ = self.encoder(
-            terrain,
-            token,
-            port_code,
-            robber,
-            vertex_owner,
-            vertex_building,
-            edge_owner,
-            bank,
-            knights_played,
-            award_points,
-            longest_road_holder,
-            largest_army_holder,
-            phase,
-            free_roads,
-            deck_size,
-            turns,
-            roads_to_take,
-            to_move,
-            perspective,
-            own_hand,
-            hand_totals,
-            own_dev,
-            dev_totals,
-            ledger_known,
-            ledger_unknown,
-        )
+    def forward(self, *fields: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        """Positional inputs in `RECORD_FIELDS` order, as the graph names them."""
+        record = dict(zip(_INPUT_NAMES, fields, strict=True))
+        action_mask = record["action_mask"]
+        perspective = record["perspective"]
+        hexes, vertices, edges, globals_ = self.encoder(record)
         pred = self.net(hexes, vertices, edges, globals_)
 
         # `masked_log_softmax` is written once in `hexn.policy` for
@@ -792,7 +703,8 @@ def _verify_parity(
         ref_value = pred.value.gather(1, rotate).numpy()
 
     session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
-    onnx_out = dict(zip(_OUTPUT_NAMES, session.run(list(_OUTPUT_NAMES), record)))
+    feed = {name: record[name] for name in _INPUT_NAMES}
+    onnx_out = dict(zip(_OUTPUT_NAMES, session.run(list(_OUTPUT_NAMES), feed)))
 
     np.testing.assert_array_equal(onnx_out["action_index"], ref_action_index, err_msg="action_index")
     for name, ref in (("prior", ref_prior), ("value", ref_value)):

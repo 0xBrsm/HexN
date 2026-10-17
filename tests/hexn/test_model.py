@@ -271,11 +271,9 @@ def test_the_default_config_writes_exactly_the_state_dict_keys_it_always_has():
     that happens to compute the same function.
 
     `aux_margin.{weight,bias}` is the one deliberate exception: contract 6's
-    win-head registration adds a genuinely new head to every checkpoint from
-    here on, which is exactly what `hexn.migrate` exists to carry an
-    existing contract-5 checkpoint across (it warm-starts the new head from
-    the old value head's own weights) -- this list says what the shape *is*
-    now, not that nothing may ever be added to it again.
+    win-head registration added a genuinely new head to every checkpoint
+    from then on -- this list says what the shape *is* now, not that nothing
+    may ever be added to it again.
     """
     _, _, net = a_net()
 
@@ -677,3 +675,29 @@ def test_the_value_read_is_the_last_thing_the_forward_builds():
     order = [out.logits, out.value]
     sequence = [tensor.grad_fn._sequence_nr() for tensor in order]
     assert sequence == sorted(sequence), sequence
+
+
+def test_a_contract_8_checkpoint_loads_with_zero_weights_on_the_rule_columns():
+    """Contract 8.1 only appends globals: a contract-8 `embed_global` is
+    widened with zero columns and computes what it did, and any other width
+    is still refused by name."""
+    from hexset.encoding import RULE_BLOCKS, global_columns
+
+    _, _, net = a_net()
+    contract8 = global_columns(4)[RULE_BLOCKS[0]].start
+    with torch.no_grad():
+        net.embed_global.weight[:, contract8:] = 0.0
+    state = {k: v.clone() for k, v in net.state_dict().items()}
+    state["embed_global.weight"] = state["embed_global.weight"][:, :contract8].clone()
+
+    _, _, loaded = a_net(seed=1)
+    loaded.load_state_dict(state)
+    batch = collate(observations(3))
+    with torch.no_grad():
+        want, got = net(*batch), loaded(*batch)
+    torch.testing.assert_close(got.logits, want.logits)
+    torch.testing.assert_close(got.value, want.value)
+
+    state["embed_global.weight"] = state["embed_global.weight"][:, :-1]
+    with pytest.raises(ValueError, match="another record contract"):
+        a_net()[2].load_state_dict(state)

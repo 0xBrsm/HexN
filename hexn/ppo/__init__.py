@@ -107,6 +107,15 @@ ADAM_EPS = 1e-5
 # the behaviour policy all but never chose cannot dominate a minibatch.
 DECOUPLED_CAP = 2.0
 
+# The largest log-ratio the surrogate exponentiates. A net whose legal logits
+# span a hundred nats can move one position's log-probability past 88 in an
+# update, where `exp` overflows float32: an infinite ratio times a zero
+# behaviour weight or advantage is NaN, and one NaN row poisons the step.
+# The cap only touches a row already 20 nats from its anchor: past the clip
+# for a positive advantage, and for a negative one a term of e**20 times it
+# that stops pulling, where uncapped it would swamp the minibatch.
+RATIO_LOG_CAP = 20.0
+
 # What the auxiliary margin head can learn (`PPOConfig.aux_target`).
 AUX_TARGETS = ("relative", "loss", "points", "outlook")
 
@@ -957,7 +966,7 @@ def minibatch_terms(
     # having been played by an older one. Without `prox_log_prob` the anchor is
     # the behaviour policy and the weight is one: plain PPO.
     anchor = old_log_prob if prox_log_prob is None else prox_log_prob
-    ratio = (evaluation.log_prob - anchor).exp()
+    ratio = (evaluation.log_prob - anchor).clamp(max=RATIO_LOG_CAP).exp()
     unclipped = ratio * advantage
     clamped = ratio.clamp(1 - config.clip, 1 + config.clip) * advantage
     surrogate = torch.min(unclipped, clamped)

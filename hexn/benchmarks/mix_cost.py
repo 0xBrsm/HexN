@@ -273,7 +273,7 @@ def shard(
         action_cap=action_cap,
         max_offers=max_offers,
         opponents=opponents,
-        caster=mix_caster(parsed, players, seed) if parsed else None,
+        caster=mix_caster(parsed, players, seed) if opponents else None,
     )
 
     start = time.perf_counter()

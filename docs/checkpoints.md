@@ -49,7 +49,7 @@ and the metadata `hexn.export_onnx` writes into a served file. HexSet's own
 `docs/onnx.md` defines the currently served contract
 (`hexset.onnx_record.CONTRACT_VERSION`) and is the source of truth for it.
 This package's module docstrings cite specific numbers as shorthand for
-"before/after that shape changed." The two most recent are:
+"before/after that shape changed." The most recent are:
 
 - **Contract 5** deleted the public trade layer outright
   (`hexset.trading`): trades clear from each seat's own published
@@ -65,68 +65,46 @@ This package's module docstrings cite specific numbers as shorthand for
   (a win-probability softmax over seats) rather than a points margin, and
   adds the auxiliary margin head as a warm-started copy of the old value
   head's weights.
+- **Contract 7** appended each seat's roads to take Longest Road and a
+  one-hot of the seat to move to the globals.
+- **Contract 8** re-encodes every input: opponents' cards as expected
+  counts, card ages and the odds of the unseen cards; awards and
+  each vertex's reach as closeness; buildings by the points they score
+  (`hexset.encoding`'s module docstring, HexSet's changelog).
 
-## Migrating a checkpoint across a contract (`hexn.migrate`)
-
-```bash
-python -m hexn.migrate --checkpoint runs/example/iter-02400-c5.pt \
-    --out runs/example/iter-02400-c6.pt
-```
-
-Carries a contract-5 checkpoint onto contract 6 without changing what it
-computes on a position whose dropped columns read zero:
-
-- The twenty dropped valuation columns are a pure column *selection* out of
-  `embed_global.weight`. Every contract-6 global column has a named
-  contract-5 source, so there is no fresh, zero-initialised weight anywhere
-  in that projection.
-- The knight block's collapse is an explicit warm start, not an identity:
-  the new single slot is initialised as the mean of the block it replaces.
-- The value head's weights are kept exactly (still `softmax(margin / T)`'s
-  logits, linearly rescaled by `1/T`), with `T` fit by maximum likelihood
-  against real games' eventual winners (`--win-games`, `--win-seed`). The
-  new auxiliary margin head starts as an exact copy of the old (unscaled)
-  value head.
-
-Function-preservation is claimed **only** for the `embed_global` projection,
-on positions where the dropped columns would have read zero. `compare()`
-verifies this: it pads a contract-6 encoding back out to contract 5's width
-and checks `embed_global`'s output bit for bit. Function-preservation is not
-claimed for the knight collapse or the value-head rescaling, both of which
-are calibrations, nor for a contract-5 checkpoint whose seats had actually
-published a nonzero valuation.
-
-`--checkpoint` must already read contract 5's global-feature width at
-`--players`. The tool refuses a checkpoint already on contract 6, and
-refuses one on neither. `--out` must not already exist unless `--force`.
-
-The result reads today's globals: the blocks contract 7 appended get zero
-columns, as below.
-
-## Migrating a contract-6 checkpoint onto contract 7 (`hexn.migrate_globals`)
+## Migrating a contract-7 checkpoint onto contract 8 (`hexn.migrate_c8`)
 
 ```bash
-python -m hexn.migrate_globals --checkpoint runs/example/iter-00200.pt \
-    --out runs/example/iter-00200-c7.pt
+python -m hexn.migrate_c8 --checkpoint runs/example/iter-00050.pt \
+    --out runs/example/iter-00050-c8.pt --runtime <module> --entrant <bot>
 ```
 
-Contract 7 appends `2 * players` global features after the ledger tail
-(8 at four seats): each seat's roads to take Longest Road over
-`ROADS_TO_TAKE_CAP`, then a one-hot of the seat to move, both seat-relative.
-Every earlier column keeps its offset. The tool appends that many zero
-columns to `embed_global.weight` and changes nothing else in the net, so the
-migrated net computes exactly what the source did on every position; training
-then learns what the new columns are worth. The optimiser's Adam moments for
-that weight get zero columns too, so `--resume` continues from the migrated
-file, and everything else in the checkpoint passes through.
+Contract 8 re-encodes every input, so the four input projections
+(`embed_hex`, `embed_vertex`, `embed_edge`, `embed_global`) change width and
+every other parameter is copied. Each projection is refitted by least squares
+so that its output on the contract-8 inputs matches the old projection's on
+the contract-7 inputs of the same positions, from every seat. Where contract
+8 restates contract 7 linearly (terrain with has-token and the desert, edges,
+ports, the summed counts) the fit is exact; where it does not (building points
+against the building and owner one-hots, the award reads against the holder
+one-hots, expected hands against the ledger) it is the best linear fit on the
+positions given. Contract 8's new information (`seat_reach`,
+`own_dev_playable`, `opponent_dev_ages`, `dev_odds`) starts
+at zero weight.
 
-Before writing, it checks the claim on `--observations` positions (default
-64, each from every seat): the source net on the contract-6 encoding against
-the migrated net on the full one, and prints the largest absolute difference
-of each output (zero up to float reassociation). The report is stored under
-the checkpoint's `migrate_globals` key. A checkpoint already at today's width
-is refused, as is one at neither width; `--out` must not already exist unless
-`--force`.
+Positions come from `--games` seeded games (default 64) among four seats of
+`--entrant` (an arena name, with the `--runtime` that registers it; `random`
+plays uniformly), every `--stride` decisions (default 7), from every seat. A
+quarter of the games are held out. The report, printed and stored under the
+checkpoint's `migrate_c8` key, gives each fit's largest residual and, on the
+held-out games, each projection's and each output's largest difference
+between the old net on contract 7 and the migrated net on contract 8. The
+optimiser state is not carried: a migrated net starts a run, it does not
+resume one. A checkpoint not on contract 7's widths is refused; `--out` must
+not already exist unless `--force`.
+
+A checkpoint whose input projections read another contract's widths is
+refused when it is loaded into a `HexNet`, naming the widths.
 
 ## Widening a checkpoint (`hexn.widen`)
 

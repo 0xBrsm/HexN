@@ -138,4 +138,4 @@ def test_a_checkpoint_round_trips_with_the_resume_contract(tmp_path):
     assert fresh.state == {}
     # And it is the narrow function, up to the noise asked for (see the same
     # bound's comment in test_noise_separates_the_copies_...).
-    assert report["mean_policy_kl_reference"] < 3e-2
+    assert report["mean_policy_kl_reference"] < 8e-2

@@ -1086,6 +1086,21 @@ def test_the_behaviour_weight_is_capped(collected):
     assert policy_term(prox - 10.0) == pytest.approx(ppo.DECOUPLED_CAP * policy_term(prox), rel=1e-5)
 
 
+def test_a_runaway_ratio_stays_finite(collected):
+    # A row the update has moved 200 nats above its anchor, whose behaviour
+    # weight has underflowed to zero: e**200 overflows float32, and the
+    # uncapped surrogate was inf * 0, NaN.
+    policy, episodes = collected
+    batch = assemble(episodes[:1], policy.layout, PPOConfig())
+    prox = ppo.attach_proximal(batch, policy).prox_log_prob
+    _, advantage = _terms(policy, batch, PPOConfig())
+    terms = ppo.minibatch_terms(
+        policy, batch.buffer, batch.mask, batch.chosen, prox + 200.0, advantage,
+        batch.value_target, batch.margin_target, PPOConfig(), prox_log_prob=prox - 200.0,
+    )
+    assert torch.isfinite(terms.policy_loss) and torch.isfinite(terms.loss)
+
+
 def test_decoupled_and_the_proximal_log_probs_come_together(collected):
     policy, episodes = collected
     batch = assemble(episodes, policy.layout, PPOConfig())

@@ -2,6 +2,42 @@
 
 All notable changes to the `hexn` package are recorded here.
 
+## 0.43.0
+
+### Breaking
+
+- **Contract 8: the network reads HexSet's contract-8 observation.**
+  `HexNet`'s four input projections read its widths (hex 7, vertex 14, edge
+  4, globals 75 at four seats). A checkpoint of another contract is refused
+  at load, naming the widths it reads. `hexn.export_onnx` writes contract 8:
+  `RecordEncoder` reads the record's contract-8 fields, and a graph declares
+  only the record fields it reads (27). Contract-6 and contract-7 `.onnx`
+  files keep serving in HexSet.
+
+- **`hexn.migrate` is removed** (contract 5 onto 6): it reads a layout HexSet
+  no longer encodes. `python -m hexn.migrate_c8` carries a contract-7
+  checkpoint onto contract 8.
+
+### Added
+
+- `hexn.migrate_c8`: carries a contract-7 checkpoint onto contract 8. Every
+  parameter but the four input projections is copied; each projection is
+  refitted by least squares so that, on positions from seeded games
+  (`--entrant`, with `--runtime`), its output matches the old net's on the
+  same positions. Where contract 8 restates contract 7 linearly the fit is
+  exact; its new information starts at zero weight. The report -- each fit's
+  residual and each output's largest difference on held-out games -- is
+  printed and kept in the checkpoint's `migrate_c8` block.
+
+### Changed
+
+- **`hexn.export_onnx` writes contract 8.1**: `RecordEncoder` reads the
+  table's rules and the next roll's odds from the record and each seat's
+  points against the points the game is played to. A contract-8 checkpoint
+  loads onto `HexNet` with zero weights on the new global columns, so it
+  plays a 10-point standard game exactly as before, and `--init` takes it
+  as it is. `hexn.migrate_c8` leaves the new columns at zero.
+
 ## 0.42.0
 
 ### Changed

@@ -45,10 +45,8 @@ def as_tensors(record: dict[str, np.ndarray]) -> dict[str, "torch.Tensor"]:
 
 
 def run_encoder(encoder: RecordEncoder, record: dict[str, np.ndarray]):
-    tensors = as_tensors(record)
-    args = [tensors[name] for name in RECORD_FIELDS if name != "action_mask"]
     with torch.no_grad():
-        return encoder(*args)
+        return encoder(as_tensors(record))
 
 
 def assert_exact(got: tuple, want) -> None:
@@ -140,7 +138,7 @@ def test_record_encoder_matches_encode_batch():
 
 
 def test_record_encoder_matches_encode_off_turn_and_with_longest_road_held():
-    """The two contract-7 blocks where they carry information: a perspective
+    """Two blocks where they carry information: a perspective
     that is not the seat to move (the mover one-hot off slot 0) and a seat
     holding Longest Road (its roads-to-take entry 0), from every seat, single
     and batched."""
@@ -226,13 +224,13 @@ def test_the_graph_is_shaped_the_way_hexset_feeds_and_reads_it_v2(tmp_path):
     export(str(checkpoint), out, topology=board.topology)
 
     model = onnx.load(str(out))
-    assert [t.name for t in model.graph.input] == list(RECORD_FIELDS)
+    assert [t.name for t in model.graph.input] == list(_INPUT_NAMES)
     assert [t.name for t in model.graph.output] == list(_OUTPUT_NAMES)
 
     bool_inputs = {"action_mask"}
-    # No float input: contract 6 deleted the public valuation vector
-    # (`hexset.trading`), and every remaining record field is int64.
-    float_inputs: set[str] = set()
+    # Contract 8's expected hands and card ages and contract 8.1's roll odds
+    # are the only float inputs.
+    float_inputs = {"expected_hand", "dev_ages", "roll_odds"}
     for tensor in model.graph.input:
         if tensor.name in bool_inputs:
             expected = onnx.TensorProto.BOOL
@@ -269,7 +267,7 @@ def test_the_graph_is_shaped_the_way_hexset_feeds_and_reads_it_v2(tmp_path):
             assert prior[row].sum() == pytest.approx(1.0, abs=1e-4)
 
 
-def test_the_exported_metadata_says_contract_7_and_matches_the_checkpoints_own_args(tmp_path):
+def test_the_exported_metadata_says_contract_8_1_and_matches_the_checkpoints_own_args(tmp_path):
     checkpoint = tmp_path / "latest.pt"
     board = a_checkpoint(checkpoint, players=3, max_offers=5)
     out = tmp_path / "latest.onnx"
@@ -278,7 +276,7 @@ def test_the_exported_metadata_says_contract_7_and_matches_the_checkpoints_own_a
 
     session = ort.InferenceSession(str(out), providers=["CPUExecutionProvider"])
     meta = session.get_modelmeta().custom_metadata_map
-    assert meta["contract"] == "7"
+    assert meta["contract"] == "8.1"
     assert meta["players"] == "3"
     assert meta["max_offers"] == "5"
     assert meta["iteration"] == "7"
@@ -324,7 +322,7 @@ def test_a_search_export_declares_itself_in_the_keys_hexset_reads(tmp_path):
     meta = ort.InferenceSession(
         str(out), providers=["CPUExecutionProvider"]
     ).get_modelmeta().custom_metadata_map
-    assert meta["contract"] == "7"
+    assert meta["contract"] == "8.1"
     assert meta["search"] == "mcts"
     assert meta["simulations"] == "256"
     assert meta["wave"] == "32"
@@ -343,7 +341,7 @@ def test_a_gate_plies_export_declares_itself_in_the_keys_hexset_reads(tmp_path):
     meta = ort.InferenceSession(
         str(out), providers=["CPUExecutionProvider"]
     ).get_modelmeta().custom_metadata_map
-    assert meta["contract"] == "7"
+    assert meta["contract"] == "8.1"
     assert meta["gate_plies"] == "8"
     assert "search" not in meta
 
@@ -379,8 +377,46 @@ def test_a_search_budget_without_a_search_is_refused_not_written(tmp_path):
         export(str(checkpoint), tmp_path / "x.onnx", topology=board.topology, search="puct")
 
 
-def test_input_names_are_exactly_the_record_fields():
-    """Pins the exporter's input order to `onnx_record.RECORD_FIELDS` --
-    hexset's phase-3 record builder has to produce a dict with exactly
-    these keys, in a contract both repos can only agree on by name."""
-    assert _INPUT_NAMES == RECORD_FIELDS
+def test_input_names_are_the_record_fields_the_graph_reads_in_record_order():
+    """Pins the exporter's inputs to `onnx_record.RECORD_FIELDS` by name and
+    order: a contract-8 graph reads every field but the six only older
+    contracts read, and declares exactly the ones it reads."""
+    assert _INPUT_NAMES == tuple(n for n in RECORD_FIELDS if n in set(_INPUT_NAMES))
+    assert set(RECORD_FIELDS) - set(_INPUT_NAMES) == {
+        "knights_played", "longest_road_holder", "largest_army_holder",
+        "hand_totals", "ledger_known", "ledger_unknown",
+    }
+
+
+def test_record_encoder_matches_encode_where_the_contract_8_blocks_carry_information():
+    """Every seat's frame, a card played this turn, unknown card ages, shown
+    wants and spares, and Largest Army held: single and batched, bit for bit."""
+    games = [a_game(seed=seed, steps=350) for seed in range(60)]
+    live = [g for g in games if not is_over(g)][:12]
+    for i, game in enumerate(live):
+        state = game._state
+        if i % 3 == 0:
+            game.dev_card_played = True
+        if i % 4 == 1:
+            state.dev_ages[(i + 1) % 4] = None
+        rows = game.ledger.seats
+        rows[i % 4].want = [0, 1, 0, 2, 0]
+        rows[(i + 2) % 4].waste = [3, 0, 0, 0, 1]
+        if i % 5 == 2:
+            state.knights_played = [3, 1, 0, 2]
+            state.largest_army_holder = 0
+    space = space_for(live[0])
+    graph = static_graph(live[0].state(0, hidden=False).board.topology)
+    encoder = RecordEncoder(graph, players=4)
+    encoder.eval()
+
+    pairs = [(game, seat) for game in live for seat in range(4)]
+    for game, seat in pairs:
+        record = record_from_game(game, seat, space)
+        got = run_encoder(encoder, {k: v[None] for k, v in record.items()})
+        assert_exact(tuple(g[0] for g in got), encode(game, seat))
+
+    record = record_batch(pairs, space)
+    got = run_encoder(encoder, record)
+    for i, obs in enumerate(encode_batch([g for g, _ in pairs], [s for _, s in pairs])):
+        assert_exact(tuple(g[i] for g in got), obs)
