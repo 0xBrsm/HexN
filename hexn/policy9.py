@@ -8,18 +8,23 @@ The bot asks for one atomic move at a time (`act_rows` over
 turn, the snake seat's double turn, a Road Building card, a discard,
 `hexset.decisions`), the policy chooses the whole decision there, at the
 position before its first move, returns that first move, and keeps the rest as
-the seat's plan: each later ask inside the decision gets the plan's next move.
-Nobody else acts inside a decision and nothing is revealed, so the plan cannot
-go stale; it is checked against the options all the same, and a position
-inside a decision with no plan of its own (one a gate imagined, or a game
-resumed part-way) is finished greedily from the position as it stands.
+the seat's plan (`hexset.decisions.Plans`): each later ask inside the decision
+gets the plan's next move. A position inside a decision with no plan of its
+own (one a gate imagined, or a game resumed part-way) is asked as a decision
+of its legal moves alone (`hexset.decisions.atomic`): its best-scored road.
 
-Greedy: the highest-scored decision. `score_rows` (search priors) is not
-built: the contract-9 reads play one forward. A net whose
+Greedy: the highest-scored option of the decision (`best` over its blocks,
+`Scored`), a tie to the earlier block and then the lower index. An exported
+file chooses with the same rule inside its graph (`hexn.export_onnx9`), so a
+file and the net it was exported from play alike. A net whose
 `ModelConfig.double_turn` is "parts" (one PPO trained) chooses the snake
 seat's double turn as two setup turns, the setup head read once on the board
-before the first and once after it; "joint" (contract-9 BC's) chooses the
-pair at once with the double turn's heads.
+before the first and once after it; "joint" (contract-9 BC's) chooses the pair
+at once with the double turn's heads. `score_rows` reads the decision's
+probability marginalised onto its first atomic move, as a file's `prior`
+does (`hexn.model9.first_move_prior`), so a search a move at a time sees
+every whole option; `option_rows` lists every whole option of a decision with its
+probability, for a caller that searches over whole decisions.
 
 `NetworkPolicy9` is the same net behind `hexn.selfplay.BatchPolicy` for
 self-play: one forward per tick over every learner decision the lanes ask for
@@ -34,6 +39,7 @@ self-play never reads the double turn's heads.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -42,161 +48,348 @@ from hexset import contract9, decisions as D
 from torch import Tensor
 
 from hexset.actions import Action, ActionSpace, ActionType
-from hexset.board.terrain import NUM_RESOURCES
+from hexset.decisions import option_of
 from hexset.encoding import from_frame
 from hexset.game import Game, Phase, pending_free_roads
 
-from .model9 import HexNet, Scores, chosen_scores, collate, decision_entropy, decision_scores, unpack9
+from .model9 import (HexNet, Scores, chosen_scores, collate, decision_entropy, decision_scores, first_move_prior,
+                     unpack9)
 from .policy import Evaluation, keyed_gumbel, keyed_gumbel_at
 from .selfplay import Choice, Request
 
-__all__ = ["Policy9", "NetworkPolicy9", "option_of"]
+__all__ = ["Policy9", "NetworkPolicy9", "Heads9", "Scored", "ranked", "best", "option_of"]
+
+
+# --- choosing a whole decision ----------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Scored:
+    """A score for every option of one `hexset.decisions.Decision`, in its
+    blocks: higher is better, and only a legal entry is read. `flat` is one
+    per action of the flat space (robber victims seat-relative), read where
+    `decision.flat`; `setup` one per incidence, read where `decision.setup`
+    and the decision is not `double`; `double` the double turn's ordered
+    pairs, first by second `(incidences, incidences)`, read where both turns
+    are legal and `hexset.decisions.double_pairs` allows them, `None` for a
+    decision that is not `double`; `road_building` and `discard` one per
+    candidate row of the decision's."""
+
+    flat: np.ndarray
+    setup: np.ndarray
+    road_building: np.ndarray
+    discard: np.ndarray
+    double: np.ndarray | None = None
+
+
+_DOUBLE_OK: dict[int, tuple[object, np.ndarray]] = {}
+
+
+def _double_ok(topology) -> np.ndarray:
+    """`hexset.decisions.double_pairs(topology)`, worked out once per topology
+    (by identity, as `hexset.contract9.incidences` keeps its own)."""
+    held = _DOUBLE_OK.get(id(topology))
+    if held is not None and held[0] is topology:
+        return held[1]
+    out = D.double_pairs(topology)
+    out.flags.writeable = False
+    if len(_DOUBLE_OK) >= 64:
+        _DOUBLE_OK.pop(next(iter(_DOUBLE_OK)))
+    _DOUBLE_OK[id(topology)] = (topology, out)
+    return out
+
+
+def _blocks(decision: D.Decision, scored: Scored, topology) -> list[tuple[D.DecisionKind, np.ndarray]]:
+    """Each block's scores with every illegal entry at `-inf`, in block
+    order: flat, then the setup turn or the double turn, Road Building, the
+    discard."""
+    neg = -np.inf
+    out = [(D.DecisionKind.FLAT, np.where(decision.flat, scored.flat, neg))]
+    if decision.double:
+        if scored.double is None:
+            raise ValueError("a double turn's decision needs its pairs scored")
+        legal = decision.setup[:, None] & decision.setup[None, :] & _double_ok(topology)
+        out.append((D.DecisionKind.DOUBLE, np.where(legal, scored.double, neg).reshape(-1)))
+    else:
+        out.append((D.DecisionKind.SETUP, np.where(decision.setup, scored.setup, neg)))
+    out.append((D.DecisionKind.ROAD_BUILDING, np.asarray(scored.road_building).reshape(-1)))
+    out.append((D.DecisionKind.DISCARD, np.asarray(scored.discard).reshape(-1)))
+    for (kind, scores), rows in zip(out[2:], (decision.road_building, decision.discard)):
+        if len(scores) != len(rows):
+            raise ValueError(f"{kind.name}: {len(scores)} scores for {len(rows)} candidates")
+    return out
+
+
+def ranked(decision: D.Decision, scored: Scored, topology) -> list[tuple[float, D.DecisionKind, int]]:
+    """Every legal option of `decision` as `(score, kind, index)`, in block
+    order (flat, the setup or double turn, Road Building, the discard) and
+    index order within a block. `topology` is the board's."""
+    out = []
+    for kind, scores in _blocks(decision, scored, topology):
+        for index in np.flatnonzero(np.isfinite(scores)):
+            out.append((float(scores[index]), kind, int(index)))
+    return out
+
+
+def best(decision: D.Decision, scored: Scored, topology) -> tuple[D.DecisionKind, int]:
+    """The highest-scored legal option of `decision`, as `(kind, index)`. A
+    tie goes to the earlier block (flat, the setup or double turn, Road
+    Building, the discard), then to the lower index. Raises where the
+    decision has no legal option."""
+    top, chosen = -np.inf, None
+    for kind, scores in _blocks(decision, scored, topology):
+        if not len(scores):
+            continue
+        index = int(np.argmax(scores))
+        if scores[index] > top:
+            top, chosen = float(scores[index]), (kind, index)
+    if chosen is None:
+        raise RuntimeError("a decision with no legal option")
+    return chosen
+
+
+@dataclass(frozen=True)
+class Heads9:
+    """One forward's numbers, numpy, each row in its own frame (row 0 the seat
+    the observation is from): `value` the win head `(B, players)`, `points`
+    the points head (`None` for a net without one), and, asked for a
+    decision's arrays, `flat` `(B, space.size)` (`HexNet.flat_scores`),
+    `setup` `(B, incidences)`, one score per Road Building and discard
+    candidate in the order asked, `double` `(D, incidences, incidences)`
+    for the double-turn rows asked (`None` for a "parts" net), and `prior`
+    `(B, space.size)` where asked (`hexn.model9.first_move_prior`)."""
+
+    value: np.ndarray
+    points: np.ndarray | None = None
+    flat: np.ndarray | None = None
+    setup: np.ndarray | None = None
+    road_building: np.ndarray | None = None
+    discard: np.ndarray | None = None
+    double: np.ndarray | None = None
+    prior: np.ndarray | None = None
+
+
+def _inside(game: Game) -> bool:
+    """Whether `game` stands inside a decision begun a move at a time (a setup
+    road or a free road owed), which `hexset.decisions.tensors` refuses."""
+    return game.phase is Phase.SETUP_ROAD or bool(pending_free_roads(game))
+
+
+def _softmax(logits: np.ndarray) -> np.ndarray:
+    logits = np.asarray(logits, dtype=np.float64)
+    shifted = np.exp(logits - logits.max())
+    return shifted / shifted.sum()
 
 
 class Policy9:
+    """A contract-9 net as a `hexset.clients.policy.Policy` (the module
+    docstring)."""
+
     def __init__(self, net: HexNet, space: ActionSpace, *, device: str = "cpu") -> None:
         self.net = net.eval()
         self.space = space
         self.device = device
         self.players = net.players
-        topology_sizes = (net.num_hexes, net.num_vertices, net.num_edges)
-        self.layout = contract9.layout(net.players, *topology_sizes)
-        # Per game (by identity), the seat whose decision is under way and the
-        # moves of it still to make.
-        self._plans: dict[int, tuple[Game, int, list[Action]]] = {}
+        self.layout = contract9.layout(net.players, net.num_hexes, net.num_vertices, net.num_edges)
+        self.joint = net.config.double_turn == "joint"
+        self._plans = D.Plans()
 
     # --- the forward -------------------------------------------------------------
 
+    def observations(self, rows: Sequence[tuple[Game, int]]) -> np.ndarray:
+        """Each `(game, seat)` as its contract-9 observation row, stacked."""
+        return np.stack([contract9.flatten(contract9.encode9(game, seat)) for game, seat in rows])
+
     def _forward(self, games: Sequence[Game], seats: Sequence[int], *, policy: bool):
-        x = np.stack([contract9.flatten(contract9.encode9(g, s)) for g, s in zip(games, seats)])
+        """The net's `Prediction` on these positions' observations."""
+        x = self.observations(list(zip(games, seats)))
         with torch.no_grad():
             return self.net(**unpack9(self.layout, torch.from_numpy(x).to(self.device)), policy=policy)
+
+    def _heads(self, observations: np.ndarray, arrays: dict[str, np.ndarray] | None, *,
+               prior: bool = False) -> Heads9:
+        """The heads on `observations`: the win and points heads alone where
+        `arrays` is `None`; with a batch of decisions' arrays
+        (`hexset.decisions.arrays`), every score `Heads9` holds for them, and
+        the `prior` if asked."""
+        net = self.net
+
+        def numpy(t: Tensor) -> np.ndarray:
+            return t.float().cpu().numpy()
+
+        def tensor(a: np.ndarray) -> Tensor:
+            return torch.from_numpy(a).to(self.device)
+
+        with torch.no_grad():
+            out = net(**unpack9(self.layout, tensor(observations)), policy=arrays is not None)
+            value, points = numpy(out.value), None if out.points is None else numpy(out.points)
+            if arrays is None:
+                return Heads9(value=value, points=points)
+            rows = torch.arange(len(observations), device=self.device)
+            rb_row, disc_row = tensor(arrays["road_building_row"]), tensor(arrays["discard_row"])
+            rb, disc, double = tensor(arrays["road_building"]), tensor(arrays["discard"]), tensor(arrays["double_rows"])
+            flat, setup = net.flat_scores(out).float(), net.setup_scores(out, rows).float()
+            rb_s = net.road_building_scores(out, rb_row, rb).float() if len(rb) else flat.new_zeros(0)
+            disc_s = net.discard_scores(out, disc_row, disc).float() if len(disc) else flat.new_zeros(0)
+            pairs = None if not self.joint else (
+                net.double_scores(out, double).float() if len(double)
+                else flat.new_zeros((0, len(net.inc_vertex), len(net.inc_vertex))))
+            marginal = None
+            if prior:
+                # Each block's legal scores, `-inf` elsewhere, as `hexn.export_onnx9`'s graph masks them.
+                legal, neg = tensor(arrays["setup"]), float("-inf")
+                single = legal.index_put((double,), torch.tensor(False, device=self.device))
+                masked = None
+                if pairs is not None:
+                    both = legal[double].unsqueeze(2) & legal[double].unsqueeze(1) & net.pairs_ok.unsqueeze(0)
+                    masked = pairs.masked_fill(~both, neg)
+                marginal = numpy(first_move_prior(
+                    net, flat.masked_fill(~tensor(arrays["flat"]), neg), setup.masked_fill(~single, neg),
+                    rb_s, rb_row, disc_s, disc_row, disc, masked, double))
+            return Heads9(value=value, points=points, flat=numpy(flat), setup=numpy(setup),
+                          road_building=numpy(rb_s), discard=numpy(disc_s),
+                          double=None if pairs is None else numpy(pairs), prior=marginal)
+
+    def decision(self, game: Game, seat: int) -> D.Decision:
+        """`seat`'s decision at `game` as this net is asked it: a position
+        inside a decision as its legal moves alone."""
+        if _inside(game):
+            return D.atomic(game, seat, self.space)
+        return D.tensors(game, seat, self.space, double_turn=self.joint)
+
+    def _scored(self, rows: Sequence[tuple[Game, int]], decisions=None, *,
+                prior: bool = False) -> tuple[list, list, Heads9]:
+        """One forward over `rows`: each row's `Decision` (`decision`, unless
+        given) and its `Scored`, and the heads (with the `prior` if asked)."""
+        decisions = [self.decision(game, seat) for game, seat in rows] if decisions is None else list(decisions)
+        arrays = D.arrays(decisions, self.space, rows[0][0]._state.board.topology)
+        heads = self._heads(self.observations(rows), arrays, prior=prior)
+        rb_row, disc_row = arrays["road_building_row"], arrays["discard_row"]
+        double_at = {int(row): i for i, row in enumerate(arrays["double_rows"])}
+        scored = []
+        for row, decision in enumerate(decisions):
+            scored.append(None if decision is None else Scored(
+                flat=heads.flat[row], setup=heads.setup[row],
+                road_building=heads.road_building[rb_row == row], discard=heads.discard[disc_row == row],
+                double=heads.double[double_at[row]] if row in double_at else None,
+            ))
+        return decisions, scored, heads
 
     def value_rows(self, rows: Sequence[tuple[Game, int]]) -> list[tuple[float, ...]]:
         """The win head, one vector per row, in board-seat order."""
         if not rows:
             return []
-        out = self._forward([g for g, _ in rows], [s for _, s in rows], policy=False)
-        values = out.value.float().cpu().numpy()
-        return [tuple(float(v) for v in from_frame(values[i], seat)) for i, (_, seat) in enumerate(rows)]
+        heads = self._heads(self.observations(rows), None)
+        return [tuple(float(v) for v in from_frame(heads.value[i], seat)) for i, (_, seat) in enumerate(rows)]
 
-    def score_rows(self, rows):  # pragma: no cover - not built
-        raise NotImplementedError("contract-9 search priors are not built; play one forward")
+    def points_rows(self, rows: Sequence[tuple[Game, int]]) -> list[tuple[float, ...]]:
+        """The points head, one vector per row, in board-seat order. Raises
+        for a net without one."""
+        if not rows:
+            return []
+        heads = self._heads(self.observations(rows), None)
+        if heads.points is None:
+            raise ValueError("this contract-9 net has no points head")
+        return [tuple(float(v) for v in from_frame(heads.points[i], seat)) for i, (_, seat) in enumerate(rows)]
 
     # --- choosing ------------------------------------------------------------------
 
     def act_rows(self, rows: Sequence[tuple[Game, int, tuple[Action, ...]]]) -> list[Action]:
-        return [self._act(game, seat, options) for game, seat, options in rows]
+        return [self._plans.act(game, seat, options, self._decide, self._finish) for game, seat, options in rows]
 
-    def _act(self, game: Game, seat: int, options: tuple[Action, ...]) -> Action:
-        plan = self._plans.pop(id(game), None)
-        if plan is not None and plan[0] is game and plan[1] == seat and plan[2] and plan[2][0] in options:
-            rest = plan[2][1:]
-            if rest:
-                self._plans[id(game)] = (game, seat, rest)
-            return plan[2][0]
-        if len(options) == 1:
-            return options[0]
-        if game.phase is Phase.SETUP_ROAD or pending_free_roads(game):
-            return self._finish(game, seat, options)
-        choice = self._decide(game, seat)
-        if len(self._plans) > 256:          # a game that ended inside a decision left its plan
-            self._plans.clear()
-        if isinstance(choice, D.Compound):
-            first, rest = choice.parts[0], list(choice.parts[1:])
-            if rest:
-                self._plans[id(game)] = (game, seat, rest)
-            choice = first
+    def _choose(self, game: Game, seat: int):
+        (decision,), (scored,), _ = self._scored([(game, seat)])
+        topology = game._state.board.topology
+        kind, index = best(decision, scored, topology)
+        return option_of(decision, kind, index, contract9.incidences(topology), seat, self.space, self.players)
+
+    def _decide(self, game: Game, seat: int):
+        """The highest-scored decision of `seat`'s at this position."""
+        return self._choose(game, seat)
+
+    def _finish(self, game: Game, seat: int, options: tuple[Action, ...]) -> Action:
+        """A move inside a decision begun without this policy's plan: the
+        best-scored of its legal moves (a road, by the road head)."""
+        choice = self._choose(game, seat)
         if choice not in options:
             raise RuntimeError(f"contract-9 policy chose {choice}, not among {options}")
         return choice
 
-    def _decide(self, game: Game, seat: int):
-        """The highest-scored decision of `seat`'s at this position."""
-        decision = D.tensors(game, seat, self.space, double_turn=self.net.config.double_turn == "joint")
-        out = self._forward([game], [seat], policy=True)
-        net, players = self.net, self.players
-        neg = float("-inf")
-        best: tuple[float, object] = (neg, None)
+    def score_rows(self, rows: Sequence[tuple[Game, int, tuple[Action, ...]]]):
+        """`(priors, values)` per row: the decision's probability marginalised
+        onto its first atomic move (`hexn.model9.first_move_prior`), at each
+        option's flat action, renormalised over the options (uniform where
+        none has mass), and the win head in board-seat order -- what an
+        exported file's `prior` gives."""
+        if not rows:
+            return []
+        _, _, heads = self._scored([(game, seat) for game, seat, _ in rows], prior=True)
+        out = []
+        for i, (game, seat, options) in enumerate(rows):
+            weights = heads.prior[i][[D.flat_index(self.space, o, seat, self.players) for o in options]].astype(
+                np.float64)
+            total = weights.sum()
+            out.append((weights / total if total > 0 else np.full(len(options), 1.0 / len(options)),
+                        tuple(float(v) for v in from_frame(heads.value[i], seat))))
+        return out
 
-        def offer(score: float, option) -> None:
-            nonlocal best
-            if score > best[0]:
-                best = (score, option)
+    def option_rows(self, rows: Sequence[tuple[Game, int]]) -> list[tuple[tuple[D.Option, ...], np.ndarray]]:
+        """Every whole option of each row's decision and its probability, the
+        softmax over all of them, in block order (flat by index, the setup or
+        double turn, Road Building, the discard): what `act_rows` chooses the
+        most probable of. A position inside a decision lists its legal moves."""
+        if not rows:
+            return []
+        decisions, scored, _ = self._scored(rows)
+        out = []
+        for i, (game, seat) in enumerate(rows):
+            topology = game._state.board.topology
+            pairs = contract9.incidences(topology)
+            items = ranked(decisions[i], scored[i], topology)
+            options = tuple(option_of(decisions[i], kind, index, pairs, seat, self.space, self.players)
+                            for _, kind, index in items)
+            out.append((options, _softmax(np.array([score for score, _, _ in items]))))
+        return out
 
-        rows = torch.zeros(1, dtype=torch.long)
-        with torch.no_grad():
-            if decision.flat.any():
-                logits = net.full_logits(out)[0].float().cpu().numpy()
-                legal = np.flatnonzero(decision.flat)
-                index = int(legal[np.argmax(logits[legal])])
-                action = self.space.decode(index)
-                if action.type is ActionType.MOVE_ROBBER and action.b < players:
-                    action = Action(action.type, action.a, (action.b + seat) % players)
-                offer(float(logits[index]), action)
-            if decision.setup.any():
-                pairs = contract9.incidences(game._state.board.topology)
-                legal = torch.from_numpy(decision.setup)
-                if decision.double:
-                    _, first, second, pair = (t[0].float() for t in net.setup_heads(out, rows))
-                    v = net.inc_vertex
-                    scores = first[:, None] + second[None, :] + pair[v][:, v]
-                    ok = legal[:, None] & legal[None, :] & net.pairs_ok
-                    flat = scores.masked_fill(~ok, neg).reshape(-1)
-                    k = int(flat.argmax())
-                    (v1, e1), (v2, e2) = pairs[k // len(pairs)], pairs[k % len(pairs)]
-                    offer(float(flat[k]), D.Compound(D.CompoundKind.SETUP_DOUBLE, D.setup_parts(v1, e1) + D.setup_parts(v2, e2)))
-                else:
-                    masked = net.setup_scores(out, rows)[0].float().masked_fill(~legal, neg)
-                    k = int(masked.argmax())
-                    offer(float(masked[k]), D.Compound(D.CompoundKind.SETUP, D.setup_parts(*pairs[k])))
-            if len(decision.road_building):
-                candidates = torch.from_numpy(decision.road_building.astype(np.int64))
-                scores = net.road_building_scores(out, torch.zeros(len(candidates), dtype=torch.long), candidates)
-                k = int(scores.argmax())
-                roads = tuple(int(e) for e in decision.road_building[k] if e >= 0)
-                offer(float(scores[k]), D.Compound(D.CompoundKind.ROAD_BUILDING, D.road_building_parts(roads)))
-            if len(decision.discard):
-                candidates = torch.from_numpy(decision.discard.astype(np.int64))
-                scores = net.discard_scores(out, torch.zeros(len(candidates), dtype=torch.long), candidates)
-                k = int(scores.argmax())
-                given = decision.discard[k][NUM_RESOURCES:]
-                offer(float(scores[k]), D.Compound(D.CompoundKind.DISCARD, D.discard_parts(given)))
-        if best[1] is None:
-            raise RuntimeError("contract-9 policy found no decision to make")
-        return best[1]
+    def answers(self, observations: np.ndarray, arrays: dict[str, np.ndarray],
+                topology) -> dict[str, np.ndarray]:
+        """What an exported graph answers for this feed (`hexn.export_onnx9`),
+        computed on the torch net: `decision` `(B, 2)` (`best` per row, `(0,
+        0)` for a row with nothing legal), `value`, `prior`
+        (`hexn.model9.first_move_prior`) and, for a net with one, `points`.
+        For checking a file against the net it was exported from."""
+        decisions = _decisions_of(arrays, self.space)
+        heads = self._heads(observations, arrays, prior=True)
+        rb_row, disc_row = arrays["road_building_row"], arrays["discard_row"]
+        double_at = {int(row): i for i, row in enumerate(arrays["double_rows"])}
+        chosen = np.zeros((len(observations), 2), dtype=np.int64)
+        for row, decision in enumerate(decisions):
+            scored = Scored(flat=heads.flat[row], setup=heads.setup[row],
+                            road_building=heads.road_building[rb_row == row], discard=heads.discard[disc_row == row],
+                            double=heads.double[double_at[row]] if row in double_at else None)
+            try:
+                chosen[row] = best(decision, scored, topology)
+            except RuntimeError:
+                pass
+        out = {"decision": chosen, "value": heads.value, "prior": heads.prior}
+        if heads.points is not None:
+            out["points"] = heads.points
+        return out
 
-    def _finish(self, game: Game, seat: int, options: tuple[Action, ...]) -> Action:
-        """A move inside a decision begun without this policy's plan: the
-        best-scored road among the options, by the road head."""
-        out = self._forward([game], [seat], policy=True)
-        with torch.no_grad():
-            road = out.road[0].float().cpu().numpy()
-        return max(options, key=lambda a: road[a.a] if a.type in (ActionType.BUILD_ROAD, ActionType.SETUP_ROAD) else -np.inf)
+
+def _decisions_of(arrays: dict[str, np.ndarray], space: ActionSpace) -> list[D.Decision]:
+    """The `Decision`s a batch of `hexset.decisions.arrays` was stated from."""
+    rows = len(arrays["flat"])
+    double = set(int(r) for r in arrays["double_rows"])
+    out = []
+    for row in range(rows):
+        rb = arrays["road_building"][arrays["road_building_row"] == row].astype(np.int16).reshape(-1, 2)
+        disc = arrays["discard"][arrays["discard_row"] == row].astype(np.int8).reshape(-1, 10)
+        out.append(D.Decision(arrays["flat"][row], arrays["setup"][row], row in double, rb, disc))
+    return out
 
 
 # --- self-play -------------------------------------------------------------------------
-
-
-def option_of(decision: D.Decision, kind: int, index: int, pairs, seat: int, space: ActionSpace,
-              players: int) -> D.Option:
-    """The option `(kind, index)` names in `decision` (`hexset.decisions.locate`
-    the other way): an action, its robber victim back in board seats, or a
-    `Compound`. `pairs` is the board's `contract9.incidences`."""
-    if kind == D.DecisionKind.FLAT:
-        action = space.decode(index)
-        if action.type is ActionType.MOVE_ROBBER and action.b < players:
-            action = Action(action.type, action.a, (action.b + seat) % players)
-        return action
-    if kind == D.DecisionKind.SETUP:
-        return D.Compound(D.CompoundKind.SETUP, D.setup_parts(*pairs[index]))
-    if kind == D.DecisionKind.DOUBLE:
-        first, second = divmod(index, len(pairs))
-        return D.Compound(D.CompoundKind.SETUP_DOUBLE, D.setup_parts(*pairs[first]) + D.setup_parts(*pairs[second]))
-    if kind == D.DecisionKind.ROAD_BUILDING:
-        roads = tuple(int(e) for e in decision.road_building[index] if e >= 0)
-        return D.Compound(D.CompoundKind.ROAD_BUILDING, D.road_building_parts(roads))
-    return D.Compound(D.CompoundKind.DISCARD, D.discard_parts(decision.discard[index][NUM_RESOURCES:]))
 
 
 def _block_argmax(scores: np.ndarray, rows: np.ndarray, batch: int) -> tuple[np.ndarray, np.ndarray]:

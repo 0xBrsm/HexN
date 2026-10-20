@@ -2,6 +2,53 @@
 
 All notable changes to the `hexn` package are recorded here.
 
+## 0.45.0
+
+### Added
+
+- **Contract-9 checkpoints export to ONNX** (`hexn.export_onnx9`; `python -m
+  hexn.export_onnx` and `export` dispatch to it on the checkpoint's own
+  contract) as a decision graph: it reads HexSet's contract-9 observation
+  and the decision's masks and candidates (`hexset.decisions.arrays`; a
+  "joint" net also the double turn's rows) and answers `decision`, chosen in
+  the graph (the legal masks and the argmax over the decision's blocks,
+  `hexn.policy9.best`), `value`, `prior` and, for a net with one, `points`.
+  `prior` is the softmax over every legal option of the decision
+  marginalised onto its first atomic move (`hexn.model9.first_move_prior`,
+  which `Policy9.score_rows` reads too): a setup turn's and the double
+  turn's mass on the first settlement, every Road Building set's on playing
+  the card, a discard's on each kind of card it gives by its share of the
+  cards, so a search asked a move at a time sees every whole option; a
+  decision of flat actions alone keeps the flat softmax. The heads, how
+  each block is scored and how the double turn is chosen stay inside the
+  graph. The file declares `contract` 9 and `max_offers` 0 unless asked, with
+  the provenance keys a contract-8 export writes, and `search` with
+  `simulations`/`wave` where asked (`--search mcts`), as contract 8 does; a
+  parity check against `hexn.policy9.Policy9`, on seeded positions of every
+  kind of decision, runs after every export and raises.
+
+- **Serving keys on the export's command line**, for either contract:
+  `--max-offers`, `--trade-floor`, `--trader-veto` (which needs `--trader`
+  and an offer budget), `--gate-own-frame` and `--robber-tip`, written as
+  `hexset.clients._modelmeta` reads them (`hexn.export_onnx9.serving_props`).
+
+- **`HexNet.double_scores`** (the double turn's score of every ordered pair
+  of setup turns) and **`HexNet.flat_scores`** (every flat action's score, a
+  setup road scored by the road head).
+
+### Changed
+
+- **`hexn.policy9.Policy9` chooses by `best`** over a decision's blocks
+  (`Scored`, `ranked` and `best`, in `hexn.policy9`), the rule an exported
+  graph chooses by, and plays the whole decision through HexSet's `Plans`:
+  the same moves as before. A position inside a decision with no plan is
+  asked as its legal moves alone (`hexset.decisions.atomic`), its best road
+  as before. `score_rows` reads the softmax of the flat scores over the legal
+  flat actions at every position, as a file's `prior` does, so a robber tip
+  and robber deals read it; `option_rows` lists every whole option of a
+  decision with its probability. `option_of` is `hexset.decisions.option_of`,
+  still importable from `hexn.policy9`.
+
 ## 0.44.0
 
 ### Added

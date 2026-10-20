@@ -39,14 +39,15 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 
-from hexset.actions import ActionSpace, ActionType
+from hexset.actions import Action, ActionSpace, ActionType
+from hexset.board.terrain import NUM_RESOURCES
 from hexset.contract9 import (
     HEX_FEATURES, SEAT_FEATURES, TABLE_FEATURES, VERTEX_FEATURES, Layout9, incidences,
 )
 from hexset.decisions import DecisionKind, double_pairs
 
 __all__ = ["DOUBLE_TURNS", "ModelConfig", "config_of", "HexNet", "Prediction", "Scores", "unpack9", "collate", "decision_scores",
-           "chosen_scores", "decision_entropy", "decision_log_prob"]
+           "chosen_scores", "decision_entropy", "decision_log_prob", "first_move_prior"]
 
 
 # `ModelConfig.double_turn`'s choices.
@@ -312,6 +313,7 @@ class HexNet(nn.Module):
         self.register_buffer("slot_city", block(ActionType.BUILD_CITY), persistent=False)
         self.register_buffer("slot_road", block(ActionType.BUILD_ROAD), persistent=False)
         self.register_buffer("slot_robber", block(ActionType.MOVE_ROBBER), persistent=False)
+        self.register_buffer("slot_setup_road", block(ActionType.SETUP_ROAD), persistent=False)
         self.register_buffer("slot_global", torch.cat([block(k) for k in _GLOBAL_KINDS]), persistent=False)
 
     def _initialise(self) -> None:
@@ -548,7 +550,9 @@ class HexNet(nn.Module):
         victims = self.robber_head(torch.cat([
             uh.unsqueeze(2).expand(-1, -1, self.players, -1),
             s.unsqueeze(1).expand(-1, uh.shape[1], -1, -1)], -1)).squeeze(-1)     # (R, H, P)
-        return torch.cat([victims, self.nobody_head(uh)], -1).reshape(len(rows), -1)
+        # `rows.shape[0]`, not `len(rows)`: the same number, and one an ONNX
+        # trace keeps as the batch's own size (`hexn.export_onnx9`).
+        return torch.cat([victims, self.nobody_head(uh)], -1).reshape(rows.shape[0], -1)
 
     def full_logits(self, out: Prediction) -> Tensor:
         """The whole flat logits, the robber block included, for every row."""
@@ -566,6 +570,24 @@ class HexNet(nn.Module):
         pair = self.pair_head(u) @ u.transpose(1, 2) / u.shape[-1] ** 0.5
         return (self.setup_head(ends).squeeze(-1), self.first_head(ends).squeeze(-1),
                 self.second_head(ends).squeeze(-1), pair)
+
+    def flat_scores(self, out: Prediction) -> Tensor:
+        """Every flat action's score for every row: `full_logits`, with a
+        setup road scored as the road head scores its edge, so a position
+        inside a setup turn, asked a move at a time, reads the road head. A
+        setup turn asked whole is scored by `setup_scores`."""
+        logits = self.full_logits(out)
+        return logits.index_copy(1, self.slot_setup_road, out.road.to(logits.dtype))
+
+    def double_scores(self, out: Prediction, rows: Tensor) -> Tensor:
+        """For `rows`, the double turn's score of every ordered pair of setup
+        turns, `(R, incidences, incidences)`, first by second: the first turn's,
+        the second (paying) turn's and the pair term of their settlements,
+        unmasked (`hexset.decisions.Scored.double`). A "parts" net has no such
+        heads."""
+        _, first, second, pair = self.setup_heads(out, rows)
+        v = self.inc_vertex
+        return first.unsqueeze(2) + second.unsqueeze(1) + pair[:, v][:, :, v]
 
     def setup_scores(self, out: Prediction, rows: Tensor) -> Tensor:
         """For `rows`, per (settlement, road) incidence the setup turn's score
@@ -748,6 +770,51 @@ def decision_log_prob(net: HexNet, out: Prediction, batch: dict[str, Tensor]) ->
     scores = decision_scores(net, out, batch)
     chosen = chosen_scores(scores, batch)
     return chosen - scores.total, chosen >= _best(scores)
+
+
+def first_move_prior(net: HexNet, flat: Tensor, setup: Tensor, rb: Tensor, rb_row: Tensor, disc: Tensor,
+                     disc_row: Tensor, discards: Tensor, double: Tensor | None = None,
+                     double_rows: Tensor | None = None) -> Tensor:
+    """`(B, space.size)`: the softmax over every legal option of each row's
+    decision, ordinary and compound together, marginalised onto the option's
+    first atomic move, as a table asks the moves one at a time
+    (`hexset.decisions.Plans`): a flat action keeps its own probability, a
+    setup turn and the double turn go to their first settlement, every Road
+    Building set to playing the card, and a discard, its cards given in an
+    order drawn uniformly, to each kind it gives by the share of its cards
+    that kind is. Zeros where nothing has a first move. A decision of flat
+    actions alone (a position inside a decision among them) reads the softmax
+    of its flat scores. The scores are each block's as `decision_scores`
+    states them, `-inf` where illegal: `flat` `(B, space.size)`, `setup`
+    `(B, incidences)`, `rb`/`disc` the candidates' beside their rows,
+    `discards` `(Kd, 10)` the candidates themselves, and `double` `(D,
+    incidences, incidences)` on `double_rows`. Traceable: an exported file
+    answers it as `prior` (`hexn.export_onnx9`)."""
+    space = net.space
+    batch, size = flat.shape
+    neg = flat.new_full((batch,), float("-inf"))
+    tops = [flat.amax(1), setup.amax(1), neg.scatter_reduce(0, rb_row, rb, reduce="amax", include_self=True),
+            neg.scatter_reduce(0, disc_row, disc, reduce="amax", include_self=True)]
+    if double is not None:
+        tops.append(neg.index_put((double_rows,), double.flatten(1).amax(1)))
+    top = torch.stack(tops, 1).amax(1)
+    top = torch.where(torch.isfinite(top), top, torch.zeros_like(top))
+    settle = space.offsets[ActionType.SETUP_SETTLEMENT] + net.inc_vertex             # each incidence's settlement
+    out = torch.exp(flat - top[:, None]).scatter_add(1, settle.expand(batch, -1), torch.exp(setup - top[:, None]))
+    out = out.reshape(-1)
+    if double is not None:
+        first = torch.exp(double - top[double_rows][:, None, None]).sum(2)                   # (D, incidences)
+        out = out.scatter_add(0, (double_rows[:, None] * size + settle[None, :]).reshape(-1), first.reshape(-1))
+    card = space.index(Action(ActionType.PLAY_ROAD_BUILDING))
+    out = out.scatter_add(0, rb_row * size + card, torch.exp(rb - top[rb_row]))
+    given = discards[:, NUM_RESOURCES:].to(out.dtype)
+    share = given / given.sum(1, keepdim=True).clamp(min=1)
+    kinds = space.index(Action(ActionType.DISCARD)) + torch.arange(NUM_RESOURCES, device=out.device)
+    out = out.scatter_add(0, (disc_row[:, None] * size + kinds[None, :]).reshape(-1),
+                          (torch.exp(disc - top[disc_row])[:, None] * share).reshape(-1))
+    out = out.reshape(batch, size)
+    total = out.sum(1, keepdim=True)
+    return torch.where(total > 0, out / total.clamp(min=1e-30), torch.zeros_like(out))
 
 
 def _best(scores: Scores) -> Tensor:

@@ -67,6 +67,12 @@ record fields. A contract-8 checkpoint loads onto it with zero weights on
 the new columns (`hexn.model.HexNet`), and so plays a standard game exactly
 as it did.
 
+**Contract 9** reads HexSet's own contract-9 observation and the arrays of
+the decision at hand, which the server builds, and answers the whole
+decision. A contract-9 checkpoint (`hexn.model9.HexNet`) is exported by
+`hexn.export_onnx9`, whose docstring is that contract; `export` and the
+command line dispatch to it by the checkpoint's own `contract`.
+
 * **Inputs**, a dynamic leading batch axis, named as
   `hexset.onnx_record.RECORD_FIELDS` names them, in its order: the 32 of its
   38 a contract-8.1 graph reads (`_INPUT_NAMES`; board, position, information
@@ -116,6 +122,11 @@ Needs `torch` (not a declared dependency of this package -- see
     python -m hexn.export_onnx --checkpoint runs/first/latest.pt --out model.onnx
     python -m hexn.export_onnx --checkpoint runs/first/latest.pt \\
         --out mcts256.onnx --search mcts --simulations 256
+
+The serving keys a served file carries -- `--max-offers`, `--trade-floor`,
+`--trader`, `--trader-veto`, `--gate-own-frame`, `--gate-plies`,
+`--robber-tip` -- are written as asked, for either contract
+(`hexn.export_onnx9.serving_props`).
 
 Then drop the file into hexset's `models/`; its stem is the name in the
 in-game picker.
@@ -188,9 +199,11 @@ _BOOL_INPUTS = frozenset({"action_mask"})
 _FLOAT_INPUTS: frozenset[str] = frozenset({"expected_hand", "dev_ages", "roll_odds"})
 _INT_OUTPUTS = frozenset({"action_index"})
 
-# The only value `hexset.clients._modelmeta.search_config` acts on; anything else in
-# the `search` key is read as "no search", so writing anything else would be
-# a silent no-op rather than a setting.
+# The searches this exporter writes. `hexset.clients._modelmeta.search_config`
+# also reads `rollout`, whose keys a file is stamped with afterwards
+# (`hexset.clients.onnxmeta.with_metadata`); anything else in the `search` key
+# is read as "no search", so writing it would be a silent no-op rather than a
+# setting.
 _SEARCHES = ("none", "mcts")
 
 
@@ -561,6 +574,7 @@ def _embed_metadata(
     wave: int | None,
     gate_plies: int | None,
     trader: str | None = None,
+    serving: dict[str, str] | None = None,
 ) -> None:
     """The facts `hexset.clients.onnxbot.load()` needs back at runtime: which
     contract the graph speaks, enough to build an `ActionSpace`, enough to
@@ -603,6 +617,9 @@ def _embed_metadata(
     # trader trades through its own gate (`hexset.clients._modelmeta`).
     if trader is not None:
         props["trader"] = trader
+    # The serving keys asked for (`hexn.export_onnx9.serving_props`), over
+    # the recorded budget where one is asked for.
+    props.update(serving or {})
 
     model = onnx.load(str(path))
     onnx.helper.set_model_props(model, props)
@@ -722,8 +739,11 @@ def export(
     wave: int | None = None,
     gate_plies: int | None = None,
     trader: str | None = None,
+    serving: dict[str, str] | None = None,
 ) -> Path:
     """Load `checkpoint`, trace it to `out`, verify contract and parity, return `out`.
+    A contract-9 checkpoint is exported by `hexn.export_onnx9.export9`, with
+    the same search keys.
 
     `search="mcts"` (with an optional `simulations`/`wave` budget) makes the
     file ask hexset to search over its own priors; the default plays one
@@ -742,11 +762,26 @@ def export(
     `trader` names a HexSet bot, as a lineup names it, to answer the served
     file's trades while the network plays every move (`hexset.arena.traded`).
     `None` writes the trader the run trained with, if it had one.
+
+    `serving` is further serving keys to write as they are
+    (`hexn.export_onnx9.serving_props`).
     """
     if search not in _SEARCHES:
         raise ValueError(f"search must be one of {_SEARCHES}, not {search!r}")
     if search == "none" and (simulations is not None or wave is not None):
         raise ValueError("simulations/wave only mean something with search='mcts'")
+    from .export_onnx9 import export9, is_contract9
+
+    if is_contract9(checkpoint):
+        keys = dict(serving or {})
+        if search == "mcts":
+            keys["search"] = "mcts"
+            keys.update((k, str(v)) for k, v in (("simulations", simulations), ("wave", wave)) if v is not None)
+        if trader is not None:
+            keys["trader"] = trader
+        if gate_plies is not None:
+            keys["gate_plies"] = str(gate_plies)
+        return export9(checkpoint, out, topology=topology, opset=opset, serving=keys)
 
     topology = topology or _base_topology()
     net, space, meta = _load_checkpoint(checkpoint, topology)
@@ -790,6 +825,7 @@ def export(
         simulations=simulations,
         wave=wave,
         gate_plies=gate_plies,
+        serving=serving,
         **meta,
     )
     _verify_contract(out, shapes)
@@ -844,11 +880,35 @@ def main(argv: list[str] | None = None) -> None:
         "plays every move. Default: the trader the run trained with, if any. "
         "Written as metadata; the server that loads the file needs the same runtime.",
     )
+    parser.add_argument("--max-offers", type=int, default=None,
+                        help="Offers a turn the served seat may make (its gate's budget; a trader veto needs "
+                        "one above 0). Default: the run's recorded budget; 0 for a contract-9 net.")
+    parser.add_argument("--trade-floor", type=float, default=None,
+                        help="The win-probability gain a trade must clear at the file's own gate.")
+    parser.add_argument("--trader-veto", action="store_true",
+                        help="The file's own gate vetoes its --trader: each exchange must clear its floor too.")
+    parser.add_argument("--gate-own-frame", type=int, choices=(0, 1), default=None,
+                        help="Price another seat's turn from the file's own frame (1) or the mover's (0).")
+    parser.add_argument("--robber-tip", type=float, default=None,
+                        help="How far its robber moves lean to the leader its value head names, in [0, 1].")
     runtime.add_argument(parser)
     args = parser.parse_args(argv)
     runtime.load(args.runtime)
     if args.search == "none" and (args.simulations is not None or args.wave is not None):
         parser.error("--simulations/--wave need --search mcts")
+    from .export_onnx9 import serving_props
+
+    try:
+        serving = serving_props(
+            max_offers=args.max_offers, trader_veto=args.trader_veto, trade_floor=args.trade_floor,
+            gate_own_frame=None if args.gate_own_frame is None else bool(args.gate_own_frame),
+            robber_tip=args.robber_tip,
+            # Checked here with the trader it vetoes; written by `export` as `--trader`.
+            **({"trader": args.trader} if args.trader_veto else {}),
+        )
+    except ValueError as error:
+        parser.error(str(error))
+    serving.pop("trader", None)
 
     checkpoint = Path(args.checkpoint)
     out = args.out or checkpoint.with_suffix(".onnx")
@@ -861,6 +921,7 @@ def main(argv: list[str] | None = None) -> None:
         wave=args.wave,
         gate_plies=args.gate_plies,
         trader=args.trader,
+        serving=serving,
     )
     print(f"wrote {path}")
 
