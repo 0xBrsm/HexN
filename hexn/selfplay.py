@@ -46,7 +46,7 @@ from hexset import contract9
 from hexset import decisions as D
 from hexset.actions import Action, ActionSpace, mask_of, space_for
 from hexset.arena import MAX_ACTIONS, deal_board, deal_game
-from hexset.board.board import Board
+from hexset.board.board import BOARD_MODES, Board
 from hexset.encoding import Observation, encode_batch
 from hexset.game import MAX_TURNS, Game, Phase
 # `_Lane` is internal to HexSet (an underscore name, outside `__all__`), used
@@ -58,7 +58,7 @@ from hexset.gym.lanes import Episode as LaneEpisode
 from hexset.outlook import outlook_of
 from hexset.victory import victory_points
 from hexset.gym.lanes import Request as LaneRequest
-from hexset.record import Record, Tape, recording
+from hexset.record import Record
 from hexset.rules import STANDARD_GAME, GameType
 
 if TYPE_CHECKING:
@@ -98,7 +98,7 @@ SAMPLE_STREAMS = ("worker", "game")
 # `contract`): "8" encodes `hexset.encoding` and asks for one atomic action a
 # decision; "9" encodes `hexset.contract9` and asks the learner for whole
 # decisions (`hexset.decisions`, `hexset.gym.lanes.LaneEnv`'s `decisions`).
-CONTRACTS = ("8", "9")
+CONTRACTS = ("8", "9", "9.1")
 
 _MASK64 = (1 << 64) - 1
 _GOLDEN64 = 0x9E3779B97F4A7C15
@@ -461,38 +461,21 @@ class RuledLaneEnv(LaneEnv):
         # `Game.coalition`, where its `targeted:` seats read it
         # (`hexn.coalition.Targeted`).
         self.coalition = coalition
+        from hexset.gym.distribution import Deal
+
+        mode = kwargs.get("board_mode", "random")
+        if kwargs.get("deal_law") is not None:
+            raise ValueError("a legacy game_law cannot be combined with deal_law")
+        kwargs["deal_law"] = lambda index: Deal(*self.game_law(index), board_mode=mode)
         super().__init__(*args, **kwargs)
 
     def _fresh(self) -> _Lane | None:
-        if self._stop is not None and self._next >= self._stop:
-            return None
-        index = self._next
-        self._next += self.stride
-        cast = self._cast(index)
-        game_type, retired = self.game_law(index)
-        board = self.board(index) if callable(self.board) else self.board
-        rules = game_type.rules
-        game = deal_game(
-            self.seed,
-            index,
-            self.players,
-            board=board,
-            chance=(lambda rng: recording(rng, rules)) if self.records else None,
-            game_type=game_type,
-            locked=retired,
-            turn_cap=self.turn_cap,
-        )
-        game.gates = self._seat_gates(game, cast)
-        plan = None if self.coalition is None else self.coalition(index)
-        if plan is not None:
-            game.coalition = plan
-        return _Lane(
-            index=index,
-            game=game,
-            cast=cast,
-            by_seat=[[] for _ in range(self.players)],
-            tape=Tape() if self.records else None,
-        )
+        lane = super()._fresh()
+        if lane is not None and self.coalition is not None:
+            plan = self.coalition(lane.index)
+            if plan is not None:
+                lane.game.coalition = plan
+        return lane
 
 
 def standard_law(index: int) -> tuple[GameType, frozenset[int]]:
@@ -574,11 +557,13 @@ class Collector:
         pair_boards: bool = False,
         temperatures: Callable[[int], Sequence[float]] | None = None,
         game_law: Callable[[int], tuple[GameType, frozenset[int]]] | None = None,
+        deal_law: Callable | None = None,
         coalition: Callable[[int], object] | None = None,
         sample_stream: str = "worker",
         outlook: bool = False,
         contract: str = "8",
         discard_order: str = "seat",
+        board_mode: str = "random",
     ) -> None:
         """`first_game` is where the game counter starts.
 
@@ -619,6 +604,9 @@ class Collector:
         asked for whole decisions and files a `Transition9` per decision;
         beside it sit scripted bots only, which act a move at a time.
         `discard_order` is `hexset.gym.lanes.DISCARD_ORDERS`' choice.
+        `board_mode` names how each game's board is dealt
+        (`hexset.board.board.BOARD_MODES`); a `deal_law` names its own per
+        game, so the two do not combine.
 
         `sink`, when set, is handed every episode the tick it finishes -- what
         keeps a game on disk before the batch it belongs to ends
@@ -637,7 +625,7 @@ class Collector:
             raise ValueError(f"sample_stream must be one of {SAMPLE_STREAMS}, got {sample_stream!r}")
         if contract not in CONTRACTS:
             raise ValueError(f"contract must be one of {CONTRACTS}, got {contract!r}")
-        if contract == "9":
+        if contract in ("9", "9.1"):
             if any(not isinstance(o, BoardBots) for o in opponents) or tuple(learners) != (0,):
                 raise ValueError("a contract-9 collector seats scripted bots beside its one learner; "
                                  "another network would be asked a move at a time")
@@ -645,6 +633,11 @@ class Collector:
                 raise ValueError("a contract-9 collector reads no outlook and plays every seat at 1.0")
         if caster is not None and not opponents:
             raise ValueError("a caster without opponents has nobody to cast")
+        if board_mode not in BOARD_MODES:
+            raise ValueError(f"unknown board mode {board_mode!r}: {sorted(BOARD_MODES)}")
+        if board_mode != "random" and (deal_law is not None or pair_boards or board is not None):
+            raise ValueError("board_mode deals each game's own board; a deal_law, pair_boards or a fixed "
+                             "board= decides the board itself")
         if pair_boards and board is not None:
             raise ValueError(
                 "pair_boards deals each pair its own shared board; a fixed "
@@ -654,6 +647,7 @@ class Collector:
         self.policy = policy
         self.contract = contract
         self.discard_order = discard_order
+        self.board_mode = board_mode
         self.sample_stream = sample_stream
         self.outlook = outlook
         self.opponents = tuple(opponents)
@@ -665,6 +659,9 @@ class Collector:
         # caster (`hexn.collect.mix_deal`); None deals the standard game at
         # every seat, as every run before `duel(...)` did.
         self.game_law = game_law
+        if deal_law is not None and (game_law is not None or pair_boards):
+            raise ValueError("deal_law cannot be combined with game_law or pair_boards")
+        self.deal_law = deal_law
         # Game index -> the game's coalition plan or None, pure in the index
         # like the caster (`hexn.collect.mix_coalitions`); None hangs nothing
         # on any game.
@@ -786,6 +783,7 @@ class Collector:
             action_cap=self.action_cap,
             turn_cap=self.turn_cap,
             board=self._paired_board if self.pair_boards else self.board,
+            deal_law=self.deal_law,
             caster=None if self.caster is None else self._cast,
             # `bench.bot` rather than `bench.spawn`: the bench a caller built
             # (`hexn.collect.named_opponent`) is the one that must hold the
@@ -805,7 +803,8 @@ class Collector:
             # cohort this should be switched off for.
             records=True,
             discard_order=self.discard_order,
-            decisions=(0,) if self.contract == "9" else (),
+            board_mode=self.board_mode,
+            decisions=(0,) if self.contract in ("9", "9.1") else (),
             **extra,
         )
 
@@ -821,7 +820,7 @@ class Collector:
         if not asked:
             # Every seat this tick is played by a bot inside the environment.
             return []
-        if self.contract == "9":
+        if self.contract in ("9", "9.1"):
             return self._requests9(asked)
         observations = encode_batch(
             [request.game for request in asked], [request.seat for request in asked]
@@ -867,7 +866,7 @@ class Collector:
             out.append(Request(
                 lane=request.lane,
                 seat=request.seat,
-                observation=contract9.flatten(contract9.encode9(request.game, request.seat)),
+                observation=contract9.flatten(contract9.encode9(request.game, request.seat, self.contract)),
                 mask=request.decision.flat,
                 options=(),
                 game=request.game,

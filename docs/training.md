@@ -6,6 +6,18 @@ resumed). All three share one checkpoint format, one evaluation harness and
 one network builder, in `hexn.loop`. This page describes what each mode
 does, and the mechanics they share.
 
+Contract `9.1` adds public rule inputs to contract `9`'s shared seat and
+table tokens. `--contract 9.1 --rules-mix '<JSON>'` freezes a
+`hexset.gym.distribution.Distribution` specification into the PPO manifest;
+it is supported for self-play with an empty `--mix`. All games keep the
+same number of dealt slots (`--players`); unused seats retire before setup.
+Checkpoints record the observation contract in `model_config`, and both
+checkpoint play and ONNX export use it. Loading contract-9 weights into a
+9.1 model appends zero input columns, preserving standard-game predictions
+before fine-tuning. Its win softmax and points predictions exclude retired
+slots. The auxiliary points target averages opponents and counts rounds
+over live seats only, with zero targets at retired slots.
+
 ## PPO self-play (`hexn.ppo`)
 
 ```bash

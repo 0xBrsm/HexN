@@ -90,6 +90,8 @@ PARSERS: dict[str, Callable[[], argparse.ArgumentParser]] = {}
 # to `max_offers`) is not a fill.
 ADDED: dict[str, dict[str, Any]] = {
     "ppo": {
+        "rules_mix": "",
+        "board_mode": "random",
         "runtime": [],
         "sample_stream": "worker",
         "collect_trunk": "reference",
@@ -121,12 +123,14 @@ ADDED: dict[str, dict[str, Any]] = {
         "c9_clip": "per-decision",
     },
     "exit": {
+        "collect_trunk": "reference",
         "k": 1,
         "keep_recent": 0,
         "step_checkpoint_every": 0,
         "micro_batch": 0,
         "prior_kl": 0.0,
     },
+    "league": {"collect_trunk": "reference"},
 }
 
 
@@ -296,7 +300,10 @@ def freeze(
     recorded run meant.
     """
     parser = _parser_for(mode)
-    resolved = vars(parser.parse_args(argv))
+    from .resources import resolve
+    args = parser.parse_args(argv)
+    resolve(args)
+    resolved = vars(args)
     expected = parameters(mode)
     missing = expected - set(resolved)
     if missing:

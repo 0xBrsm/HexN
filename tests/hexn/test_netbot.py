@@ -117,6 +117,33 @@ def test_a_head_shape_round_trips_through_the_checkpoints_args_dict(tmp_path):
     load.cache_clear()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.parametrize("loader", ["arena", "frozen"])
+def test_gpu_checkpoint_evaluation_defaults_to_equivalent_fused_execution(checkpoint, loader):
+    import copy
+    import numpy as np
+    from hexset.actions import apply
+    from hexn.collect import frozen
+
+    path, board = checkpoint
+    fast = (load(path, board.topology, "cuda").policy if loader == "arena"
+            else frozen(path, "cuda", board, 4))
+    assert fast.net.fused
+    reference = copy.deepcopy(fast)
+    reference.net.fused = False
+    game, rng = start(board, 4, random.Random(12)), random.Random(13)
+    rows = []
+    for _ in range(32):
+        options = tuple(legal_actions(game))
+        rows.append((copy.deepcopy(game), to_move(game), options))
+        apply(game, rng.choice(options))
+    actual, expected = fast.score_rows(rows), reference.score_rows(rows)
+    for (prior, value), (old_prior, old_value) in zip(actual, expected):
+        np.testing.assert_allclose(prior, old_prior, rtol=0, atol=1e-5)
+        np.testing.assert_allclose(value, old_value, rtol=0, atol=1e-5)
+    assert fast.act_rows(rows) == reference.act_rows(rows)
+
+
 def test_the_offer_budget_comes_from_the_checkpoint_unless_overridden(checkpoint):
     path, board = checkpoint
     assert a_bot(path, board).max_offers == 3

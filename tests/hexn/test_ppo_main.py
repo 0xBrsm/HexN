@@ -17,6 +17,8 @@ from hexn.ppo import __main__ as ppo_main  # noqa: E402
 TINY = [
     "--device",
     "cpu",
+    "--collect-workers",
+    "1",
     "--width",
     "8",
     "--rounds",
@@ -928,6 +930,46 @@ def test_a_config_frozen_before_the_defaults_keeps_its_values():
 
 C9 = ["--contract", "9", "--messages", "pooled", "--no-attention", "--points-head", "--aux-target", "zero_sum",
       "--aux-margin-weight", "0.1", "--action-cap", "400"]
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+def test_rule_conditioned_manifests_collect_update_save_and_resume(tmp_path, parallel):
+    from hexset.arena import deal_game
+    from hexn import netbot
+
+    torch.set_num_threads(1)
+    law = json.dumps({"presets": [{"weight": 1, "players": 2, "winning_points": 13, "discard_limit": 8,
+                                    "friendly_robber": True, "balanced_dice": True, "board_mode": "spiral"}]})
+    flags = C9 + ["--contract", "9.1", "--rules-mix", law, "--action-cap", "48",
+                  "--games-per-iteration", "2", "--lanes", "2", "--collect-trunk", "fused"]
+    if parallel:
+        flags += ["--collect-workers", "2", "--async-collect", "--decoupled"]
+    assert run(tmp_path, 2, flags) == 0
+    assert run(tmp_path, 3, flags + ["--resume"]) == 0
+    lines = [json.loads(line) for line in (tmp_path / "log.jsonl").read_text().splitlines()]
+    trained = [line for line in lines if "positions" in line]
+    assert [line["iteration"] for line in trained] == [0, 1, 2]
+    assert len({line["batch_fingerprint"] for line in trained}) == 3
+    state = torch.load(tmp_path / "latest.pt", weights_only=False)
+    assert state["model_config"]["contract"] == "9.1" and state["args"]["rules_mix"] == law
+    loaded = netbot.load(str(tmp_path / "latest.pt"), deal_game(0, 0, 4)._state.board.topology)
+    assert loaded.policy.net.CONTRACT == "9.1" and loaded.iteration == 3
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+def test_a_board_mode_run_trains_on_its_boards_and_is_refused_beside_a_rules_mix(tmp_path, parallel):
+    torch.set_num_threads(1)
+    flags = C9 + ["--board-mode", "spiral", "--action-cap", "48", "--games-per-iteration", "2", "--lanes", "2",
+                  "--collect-trunk", "fused"]
+    if parallel:
+        flags += ["--collect-workers", "2", "--async-collect", "--decoupled"]
+    assert run(tmp_path, 1, flags) == 0
+    state = torch.load(tmp_path / "latest.pt", weights_only=False)
+    assert state["args"]["board_mode"] == "spiral"
+    law = json.dumps({"presets": [{"weight": 1, "players": 4, "winning_points": 10, "discard_limit": 7,
+                                    "friendly_robber": False, "balanced_dice": False, "board_mode": "spiral"}]})
+    with pytest.raises(SystemExit):
+        run(tmp_path / "mixed", 1, C9 + ["--contract", "9.1", "--rules-mix", law, "--board-mode", "spiral"])
 
 
 def test_a_contract_9_init_from_a_joint_checkpoint_drops_the_joint_head(tmp_path, capsys):

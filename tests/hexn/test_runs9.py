@@ -319,13 +319,14 @@ def test_a_parts_net_plays_the_double_turn_a_setup_turn_at_a_time():
     model = net(scale=0.05)
     bot = Policy9(model, model.space)
     asked = []
-    original = bot._decide
+    original = bot._choose_many
 
-    def decide(game, seat):
-        asked.append((seat, D.tensors(game, seat, model.space, double_turn=False).double, D.is_double_turn(game)))
-        return original(game, seat)
+    def decide(rows):
+        for game, seat in rows:
+            asked.append((seat, D.tensors(game, seat, model.space, double_turn=False).double, D.is_double_turn(game)))
+        return original(rows)
 
-    bot._decide = decide
+    bot._choose_many = decide
     assert model.first_head is None      # a "parts" net has no joint head to read
     game = deal_game(5, 0, 4)
     while game.phase in (Phase.SETUP_SETTLEMENT, Phase.SETUP_ROAD):

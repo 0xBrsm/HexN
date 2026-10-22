@@ -42,7 +42,7 @@ from torch import Tensor, nn
 from hexset.actions import Action, ActionSpace, ActionType
 from hexset.board.terrain import NUM_RESOURCES
 from hexset.contract9 import (
-    HEX_FEATURES, SEAT_FEATURES, TABLE_FEATURES, VERTEX_FEATURES, Layout9, incidences,
+    CONTRACTS, HEX_FEATURES, SEAT_FEATURES, TABLE_FEATURES, VERTEX_FEATURES, Layout9, features, incidences,
 )
 from hexset.decisions import DecisionKind, double_pairs
 
@@ -91,8 +91,11 @@ class ModelConfig:
     # and pair heads: a "parts" net carries no parameter it never reads, and a
     # "joint" checkpoint initialises one through `without_joint_head`.
     double_turn: str = "joint"
+    contract: str = "9"
 
     def __post_init__(self) -> None:
+        if self.contract not in CONTRACTS:
+            raise ValueError(f"unknown decision contract {self.contract!r}")
         for shape in (self.heads, self.discard):
             if shape not in ("linear", "mlp"):
                 raise ValueError(f"unknown head shape {shape!r}")
@@ -105,7 +108,8 @@ class ModelConfig:
 def config_of(model_config: dict) -> ModelConfig:
     """The `ModelConfig` a checkpoint's `model_config` names; one written
     before `heads` existed trained MLP heads."""
-    return ModelConfig(width=model_config["width"], rounds=model_config["rounds"],
+    return ModelConfig(contract=str(model_config.get("contract", "9")),
+                         width=model_config["width"], rounds=model_config["rounds"],
                          heads=model_config.get("heads", "mlp"), discard=model_config.get("discard", "mlp"),
                          norm=model_config.get("norm", False), messages=model_config.get("messages", "separate"),
                          attention=model_config.get("attention", True), points=model_config.get("points", False),
@@ -239,15 +243,17 @@ class HexNet(nn.Module):
     def __init__(self, space: ActionSpace, topology, players: int, config: ModelConfig | None = None) -> None:
         super().__init__()
         self.config = config or ModelConfig()
+        self.CONTRACT = self.config.contract
         self.players = players
         self.space = space
         width = self.config.width
         hexes, vertices, edges = topology.num_hexes, topology.num_vertices, topology.num_edges
         self.num_hexes, self.num_vertices, self.num_edges = hexes, vertices, edges
 
-        self.embed_seat = nn.Linear(SEAT_FEATURES, width)
-        self.embed_table = nn.Linear(TABLE_FEATURES, width)
-        self.embed_hex = nn.Linear(HEX_FEATURES, width)
+        seat_features, table_features = features(self.CONTRACT)
+        self.embed_seat = nn.Linear(seat_features, width)
+        self.embed_table = nn.Linear(table_features, width)
+        self.embed_hex = nn.Linear(HEX_FEATURES + int(self.CONTRACT == "9.1"), width)
         self.embed_vertex = nn.Linear(VERTEX_FEATURES, width)
         self.rounds = nn.ModuleList(_Round(width, self.config.norm, self.config.messages == "pooled",
                                            self.config.attention)
@@ -316,6 +322,19 @@ class HexNet(nn.Module):
         self.register_buffer("slot_setup_road", block(ActionType.SETUP_ROAD), persistent=False)
         self.register_buffer("slot_global", torch.cat([block(k) for k in _GLOBAL_KINDS]), persistent=False)
 
+    def _load_from_state_dict(self, state_dict, prefix, *args):
+        # A 9.1 net can start from 9: only the appended input blocks are
+        # new. Every other key and shape is still checked by torch's loader.
+        if self.CONTRACT == "9.1":
+            for name, old_width in (("embed_seat.weight", SEAT_FEATURES), ("embed_table.weight", TABLE_FEATURES),
+                                    ("embed_hex.weight", HEX_FEATURES)):
+                key = prefix + name
+                weight = state_dict.get(key)
+                target = self.state_dict()[name]
+                if weight is not None and tuple(weight.shape) == (target.shape[0], old_width):
+                    state_dict[key] = nn.functional.pad(weight, (0, target.shape[1] - old_width))
+        super()._load_from_state_dict(state_dict, prefix, *args)
+
     def _initialise(self) -> None:
         """`hexn.model.HexNet._initialise`'s scheme: orthogonal √2 through the
         trunk, 0.01 on every layer that emits a logit, 1.0 on the win head."""
@@ -351,7 +370,7 @@ class HexNet(nn.Module):
         if self.fused:
             s, t, h, v = self._fused_trunk(seats, table, hexes, vertices, vertex_owner, road_owner, reach)
             h, v, s, t = self.out_hex(h), self.out_vertex(v), self.out_seat(s), self.out_table(t)
-            value_logits, value, points = self._value(s, t)
+            value_logits, value, points = self._value(s, t, seats)
             if not policy:
                 return Prediction(value=value, value_logits=value_logits, points=points)
             return self._emit(s, t, h, v, value, value_logits, points)
@@ -394,7 +413,7 @@ class HexNet(nn.Module):
             t = t + r.table(torch.cat([tn, r.norm_seat(s.mean(1)), r.norm_hex(h.mean(1)),
                                        r.norm_vertex(v.mean(1))], -1))
         h, v, s, t = self.out_hex(h), self.out_vertex(v), self.out_seat(s), self.out_table(t)
-        value_logits, value, points = self._value(s, t)
+        value_logits, value, points = self._value(s, t, seats)
         if not policy:
             return Prediction(value=value, value_logits=value_logits, points=points)
         return self._emit(s, t, h, v, value, value_logits, points)
@@ -517,12 +536,19 @@ class HexNet(nn.Module):
         t = t + r.table(torch.cat([tn, r.norm_seat(s.mean(1)), r.norm_hex(h.mean(1)), r.norm_vertex(v.mean(1))], -1))
         return h, v, s, t
 
-    def _value(self, s: Tensor, t: Tensor) -> tuple[Tensor, Tensor, Tensor | None]:
+    def _value(self, s: Tensor, t: Tensor, seats: Tensor) -> tuple[Tensor, Tensor, Tensor | None]:
         """The win head's logits and softmax over seats, and the points head's
         number per seat where the net has one: each seat token read with the table."""
         read = torch.cat([s, t.unsqueeze(1).expand_as(s)], -1)
         value_logits = self.value_head(read).squeeze(-1)
         points = None if self.points_head is None else self.points_head(read).squeeze(-1).float()
+        if self.CONTRACT == "9.1":
+            live = seats[..., SEAT_FEATURES] > 0.5
+            # Finite logits keep categorical cross-entropy's zero targets
+            # finite even in fp16. Softmax gives retired slots exactly zero.
+            value_logits = value_logits.masked_fill(~live, -1e4)
+            if points is not None:
+                points = points.masked_fill(~live, 0.0)
         return value_logits, torch.softmax(value_logits, -1), points
 
     def _emit(self, s: Tensor, t: Tensor, h: Tensor, v: Tensor, value: Tensor, value_logits: Tensor,

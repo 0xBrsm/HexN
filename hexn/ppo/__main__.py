@@ -47,7 +47,7 @@ from typing import Sequence
 
 import torch
 
-from hexset.board.board import random_base_board
+from hexset.board.board import BOARD_MODES, random_base_board
 from .. import durable, runtime
 from ..collect import (
     ParallelCollector,
@@ -111,9 +111,8 @@ MANY_CORES = 8
 def _crippled(device: str, collect_workers: int, cores: int) -> bool:
     """CPU training, or a lone collector idling most of a many-core box.
 
-    Both are the *defaults*, so this only fires for a launch nobody pointed
-    anywhere -- the same failure shape as a flag that quietly does nothing
-    because nothing checks that it stuck.
+    Explicit resource settings, including historical manifests, can still
+    choose these. New manifests resolve resources before launch.
     """
     return device == "cpu" or (collect_workers == 0 and cores > MANY_CORES)
 
@@ -127,7 +126,7 @@ def build_parser() -> argparse.ArgumentParser:
     adding a flag here cannot silently produce manifests that omit it.
     """
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--device", default="auto", help="auto selects a GPU when available, else CPU")
     # At or below --games-per-iteration: a cohort deals that many games, so
     # lanes above it never fill. See --collect-mode.
     parser.add_argument("--lanes", type=int, default=32)
@@ -166,6 +165,12 @@ def build_parser() -> argparse.ArgumentParser:
         "(the default), each finishing its discard before the next; seat, the lowest first, as every run "
         "frozen before this flag (hexset.gym.lanes)",
     )
+    parser.add_argument("--rules-mix", default="",
+                        help="JSON specification for hexset.gym.distribution.Distribution; "
+                        "contract 9.1 self-play only, frozen in the run manifest")
+    parser.add_argument("--board-mode", choices=sorted(BOARD_MODES), default="random",
+                        help="how every self-play game's board is dealt (hexset.board.board.BOARD_MODES); "
+                        "a --rules-mix names its own")
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--adam-eps", type=float, default=ADAM_EPS)
     parser.add_argument(
@@ -382,9 +387,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--collect-workers",
         type=int,
-        default=0,
+        default=None,
         help="shard collection across N processes with CPU inference; "
-        "0 keeps the single in-process collector",
+        "default: available CPUs minus two, capped by lanes and games; "
+        "0 or 1 keeps the single in-process collector",
     )
     parser.add_argument(
         "--collect-mode",
@@ -494,6 +500,8 @@ def resolve_defaults(args) -> None:
     are collect workers to prefetch with and the update is not sharded, and
     decoupled PPO exactly when collection is async. An explicit value -- including
     the `false` / `""` every config frozen before these defaults carries -- stands."""
+    from ..run.resources import resolve
+    resolve(args)
     gpu = torch.device(args.device).type == "cuda"
     args.fused = resolve_fused(args)
     amp = getattr(args, "amp", "")
@@ -537,6 +545,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     # bad combination frozen into a manifest fails with the same sentence it
     # would have as a flag.
     parser = build_parser()
+    rules_mix = getattr(args, "rules_mix", "")
+    if rules_mix:
+        if args.contract != "9.1" or args.mix:
+            parser.error("--rules-mix requires --contract 9.1 and an empty --mix (self-play)")
+        from hexset.gym.distribution import Distribution
+        try:
+            Distribution(rules_mix, args.players, args.seed)
+        except (ValueError, TypeError, KeyError) as exc:
+            parser.error(f"invalid --rules-mix: {exc}")
+    if getattr(args, "board_mode", "random") != "random" and rules_mix:
+        parser.error("--board-mode cannot be combined with --rules-mix, which deals its own boards")
     runtime.load(getattr(args, "runtime", None))
     try:
         check_trader(getattr(args, "trader", None), args.max_offers)
@@ -578,7 +597,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "kill in any other iteration still goes back to latest.pt",
             file=sys.stderr,
         )
-    if args.contract == "9":
+    if args.contract in ("9", "9.1"):
         # What a contract-9 run is not built for: the ladder plays contract-8
         # nets (reads go through `network:<.pt>` instead), and the sharded
         # update, a parent and the network trader read contract 8's rows.
@@ -704,7 +723,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         # the rounds a supervised trunk was trained with, say -- fails here,
         # loudly, rather than training a half-initialised net.
         seed_state = torch.load(args.init, map_location=args.device, weights_only=False)
-        if config.contract == "9" and policy.net.config.double_turn == "parts":
+        if config.contract in ("9", "9.1") and policy.net.config.double_turn == "parts":
             # A contract-9 BC checkpoint carries the joint double-turn heads;
             # this net plays the snake seat a setup turn at a time and has none.
             from ..model9 import without_joint_head
@@ -715,7 +734,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         grafted = config.fast_win and not any(
             key.startswith("fast_win.") for key in seed_state["net"]
         )
-        fresh_points = (config.contract == "9" and policy.net.points_head is not None
+        fresh_points = (config.contract in ("9", "9.1") and policy.net.points_head is not None
                         and not any(key.startswith("points_head.") for key in seed_state["net"]))
         if fresh_points:
             # A contract-9 checkpoint trained without the points head: every
@@ -861,8 +880,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     trunk=args.collect_trunk,
                     precision=args.collect_precision,
                     contract=str(getattr(args, "contract", "8")),
-                    net9=tuple(net9_config(args).items()) if config.contract == "9" else (),
+                    net9=tuple(net9_config(args).items()) if config.contract in ("9", "9.1") else (),
                     discard_order=getattr(args, "discard_order", "seat"),
+                    rules_mix=rules_mix,
+                    board_mode=getattr(args, "board_mode", "random"),
                 )
                 for worker in range(args.collect_workers)
             ],
@@ -901,11 +922,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 mix_temperatures(mix, args.players, args.seed) if mix else None
             ),
             game_law=mix_deal(mix, args.players, args.seed) if mix else None,
+            deal_law=Distribution(rules_mix, args.players, args.seed) if rules_mix else None,
             coalition=mix_coalitions(mix, args.players, args.seed) if mix else None,
             sample_stream=args.sample_stream,
             outlook=config.aux_target == "outlook",
             contract=config.contract,
             discard_order=getattr(args, "discard_order", "seat"),
+            board_mode=getattr(args, "board_mode", "random"),
         )
 
     crew = None
@@ -1010,7 +1033,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 games.clear()
                 return got
             print(f"helper: {got}; decoding cohort {cohort} here", flush=True)
-        if config.contract == "9":
+        if config.contract in ("9", "9.1"):
             return assembled_here(games, cohort)
         return by_index(collector.decode(games))
 
@@ -1042,7 +1065,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 # The workers act with last iteration's weights until this lands,
                 # so the sync is inside the loop and before the collect, always.
                 collector.sync(policy.net)
-            if config.contract == "9" and isinstance(collector, ParallelCollector):
+            if config.contract in ("9", "9.1") and isinstance(collector, ParallelCollector):
                 collector.start_collect(args.games_per_iteration, partial=durable.partial(collecting, iteration))
                 episodes = assembled_here(collector.receive(), iteration)
             else:

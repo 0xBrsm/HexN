@@ -2,6 +2,50 @@
 
 All notable changes to the `hexn` package are recorded here.
 
+## 0.46.0
+
+### Added
+
+- **Rule-conditioned self-play.** `--contract 9.1` reads public rules,
+  conditional dice odds and live-seat flags. `--rules-mix` freezes a
+  weighted per-game format distribution into the PPO manifest. Loading a
+  contract-9 checkpoint zero-pads the appended input weights; standard
+  four-seat predictions are preserved. Checkpoint play and ONNX export
+  support both observation contracts.
+
+- **Board mode for self-play.** `--board-mode` (`random`, the default, or
+  `spiral`) deals every self-play game's board by
+  `hexset.board.board.BOARD_MODES`, on any contract; `Collector` and
+  `WorkerSpec` take it as `board_mode`. It cannot be combined with
+  `--rules-mix`, which deals its own boards. Manifests frozen before it
+  load as `random`.
+
+### Changed
+
+- CPU checkpoint inference reuses identical complete input rows within a
+  forward through HexSet's batch helpers, restoring every decision and value
+  head to the original row and candidate order.
+
+- **Training resources default to the available hardware.** New PPO,
+  expert-iteration and league manifests select a GPU when available and
+  reserve two CPUs for learning and assembly, using the remaining CPUs for
+  collection up to the lane and cohort counts. These choices are frozen at
+  manifest creation; explicit resource settings stay explicit. Expert
+  iteration and league workers default to the fused collect trunk, and GPU
+  checkpoint evaluation uses the fused trunk.
+
+- **Batched checkpoint decisions.** `Policy9.act_rows` evaluates every row
+  needing a new decision in one network forward, while consuming compound
+  plans in their original order. Forced moves and cached plans need no
+  forward; an evicted plan is recomputed when reached.
+
+### Fixed
+
+- Retired seats receive no win probability or points prediction under
+  contract `9.1`. Zero-sum points targets count live seats for relative
+  points and the per-round discount.
+
+
 ## 0.45.0
 
 ### Added

@@ -40,6 +40,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import partial
 
 import numpy as np
 import torch
@@ -51,6 +52,7 @@ from hexset.actions import Action, ActionSpace, ActionType
 from hexset.decisions import option_of
 from hexset.encoding import from_frame
 from hexset.game import Game, Phase, pending_free_roads
+from hexset.clients.batching import coalesce
 
 from .model9 import (HexNet, Scores, chosen_scores, collate, decision_entropy, decision_scores, first_move_prior,
                      unpack9)
@@ -190,7 +192,7 @@ class Policy9:
         self.space = space
         self.device = device
         self.players = net.players
-        self.layout = contract9.layout(net.players, net.num_hexes, net.num_vertices, net.num_edges)
+        self.layout = contract9.layout(net.players, net.num_hexes, net.num_vertices, net.num_edges, net.CONTRACT)
         self.joint = net.config.double_turn == "joint"
         self._plans = D.Plans()
 
@@ -198,7 +200,7 @@ class Policy9:
 
     def observations(self, rows: Sequence[tuple[Game, int]]) -> np.ndarray:
         """Each `(game, seat)` as its contract-9 observation row, stacked."""
-        return np.stack([contract9.flatten(contract9.encode9(game, seat)) for game, seat in rows])
+        return np.stack([contract9.flatten(contract9.encode9(game, seat, self.net.CONTRACT)) for game, seat in rows])
 
     def _forward(self, games: Sequence[Game], seats: Sequence[int], *, policy: bool):
         """The net's `Prediction` on these positions' observations."""
@@ -213,6 +215,21 @@ class Policy9:
         (`hexset.decisions.arrays`), every score `Heads9` holds for them, and
         the `prior` if asked."""
         net = self.net
+        grouped = coalesce({"observation": observations, **(arrays or {})}) if str(self.device) == "cpu" else None
+        if grouped is not None:
+            observations = grouped.feed["observation"]
+            if arrays is not None:
+                arrays = {name: grouped.feed[name] for name in arrays}
+
+        def restore(heads: Heads9) -> Heads9:
+            if grouped is None:
+                return heads
+            parts = {}
+            for name in Heads9.__dataclass_fields__:
+                values = getattr(heads, name)
+                indices = grouped.candidates.get("double_rows" if name == "double" else name, grouped.inverse)
+                parts[name] = None if values is None else values[indices]
+            return Heads9(**parts)
 
         def numpy(t: Tensor) -> np.ndarray:
             return t.float().cpu().numpy()
@@ -224,7 +241,7 @@ class Policy9:
             out = net(**unpack9(self.layout, tensor(observations)), policy=arrays is not None)
             value, points = numpy(out.value), None if out.points is None else numpy(out.points)
             if arrays is None:
-                return Heads9(value=value, points=points)
+                return restore(Heads9(value=value, points=points))
             rows = torch.arange(len(observations), device=self.device)
             rb_row, disc_row = tensor(arrays["road_building_row"]), tensor(arrays["discard_row"])
             rb, disc, double = tensor(arrays["road_building"]), tensor(arrays["discard"]), tensor(arrays["double_rows"])
@@ -246,9 +263,9 @@ class Policy9:
                 marginal = numpy(first_move_prior(
                     net, flat.masked_fill(~tensor(arrays["flat"]), neg), setup.masked_fill(~single, neg),
                     rb_s, rb_row, disc_s, disc_row, disc, masked, double))
-            return Heads9(value=value, points=points, flat=numpy(flat), setup=numpy(setup),
+            return restore(Heads9(value=value, points=points, flat=numpy(flat), setup=numpy(setup),
                           road_building=numpy(rb_s), discard=numpy(disc_s),
-                          double=None if pairs is None else numpy(pairs), prior=marginal)
+                          double=None if pairs is None else numpy(pairs), prior=marginal))
 
     def decision(self, game: Game, seat: int) -> D.Decision:
         """`seat`'s decision at `game` as this net is asked it: a position
@@ -262,7 +279,7 @@ class Policy9:
         """One forward over `rows`: each row's `Decision` (`decision`, unless
         given) and its `Scored`, and the heads (with the `prior` if asked)."""
         decisions = [self.decision(game, seat) for game, seat in rows] if decisions is None else list(decisions)
-        arrays = D.arrays(decisions, self.space, rows[0][0]._state.board.topology)
+        arrays = D.arrays(decisions, self.space, rows[0][0].state(rows[0][1], hidden=False).board.topology)
         heads = self._heads(self.observations(rows), arrays, prior=prior)
         rb_row, disc_row = arrays["road_building_row"], arrays["discard_row"]
         double_at = {int(row): i for i, row in enumerate(arrays["double_rows"])}
@@ -295,22 +312,43 @@ class Policy9:
     # --- choosing ------------------------------------------------------------------
 
     def act_rows(self, rows: Sequence[tuple[Game, int, tuple[Action, ...]]]) -> list[Action]:
-        return [self._plans.act(game, seat, options, self._decide, self._finish) for game, seat, options in rows]
+        """Ask the net once for rows needing a decision, then consume plans
+        in row order. A plan evicted during the batch is recomputed where
+        needed, just as when asking one row at a time."""
+        ask = [i for i, (game, seat, options) in enumerate(rows)
+               if len(options) > 1 and not self._plans.planned(game, seat, options)]
+        chosen = dict(zip(ask, self._choose_many([rows[i][:2] for i in ask])))
+        out = []
+        for i, (game, seat, options) in enumerate(rows):
+            choose = (lambda g, s, i=i: chosen.pop(i)) if i in chosen else self._choose
+            out.append(self._plans.act(game, seat, options, choose, partial(self._finish, choose=choose)))
+        return out
 
     def _choose(self, game: Game, seat: int):
-        (decision,), (scored,), _ = self._scored([(game, seat)])
-        topology = game._state.board.topology
-        kind, index = best(decision, scored, topology)
-        return option_of(decision, kind, index, contract9.incidences(topology), seat, self.space, self.players)
+        (choice,) = self._choose_many([(game, seat)])
+        return choice
+
+    def _choose_many(self, rows: Sequence[tuple[Game, int]]) -> list[D.Option]:
+        """The highest-scored decision per row, from one network forward."""
+        if not rows:
+            return []
+        decisions, scored, _ = self._scored(rows)
+        out = []
+        for (game, seat), decision, scores in zip(rows, decisions, scored):
+            topology = game.state(seat, hidden=False).board.topology
+            kind, index = best(decision, scores, topology)
+            out.append(option_of(decision, kind, index, contract9.incidences(topology),
+                                 seat, self.space, self.players))
+        return out
 
     def _decide(self, game: Game, seat: int):
         """The highest-scored decision of `seat`'s at this position."""
         return self._choose(game, seat)
 
-    def _finish(self, game: Game, seat: int, options: tuple[Action, ...]) -> Action:
+    def _finish(self, game: Game, seat: int, options: tuple[Action, ...], *, choose=None) -> Action:
         """A move inside a decision begun without this policy's plan: the
         best-scored of its legal moves (a road, by the road head)."""
-        choice = self._choose(game, seat)
+        choice = (self._choose if choose is None else choose)(game, seat)
         if choice not in options:
             raise RuntimeError(f"contract-9 policy chose {choice}, not among {options}")
         return choice
@@ -343,7 +381,7 @@ class Policy9:
         decisions, scored, _ = self._scored(rows)
         out = []
         for i, (game, seat) in enumerate(rows):
-            topology = game._state.board.topology
+            topology = game.state(seat, hidden=False).board.topology
             pairs = contract9.incidences(topology)
             items = ranked(decisions[i], scored[i], topology)
             options = tuple(option_of(decisions[i], kind, index, pairs, seat, self.space, self.players)
@@ -429,7 +467,7 @@ class NetworkPolicy9:
         self.greedy = greedy
         self.generator = generator
         self.precision = "fp32"
-        self.layout = contract9.layout(net.players, net.num_hexes, net.num_vertices, net.num_edges)
+        self.layout = contract9.layout(net.players, net.num_hexes, net.num_vertices, net.num_edges, net.CONTRACT)
         self.incidences = int(net.inc_vertex.shape[0])
         self._pairs = None
 
@@ -471,7 +509,7 @@ class NetworkPolicy9:
             points = None if out.points is None else out.points.float().cpu().numpy()
         if self._pairs is None:
             # The net's buffers are one topology's, so every board it plays has it.
-            self._pairs = contract9.incidences(requests[0].game._state.board.topology)
+            self._pairs = contract9.incidences(requests[0].game.state(requests[0].seat, hidden=False).board.topology)
         out_choices = []
         for row, request in enumerate(requests):
             kind, index = int(kinds[row]), int(indices[row])

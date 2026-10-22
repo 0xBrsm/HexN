@@ -442,7 +442,7 @@ def add_net9_flags(parser: argparse.ArgumentParser) -> None:
     `net9_config` reads them by. Inert under contract 8."""
     parser.add_argument(
         "--contract",
-        choices=("8", "9"),
+        choices=("8", "9", "9.1"),
         default="8",
         help="the network contract: 8, hexn.model.HexNet on hexset.encoding and one action a decision; 9, "
         "hexn.model9.HexNet on hexset.contract9, asked for whole decisions (hexset.decisions)",
@@ -467,7 +467,8 @@ def net9_config(args) -> dict:
     `add_net9_flags` adds. Self-play chooses the snake seat's double turn as
     two setup turns (`double_turn="parts"`), so a checkpoint it saves is read
     the same way by `hexn.netbot.load`."""
-    return {"heads": args.heads, "discard": args.discard_head, "norm": bool(args.norm),
+    return {"contract": str(getattr(args, "contract", "9")), "heads": args.heads,
+            "discard": args.discard_head, "norm": bool(args.norm),
             "messages": args.messages, "attention": bool(args.attention), "points": bool(args.points_head),
             "double_turn": "parts"}
 
@@ -476,11 +477,11 @@ def model_record(policy) -> dict:
     """What a checkpoint carries beside `args` for `hexn.netbot.load` to
     rebuild its net: a contract-9 net's `model_config`, nothing for contract 8
     (whose shape `args` records)."""
-    if getattr(policy.net, "CONTRACT", "8") != "9":
+    if getattr(policy.net, "CONTRACT", "8") not in ("9", "9.1"):
         return {}
     from dataclasses import asdict
 
-    return {"model_config": {**asdict(policy.net.config), "contract": "9"}}
+    return {"model_config": {**asdict(policy.net.config), "contract": policy.net.CONTRACT}}
 
 
 def resolve_fused(args) -> bool:
@@ -494,12 +495,14 @@ def resolve_fused(args) -> bool:
 
 
 def build(args) -> tuple[NetworkPolicy, torch.optim.Optimizer, object]:
+    from .run.resources import resolve
+    resolve(args)
     rng = random.Random(args.seed)
     board = random_base_board(rng)
     game = start(board, args.players, rng)
     space = space_for(game)
     graph = static_graph(board.topology)
-    if str(getattr(args, "contract", "8")) == "9":
+    if str(getattr(args, "contract", "8")) in ("9", "9.1"):
         from .model9 import HexNet as HexNet9, ModelConfig as ModelConfig9
         from .policy9 import NetworkPolicy9
 

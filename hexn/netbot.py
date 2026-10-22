@@ -109,7 +109,7 @@ def load(
     state = torch.load(path, map_location=device, weights_only=False)
     args = state.get("args", {})
     players = int(args.get("players", 4))
-    if str(args.get("contract", "")) == "9":
+    if str(args.get("contract", "")) in ("9", "9.1"):
         return _load9(state, args, topology, players, device)
     # The head shapes read the same way width and rounds do, and default to the
     # shape every checkpoint written before they existed was trained with. A
@@ -124,6 +124,7 @@ def load(
     )
     net = HexNet(space, graph, players, config)
     net.load_state_dict(state["net"])
+    net.fused = torch.device(device).type == "cuda"
     net = net.to(device).eval()
     if compile_mode != "none":
         net = torch.compile(net, mode=compile_mode)

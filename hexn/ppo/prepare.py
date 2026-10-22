@@ -144,7 +144,7 @@ def prepare(
     Contract-9 games are assembled from their columns (`prepare_columns9`):
     they are encoded once more here (`hexn.gamefile`, exact), which only a
     collector that hands back objects -- the in-process one -- pays for."""
-    if config.contract == "9":
+    if config.contract in ("9", "9.1"):
         from .. import gamefile
 
         return prepare_columns9(
@@ -350,7 +350,7 @@ def prepare_columns9(columns, config: PPOConfig, players: int):
     from ..rewards import win_loss
     from . import advantages, observation_dtype, zero_sum_targets
 
-    if config.contract != "9":
+    if config.contract not in ("9", "9.1"):
         raise ValueError("contract-9 columns make a contract-9 batch")
     zero_sum = config.aux_target == "zero_sum"
     chosen, kinds, log_probs, advantage_blocks, targets, margins = [], [], [], [], [], []
@@ -372,6 +372,8 @@ def prepare_columns9(columns, config: PPOConfig, players: int):
                 np.asarray([row[at["turns"]] for row in rows], dtype=np.int64),
                 np.asarray([row[at["seat_points"]] for row in rows], dtype=np.float64).reshape(len(rows), seats),
                 outcome.points, config.zero_sum,
+                live=[s not in (fields["record"].locked if fields.get("record") is not None else ())
+                      for s in range(seats)],
             )
         k = 0
         for seat, count in enumerate(game["counts"]):

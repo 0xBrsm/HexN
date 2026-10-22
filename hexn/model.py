@@ -539,10 +539,10 @@ class HexNet(nn.Module):
         # they are derived from the graph, not learned, and must not become
         # state_dict keys old checkpoints fail strict loading over.
         # Same numbers up to float reassociation; the equivalence test
-        # compares the two paths. Default OFF: the dense GEMMs do ~6x the
-        # gather path's arithmetic, so whether they win depends on the host;
-        # the learner opts in with `--fused` on `hexn.ppo` and the collect
-        # workers with `--collect-trunk fused`.
+        # compares the two paths. The bare module keeps the gather path for
+        # CPU execution: dense GEMMs do more arithmetic. Trainers and
+        # checkpoint loaders select the fused path on GPU; collect workers
+        # default to fused execution for their batched CPU inference.
         self.register_buffer(
             "A_vh", _mean_adjacency(hex_vertex[1], hex_vertex[0], graph.num_vertices, graph.num_hexes), persistent=False
         )

@@ -268,7 +268,9 @@ def _sample_rows(players: int, count: int, seed: int) -> list:
         if is_over(game):
             continue
         if game.phase is Phase.MAIN and not game.dev_card_played and rng.random() < 0.5:
-            game._state.dev_cards[game.current_player][DevCard.ROAD_BUILDING] += 1
+            state = game.state(game.current_player, hidden=False)
+            state.dev_cards[game.current_player][DevCard.ROAD_BUILDING] += 1
+            game.set_state(state)
         out.append((game, to_move(game)))
     return out
 
@@ -277,7 +279,7 @@ def _feed(rows, space: ActionSpace, topology: Topology, joint: bool, policy) -> 
     """The inputs for `rows`, each asked its decision as HexSet would ask it."""
     decisions = [policy.decision(game, seat) for game, seat in rows]
     arrays = D.arrays(decisions, space, topology)
-    feed = {"observation": np.stack([contract9.flatten(contract9.encode9(g, s)) for g, s in rows])}
+    feed = {"observation": np.stack([contract9.flatten(contract9.encode9(g, s, policy.net.CONTRACT)) for g, s in rows])}
     feed.update((name, arrays[name]) for name in input_names(joint) if name != "observation")
     return feed
 
@@ -413,7 +415,7 @@ def export9(
     topology = topology or _base_topology()
     net, space, meta = _load(checkpoint, topology)
     players = meta["players"]
-    layout = contract9.layout(players, topology.num_hexes, topology.num_vertices, topology.num_edges)
+    layout = contract9.layout(players, topology.num_hexes, topology.num_vertices, topology.num_edges, net.CONTRACT)
     joint = net.config.double_turn == "joint"
     points = net.points_head is not None
     serving = dict(serving or {})
@@ -437,7 +439,7 @@ def export9(
                 opset_version=opset,
             )
         props = {
-            "contract": CONTRACT,
+            "contract": net.CONTRACT,
             "players": str(players),
             "num_hexes": str(topology.num_hexes),
             "num_vertices": str(topology.num_vertices),
@@ -464,4 +466,4 @@ def is_contract9(checkpoint: str) -> bool:
     saved `model_config` or `args`."""
     state = torch.load(checkpoint, map_location="cpu", weights_only=False)
     config = state.get("model_config") or {}
-    return str(config.get("contract", state.get("args", {}).get("contract", ""))) == CONTRACT
+    return str(config.get("contract", state.get("args", {}).get("contract", ""))) in contract9.CONTRACTS

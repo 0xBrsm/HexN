@@ -27,6 +27,21 @@ permanently, whether or not it was ever mentioned on a command line.
 
 ## Creating a run
 
+New manifests select a GPU when available, otherwise CPU. Collection uses
+the available CPU count minus two (for the learner and batch assembly),
+capped by lanes and, for cohorts, games per iteration. Fixed-corpus fits do
+not start collect workers; paired leagues also require equal worker quotas.
+CPU availability respects process affinity and container
+quotas. These automatic choices resolve when the manifest is created and
+are written as concrete values. When preparing a run for another host,
+pass that host's `--device` and `--collect-workers` explicitly.
+
+All three trainers default their collect workers to the fused trunk.
+Existing manifests retain their explicit execution settings, including the
+reference trunk for a manifest created before the collect-trunk flag existed.
+Checkpoint decisions batch all positions needing a forward automatically;
+single-position callers use the same implementation with one row.
+
 ```bash
 python -m hexn.run.init --mode ppo --name my-run \
     --description "what this run is for" \

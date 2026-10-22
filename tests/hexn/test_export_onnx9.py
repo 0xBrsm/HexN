@@ -12,7 +12,7 @@ from __future__ import annotations
 import hashlib
 import os
 import random
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import numpy as np
@@ -57,8 +57,8 @@ def a_checkpoint(path: Path, config: ModelConfig, *, seed: int = 0, iteration: i
             if head is not None:
                 for p in head.parameters():
                     p.mul_(50)
-    torch.save({"net": net.state_dict(), "model_config": {**asdict(config), "contract": "9"},
-                "args": {"contract": "9", "players": 4, "max_offers": 0}, "iteration": iteration}, path)
+    torch.save({"net": net.state_dict(), "model_config": asdict(config),
+                "args": {"contract": config.contract, "players": 4, "max_offers": 0}, "iteration": iteration}, path)
     return path
 
 
@@ -113,7 +113,7 @@ def _kinds(rows, joint: bool, space) -> set:
     return seen
 
 
-@pytest.mark.parametrize("config", [PARTS, JOINT], ids=["parts", "joint"])
+@pytest.mark.parametrize("config", [PARTS, JOINT, replace(PARTS, contract="9.1")], ids=["parts", "joint", "rules"])
 def test_the_graph_chooses_the_decision_the_torch_net_chooses(config, tmp_path):
     source = a_checkpoint(tmp_path / "net.pt", config)
     out = export9(str(source), tmp_path / "net.onnx")
@@ -124,6 +124,12 @@ def test_the_graph_chooses_the_decision_the_torch_net_chooses(config, tmp_path):
     joint = config.double_turn == "joint"
     assert isinstance(served, DecisionPolicy) and ("double_rows" in served.inputs) == joint
     rows = positions(3, 160)
+    if config.contract == "9.1":
+        from hexset.rules import GameType, Rules
+        for live in (2, 3, 4):
+            game = deal_game(4, live, 4, game_type=GameType("custom", Rules(13, 8, True, True), (live,)),
+                             locked=frozenset(range(live, 4)), board_mode="spiral")
+            rows.extend((game, seat) for seat in range(live))
     kinds = _kinds(rows, joint, served.space)
     assert {"setup", "road_building", "discard", "flat", "inside"} <= kinds and ("double" in kinds) == joint
     # The graph's answers on one batch of every row, against the torch net's.

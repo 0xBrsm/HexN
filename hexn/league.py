@@ -221,8 +221,12 @@ def build_parser() -> argparse.ArgumentParser:
     # HexSet ships no bots: `--trader`, `--mix` and a rung name one only once
     # the runtime registering it is loaded (`hexn.runtime`).
     runtime.add_argument(parser)
-    parser.add_argument("--collect-workers", type=int, default=16)
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--collect-workers", type=int, default=None,
+                        help="default: available CPUs minus two, capped by lanes and games; "
+                             "paired games use a divisor of the cohort size")
+    parser.add_argument("--collect-trunk", choices=("reference", "fused"), default="fused",
+                        help="the collect workers' trunk; defaults to fused GEMMs")
+    parser.add_argument("--device", default="auto", help="auto selects a GPU when available, else CPU")
     parser.add_argument("--checkpoint-dir", required=True)
     parser.add_argument("--checkpoint-every", type=int, default=1)
     parser.add_argument("--keep-recent", type=int, default=5)
@@ -442,6 +446,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ),
                 first_game=base_index + worker,
                 pair_boards=args.pair_boards,
+                trunk=args.collect_trunk,
             )
             for worker in range(args.collect_workers)
         ],

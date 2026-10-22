@@ -127,6 +127,7 @@ def frozen(
         ),
     ).to(device)
     net.load_state_dict(state["net"])
+    net.fused = torch.device(device).type == "cuda"
     net.eval()
     return NetworkPolicy(
         net,
@@ -1017,7 +1018,7 @@ class WorkerSpec:
     # (`hexn.policy.PRECISIONS`). Two fields because they answer different
     # questions: the trunk is speed only, while a 16-bit precision is a
     # (slightly) different behaviour policy, recorded exactly.
-    trunk: str = "reference"
+    trunk: str = "fused"
     precision: str = "fp32"
     # The network contract (`hexn.selfplay.CONTRACTS`). Under "9" the worker
     # builds `hexn.model9.HexNet` from `net9` (`hexn.model9.ModelConfig`'s
@@ -1027,6 +1028,9 @@ class WorkerSpec:
     net9: tuple[tuple[str, object], ...] = ()
     # How a seven's discards are ordered (`hexset.gym.lanes.DISCARD_ORDERS`).
     discard_order: str = "seat"
+    rules_mix: str = ""
+    # How each game's board is dealt (`hexset.board.board.BOARD_MODES`).
+    board_mode: str = "random"
 
 
 def _build9(spec: WorkerSpec) -> tuple[list, Collector]:
@@ -1034,6 +1038,7 @@ def _build9(spec: WorkerSpec) -> tuple[list, Collector]:
     the scripted bots a mix names."""
     from hexset.actions import space_for
     from hexset.arena import deal_game
+    from hexset.gym.distribution import Distribution
 
     from .model9 import HexNet as HexNet9, ModelConfig as ModelConfig9
     from .policy9 import NetworkPolicy9
@@ -1044,8 +1049,9 @@ def _build9(spec: WorkerSpec) -> tuple[list, Collector]:
     if any(unbuilt.values()):
         raise ValueError(f"not built for a contract-9 worker: {sorted(k for k, v in unbuilt.items() if v)}")
     game = deal_game(spec.seed, 0, spec.players)
-    net = HexNet9(space_for(game), game._state.board.topology, spec.players,
-                  ModelConfig9(width=spec.width, rounds=spec.rounds, **dict(spec.net9)))
+    net = HexNet9(space_for(game), game.state(0, hidden=False).board.topology, spec.players,
+                  ModelConfig9(width=spec.width, rounds=spec.rounds,
+                               **{**dict(spec.net9), "contract": spec.contract}))
     net.fused = spec.trunk == "fused"
     policy = NetworkPolicy9(net.eval(), space_for(game), device="cpu",
                             generator=torch.Generator().manual_seed(spec.torch_seed))
@@ -1066,9 +1072,11 @@ def _build9(spec: WorkerSpec) -> tuple[list, Collector]:
         caster=mix_caster(spec.mix, spec.players, spec.seed) if spec.mix else None,
         sample_stream=spec.sample_stream,
         game_law=mix_deal(spec.mix, spec.players, spec.seed) if spec.mix else None,
+        deal_law=Distribution(spec.rules_mix, spec.players, spec.seed) if spec.rules_mix else None,
         coalition=mix_coalitions(spec.mix, spec.players, spec.seed) if spec.mix else None,
-        contract="9",
+        contract=spec.contract,
         discard_order=spec.discard_order,
+        board_mode=spec.board_mode,
     )
     return [policy], collector
 
@@ -1081,7 +1089,7 @@ def _build(spec: WorkerSpec) -> tuple[list[NetworkPolicy], Collector]:
     runtime.load(spec.runtime)
     if spec.trunk not in TRUNKS:
         raise ValueError(f"trunk must be one of {TRUNKS}, got {spec.trunk!r}")
-    if spec.contract == "9":
+    if spec.contract in ("9", "9.1"):
         return _build9(spec)
 
     board = random_base_board(random.Random(spec.seed))
@@ -1246,6 +1254,7 @@ def _build(spec: WorkerSpec) -> tuple[list[NetworkPolicy], Collector]:
         sample_stream=spec.sample_stream,
         outlook=spec.outlook,
         discard_order=spec.discard_order,
+        board_mode=spec.board_mode,
         game_law=(
             mix_deal(spec.mix, spec.players, spec.seed, pair_boards=spec.pair_boards)
             if spec.learners <= 1 and spec.mix

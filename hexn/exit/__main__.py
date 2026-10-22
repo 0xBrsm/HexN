@@ -99,7 +99,7 @@ def build_parser() -> argparse.ArgumentParser:
     """Distillation's knobs, introspectable by `hexn.run` -- see
     `train.build_parser` for why the parser is a function rather than inline."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--device", default="auto", help="auto selects a GPU when available, else CPU")
     parser.add_argument("--lanes", type=int, default=16)
     parser.add_argument("--players", type=int, default=4)
     parser.add_argument("--iterations", type=int, default=100)
@@ -150,11 +150,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--value-horizon", type=int, default=0)
     parser.add_argument("--play-temperature", type=float, default=1.0)
     parser.add_argument("--target-temperature", type=float, default=1.0)
-    parser.add_argument("--collect-workers", type=int, default=0,
+    parser.add_argument("--collect-workers", type=int, default=None,
                         help="shard searched collection across processes; each "
                              "runs its own search on CPU and the learner keeps "
-                             "the GPU. 0 or 1 keeps the single in-process "
-                             "collector, which is ~10x slower")
+                             "the GPU. Default: available CPUs minus two, "
+                             "capped by lanes and games. 0 or 1 keeps the "
+                             "single in-process collector")
+    parser.add_argument("--collect-trunk", choices=("reference", "fused"), default="fused",
+                        help="the collect workers' trunk; defaults to fused GEMMs")
     parser.add_argument("--contested-only", action="store_true",
                         help="train the policy only where the search overruled "
                              "it; the value head still sees every position")
@@ -542,6 +545,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     noise_fraction=args.noise_fraction,
                     play_temperature=args.play_temperature,
                     k=args.k,
+                    trunk=args.collect_trunk,
                 )
                 for worker in range(args.collect_workers)
             ],

@@ -24,6 +24,83 @@ from hexn.selfplay import Collector, Request  # noqa: E402
 CONFIG = ModelConfig(width=16, rounds=2, messages="pooled", attention=False, points=True)
 
 
+@pytest.mark.parametrize('joint',[False,True])
+def test_native_complete_input_reuse_restores_every_head_and_current_weights(joint,monkeypatch,request):
+    from dataclasses import replace
+    import hexn.policy9 as module
+    from hexn.policy9 import Policy9
+    previous_threads=torch.get_num_threads()
+    torch.set_num_threads(1)
+    request.addfinalizer(lambda:torch.set_num_threads(previous_threads))
+    game=deal_game(0,0,4)
+    torch.manual_seed(7)
+    model=HexNet(space_for(game),game._state.board.topology,4,
+                 replace(CONFIG,double_turn='joint' if joint else 'parts')).eval()
+    p=Policy9(model,model.space)
+    observations=p.observations([(game,0),(game,1),(game,0),(game,1)])
+    flat=np.zeros(model.space.size,bool);flat[0]=True
+    setup=np.ones(len(model.inc_vertex),bool)
+    d=D.Decision(flat,setup,joint,np.array([[0,1],[1,0]],np.int16),np.zeros((2,10),np.int8))
+    arrays=D.arrays([d]*4,model.space,game._state.board.topology)
+    actual=p._heads(observations,arrays,prior=True)
+    values=p._heads(observations,None)
+    with monkeypatch.context() as m:
+        m.setattr(module,'coalesce',lambda _:None)
+        expected=p._heads(observations,arrays,prior=True)
+        expected_values=p._heads(observations,None)
+    for name in actual.__dataclass_fields__:
+        a,b=getattr(actual,name),getattr(expected,name)
+        if a is None:assert b is None
+        else:np.testing.assert_allclose(a,b,atol=2e-5,rtol=0)
+    np.testing.assert_allclose(values.value,expected_values.value,atol=2e-5,rtol=0)
+    with torch.no_grad():model.global_head.bias.add_(.5)
+    changed=p._heads(observations,arrays)
+    assert not np.array_equal(changed.flat,actual.flat)
+
+
+@pytest.mark.parametrize("limit", [256, 1])
+@pytest.mark.parametrize("double_turn", ["parts", "joint"])
+@pytest.mark.parametrize("contract", ["9", "9.1"])
+def test_checkpoint_batch_consumes_the_same_plans_as_individual_rows(limit, double_turn, contract, request):
+    from dataclasses import replace
+    from hexset.actions import apply, options_for
+    from hexset.game import to_move
+    from hexn.policy9 import Policy9
+
+    previous_threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    request.addfinalizer(lambda: torch.set_num_threads(previous_threads))
+    game = deal_game(0, 0, 4)
+    torch.manual_seed(4)
+    model = HexNet(space_for(game), game._state.board.topology, 4,
+                   replace(CONFIG, double_turn=double_turn, contract=contract)).eval()
+    batched, individual = [Policy9(model, model.space) for _ in range(2)]
+    for pol in (batched, individual):
+        pol._plans.LIMIT = limit
+    tables = [[deal_game(7, i, 4) for i in range(6)] for _ in range(2)]
+    batches = []
+    heads = batched._heads
+
+    def counted(observations, arrays, **kwargs):
+        batches.append(len(observations))
+        return heads(observations, arrays, **kwargs)
+
+    batched._heads = counted
+    assert batched.act_rows([]) == []
+    for _ in range(160):
+        rows = [[(g, to_move(g), tuple(options_for(g))) for g in table
+                 if g.won_by is None] for table in tables]
+        if not rows[0]:
+            break
+        got = batched.act_rows(rows[0])
+        want = [individual.act_rows([row])[0] for row in rows[1]]
+        assert got == want
+        for table_rows, actions in zip(rows, (got, want)):
+            for (g, _, _), action in zip(table_rows, actions):
+                apply(g, action)
+    assert max(batches) > 1
+
+
 def net(seed: int = 0, scale: float = 1.0) -> HexNet:
     """A small contract-9 net; `scale` sharpens its option logits past an
     untrained net's near-uniform ones, so the draws below test something."""

@@ -344,15 +344,15 @@ class PPOConfig:
             )
         if self.prior_kl < 0.0:
             raise ValueError(f"prior_kl cannot be negative, got {self.prior_kl}")
-        if self.contract not in ("8", "9"):
+        if self.contract not in ("8", "9", "9.1"):
             raise ValueError(f"unknown contract {self.contract!r}")
         if self.c9_clip not in C9_CLIPS:
             raise ValueError(f"unknown c9_clip {self.c9_clip!r}: {C9_CLIPS}")
         if not 0.0 < self.zero_sum <= 1.0:
             raise ValueError(f"zero_sum discounts a round by a factor in (0, 1], got {self.zero_sum}")
-        if self.aux_target == "zero_sum" and self.contract != "9":
+        if self.aux_target == "zero_sum" and self.contract not in ("9", "9.1"):
             raise ValueError("aux_target 'zero_sum' trains contract 9's points head")
-        if self.contract == "9":
+        if self.contract in ("9", "9.1"):
             if self.aux_target != "zero_sum" and self.aux_margin_weight:
                 raise ValueError("a contract-9 net's one auxiliary head is the points head: aux_target 'zero_sum'")
             # What the contract-9 batch is not built for: each is a field of
@@ -391,7 +391,8 @@ def outlook_row(outlook: Sequence[float], seat: int, seats: int) -> np.ndarray:
     return np.roll(np.asarray(outlook, dtype=np.float32), -seat)
 
 def zero_sum_targets(
-    steps: np.ndarray, turns: np.ndarray, seat_points: np.ndarray, final: Sequence[int], gamma: float
+    steps: np.ndarray, turns: np.ndarray, seat_points: np.ndarray, final: Sequence[int], gamma: float,
+    live: Sequence[bool] | None = None,
 ) -> np.ndarray:
     """`(decisions, seats)`, board order, one row per decision in the order
     given: every seat's later changes in its relative points (its points less
@@ -405,14 +406,21 @@ def zero_sum_targets(
     game's last points. A change between two decisions is the earlier one's:
     the turn count moves only at an end of turn, which changes no points, so
     over a game in which every decision is recorded this is the target each
-    move's own replay gives."""
+    move's own replay gives. ``live`` excludes retired slots from both the
+    opponents' mean and the round clock, and leaves their targets zero."""
     order = np.argsort(steps, kind="stable")
     seats = seat_points.shape[1]
+    active = np.ones(seats, dtype=bool) if live is None else np.asarray(live, dtype=bool)
+    if active.shape != (seats,) or active.sum() < 2:
+        raise ValueError("zero-sum targets need at least two live seats")
+    count = int(active.sum())
     points = np.concatenate([seat_points[order], np.asarray(final, dtype=np.float64)[None]]).astype(np.float64)
-    relative = points - (points.sum(1, keepdims=True) - points) / (seats - 1)
+    relative = np.zeros_like(points)
+    playing = points[:, active]
+    relative[:, active] = playing - (playing.sum(1, keepdims=True) - playing) / (count - 1)
     change = relative[1:] - relative[:-1]
     clock = np.asarray(turns, dtype=np.int64)[order]
-    rounds = (clock[None, :] - clock[:, None]) // seats
+    rounds = (clock[None, :] - clock[:, None]) // count
     weights = np.where(np.arange(len(clock))[None, :] >= np.arange(len(clock))[:, None],
                        gamma ** np.maximum(rounds, 0), 0.0)
     out = np.empty((len(clock), seats), dtype=np.float32)
@@ -1132,7 +1140,15 @@ def decision_terms(
     if config.aux_target == "zero_sum":
         if evaluation.points is None:
             raise ValueError("aux_target 'zero_sum' trains the points head; this net has none")
-        margin_loss = (evaluation.points[heads] - margin_target).pow(2).mean()
+        squared = (evaluation.points[heads] - margin_target).pow(2)
+        if config.contract == "9.1":
+            from hexset.contract9 import SEAT_COLUMNS_91
+            tokens = buffer[heads, policy.layout.slices["seats"]].reshape(
+                len(heads), *policy.layout.shapes["seats"])
+            live = tokens[..., SEAT_COLUMNS_91["live"]].squeeze(-1).float()
+            margin_loss = ((squared * live).sum(-1) / live.sum(-1).clamp(min=1)).mean()
+        else:
+            margin_loss = squared.mean()
     else:
         margin_loss = advantage.new_zeros(())
     margin_term = config.aux_margin_weight * margin_loss
