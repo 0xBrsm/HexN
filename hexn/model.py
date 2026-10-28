@@ -32,7 +32,7 @@ be better.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import torch
@@ -41,11 +41,10 @@ from torch import Tensor, nn
 from hexset.actions import ActionSpace
 from hexset.encoding import (
     HEX_FEATURES,
-    RULE_BLOCKS,
+    OBSERVATION_CONTRACTS,
     Observation,
     StaticGraph,
     edge_features,
-    global_columns,
     global_features,
     vertex_features,
 )
@@ -114,6 +113,11 @@ class ModelConfig:
     # Build the fast-win head (`HexNet.fast_win`, `Prediction.fast`). Off by
     # default, so every checkpoint written before it keeps its exact key set.
     fast_win: bool = False
+    # The observation contract the net reads (`hexset.encoding.OBSERVATION_CONTRACTS`):
+    # "8", or "8.1" for a net trained across rule sets. A checkpoint carries
+    # its own: `HexNet` takes it from the weights at load, so a builder that
+    # does not know it in advance still loads the net it is given.
+    contract: str = "8"
 
     def __post_init__(self) -> None:
         # A mistyped shape has to fail before a run starts, not silently fall
@@ -124,6 +128,8 @@ class ModelConfig:
             raise ValueError(f"unknown policy_head {self.policy_head!r}: {POLICY_HEADS}")
         if self.quantiles < 1:
             raise ValueError(f"a quantile head needs at least one level, got {self.quantiles}")
+        if self.contract not in OBSERVATION_CONTRACTS:
+            raise ValueError(f"unknown observation contract {self.contract!r}: {OBSERVATION_CONTRACTS}")
 
 
 def config_from_args(args: Mapping[str, object]) -> ModelConfig:
@@ -457,12 +463,13 @@ class HexNet(nn.Module):
         self.embed_hex = nn.Linear(HEX_FEATURES, width)
         self.embed_vertex = nn.Linear(vertex_features(players), width)
         self.embed_edge = nn.Linear(edge_features(players), width)
-        self.embed_global = nn.Linear(global_features(players), width)
+        self.embed_global = nn.Linear(global_features(players, self.config.contract), width)
         # A checkpoint whose input projections read another contract's
         # inputs is refused by name: contract 8 re-encodes all four, so no
         # padding computes what an older net did (`hexn.migrate_c8` refits them).
-        # Contract 8.1 only appends globals, so a contract-8 checkpoint is
-        # widened with zero weights on them and refused nowhere.
+        # Contract 8.1 only appends globals: a contract-8.1 checkpoint turns a
+        # contract-8 net into an 8.1 one at load, and a contract-8 checkpoint
+        # loads onto an 8.1 net with zero weights on the appended columns.
         self._register_load_state_dict_pre_hook(self._refuse_other_inputs)
 
         self.rounds = nn.ModuleList(Round(width) for _ in range(self.config.rounds))
@@ -665,17 +672,26 @@ class HexNet(nn.Module):
         """Raise, naming the widths, where `state_dict`'s input projections
         read inputs of another width than this net's.
 
-        A contract-8 `embed_global`, which reads every global before
-        `RULE_BLOCKS`, is first widened in place with zero columns for them:
-        the net then computes on every input exactly what it did, but for
-        the points it reads against a game's target, which is the old
-        reading wherever the game is played to 10."""
+        Contract 8.1 appends `RULE_BLOCKS` to contract 8's globals, so the two
+        meet at load. A contract-8.1 `embed_global` makes this net an 8.1 one
+        (`config.contract`, the projection rebuilt at the wider width before
+        the weights are copied in). A contract-8 `embed_global` loaded onto
+        an 8.1 net is widened in place with zero columns: the net then
+        computes on every input what it did, but for the points it reads
+        against a game's target, which is the old reading wherever the game
+        is played to 10."""
         key = f"{prefix}embed_global.weight"
         weight = state_dict.get(key)
-        contract8 = global_columns(self.players)[RULE_BLOCKS[0]].start
-        if weight is not None and weight.dim() == 2 and weight.shape[1] == contract8:
-            pad = weight.new_zeros(weight.shape[0], self.embed_global.in_features - contract8)
-            state_dict[key] = torch.cat([weight, pad], dim=1)
+        plain = global_features(self.players, "8")
+        rules = global_features(self.players, "8.1")
+        if weight is not None and weight.dim() == 2:
+            if weight.shape[1] == rules and self.config.contract == "8":
+                old = self.embed_global
+                self.embed_global = nn.Linear(rules, old.out_features).to(device=old.weight.device, dtype=old.weight.dtype)
+                self.config = replace(self.config, contract="8.1")
+            elif weight.shape[1] == plain and self.config.contract == "8.1":
+                pad = weight.new_zeros(weight.shape[0], rules - plain)
+                state_dict[key] = torch.cat([weight, pad], dim=1)
         found, wanted = {}, {}
         for name in ("embed_hex", "embed_vertex", "embed_edge", "embed_global"):
             weight = state_dict.get(f"{prefix}{name}.weight")
@@ -915,16 +931,40 @@ class Packing:
     blocks: tuple[tuple[str, int, int, tuple[int, ...]], ...]
 
 
-def packing(graph: StaticGraph, players: int) -> Packing:
+def packing(graph: StaticGraph, players: int, contract: str = "8") -> Packing:
     shapes = (
         ("hexes", (graph.num_hexes, HEX_FEATURES)),
         ("vertices", (graph.num_vertices, vertex_features(players))),
         ("edges", (graph.num_edges, edge_features(players))),
-        ("globals", (global_features(players),)),
+        ("globals", (global_features(players, contract),)),
     )
     blocks = []
     start = 0
     for name, shape in shapes:
+        size = int(np.prod(shape))
+        blocks.append((name, start, start + size, shape))
+        start += size
+    return Packing(width=start, blocks=tuple(blocks))
+
+
+def layout_contract(layout: Packing) -> tuple[int, str]:
+    """The seat count and observation contract `layout` packs, read off its
+    own blocks: the vertex row's width names the seats (`vertex_features`),
+    and the globals block is contract 8's width or 8.1's."""
+    shapes = {name: shape for name, _, _, shape in layout.blocks}
+    players = next(p for p in range(1, 9) if vertex_features(p) == shapes["vertices"][1])
+    contract = "8.1" if shapes["globals"][0] == global_features(players, "8.1") else "8"
+    return players, contract
+
+
+def for_contract(layout: Packing, contract: str) -> Packing:
+    """`layout` with its globals block sized for observation `contract`, every
+    other block as it was: the layout a net reads once its contract is known."""
+    players, _ = layout_contract(layout)
+    blocks, start = [], 0
+    for name, _, _, shape in layout.blocks:
+        if name == "globals":
+            shape = (global_features(players, contract),)
         size = int(np.prod(shape))
         blocks.append((name, start, start + size, shape))
         start += size

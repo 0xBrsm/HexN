@@ -17,6 +17,7 @@ from hexn.model9 import collate  # noqa: E402
 from hexn.ppo import PPOConfig, decision_rows, zero_sum_targets  # noqa: E402
 from hexn.ppo.prepare import Preparer, games_digest, prepare, prepare_columns9, prepare_games  # noqa: E402
 from hexn import durable  # noqa: E402
+from _kept import kept
 
 NET9 = (("heads", "linear"), ("discard", "mlp"), ("norm", True), ("messages", "pooled"), ("attention", False),
         ("points", True))
@@ -35,6 +36,7 @@ def spec(**overrides) -> WorkerSpec:
 def cohort():
     """Five contract-9 games from a tiny shard, as objects and as bytes."""
     policies, collector = _build(spec())
+    collector.sink = kept().keep  # a worker's command names its partial
     episodes = collector.cohort(5)
     return policies[0], episodes, [gamefile.encode(e) for e in episodes]
 
@@ -66,6 +68,7 @@ def test_damage_is_detected_and_contracts_are_not_mixed(cohort):
     with pytest.raises(gamefile.Corrupt):
         gamefile.check(broken)
     policies, collector = _build(spec(contract="8", net9=()))
+    collector.sink = kept().keep  # a worker's command names its partial
     eight = gamefile.encode(collector.cohort(1)[0])
     with pytest.raises(ValueError, match="mixes"):
         gamefile.decode_columns([games[0], eight])
@@ -105,6 +108,7 @@ def test_a_half_precision_batch_is_the_columns_rounded():
     """Under fp16 the observations, owner pointers and reach included, are
     held in half: the pointers exactly."""
     policies, collector = _build(spec(lanes=1, action_cap=200))
+    collector.sink = kept().keep  # a worker's command names its partial
     games = [gamefile.encode(e) for e in collector.cohort(1)]
     half, _, _ = prepare_games(games, np.float16, None, PPOConfig(contract="9", amp="fp16"), 4)
     full, _, _ = prepare_games(games, np.float32, None, PPOConfig(contract="9"), 4)
@@ -167,6 +171,45 @@ def test_the_points_target_is_in_each_deciders_frame(cohort):
                 np.testing.assert_array_equal(batch.margin_target[k].numpy(), np.roll(by_step[t.step], -t.seat))
                 k += 1
     assert k == len(batch.margin_target) == batch.units()
+
+
+MIXED = (("table(self|random)", 1.0),)
+
+
+def mixed_cohort(marks: bool):
+    """Contract-9 games at tables a scripted bot shares with one to four
+    learner seats, as objects and as bytes."""
+    _, collector = _build(spec(mix=MIXED, runtime=("_scripted_runtime",), marks=marks))
+    collector.sink = kept().keep  # a worker's command names its partial
+    episodes = collector.cohort(6)
+    return episodes, [gamefile.encode(e) for e in episodes]
+
+
+def test_a_mixed_tables_points_target_is_the_one_each_moves_replay_gives():
+    """The bot's moves come back as marks, so every learner decision's
+    target is the per-move replay's, exactly as in self-play."""
+    episodes, games = mixed_cohort(marks=True)
+    assert any(0 < e.cast.count(0) < 4 for e in episodes)
+    for episode, back in zip(episodes, gamefile.decode_all(games)):
+        assert back.marks == episode.marks
+        assert bool(episode.marks) == any(episode.cast)
+        assert not {s for s, *_ in episode.marks} & {t.step for t in rows(episode)}
+    batch, _, _ = prepare_games(games, np.float32, None, CONFIG, 4)
+    k = 0
+    for episode in sorted(episodes, key=lambda e: e.index):
+        reference = bc_targets(episode.record, 4, 0.6)
+        for t in rows(episode):
+            if t.part == 0:
+                np.testing.assert_allclose(batch.margin_target[k].numpy(), np.roll(reference[t.step], -t.seat),
+                                           rtol=0, atol=1e-5)
+                k += 1
+    assert k == len(batch.margin_target)
+
+
+def test_a_mixed_table_without_marks_is_refused():
+    _, games = mixed_cohort(marks=False)
+    with pytest.raises(ValueError, match="carries no marks"):
+        prepare_games(games, np.float32, None, CONFIG, 4)
 
 
 def test_the_helper_prepares_a_contract_9_cohort_as_the_trainer_would(cohort, tmp_path):

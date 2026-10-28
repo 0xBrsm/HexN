@@ -19,6 +19,7 @@ from hexn.policy import NetworkPolicy  # noqa: E402
 from hexn.reanalyse import reanalyse  # noqa: E402
 from hexn.selfplay import Collector  # noqa: E402
 from hexn.store import EpisodeStore  # noqa: E402
+from _kept import kept
 
 
 def a_policy(seed: int = 0, width: int = 16) -> NetworkPolicy:
@@ -54,7 +55,8 @@ def searched_episodes(policy, search, seed: int = 0):
     """
     expert = SearchPolicy(search, rng=random.Random(seed))
     return Collector(
-        expert, lanes=1, seed=seed, action_cap=60, max_offers=0
+        expert, lanes=1, seed=seed, action_cap=60, max_offers=0,
+        keep=kept(),
     ).collect(1)
 
 

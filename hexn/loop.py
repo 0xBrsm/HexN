@@ -137,8 +137,10 @@ def duel(
     network_seats: Sequence[int],
     max_offers: int | None,
     trader: str | None = None,
+    journal: str | Path,
 ) -> dict:
     """Play the network against uniform-random opponents and report an interval.
+    Every game is kept in `journal` (`hexset.bench.versus.compete_batched`).
 
     The floor reading, kept because a run that cannot beat `hexset.bots.
     RandomBot` has nothing else worth measuring. The harness is HexSet's
@@ -177,6 +179,7 @@ def duel(
         antithetic=False,
         learner=0,
         episodes=True,
+        journal=journal,
     )
     # The three readings the paired verdict has no place for: how many games
     # reached a winner at all, the share of seats that would win by chance,
@@ -206,8 +209,10 @@ def versus(
     max_offers: int | None,
     antithetic: bool = True,
     trader: str | None = None,
+    journal: str | Path,
 ) -> dict:
     """The learner against one reference, two seats each, seats rotating.
+    Every game is kept in `journal`.
 
     Reports the win rate with its Wilson interval, and paired terminal
     victory points — the finer instrument: learner seats' mean minus
@@ -250,6 +255,7 @@ def versus(
         action_cap=4000,
         antithetic=antithetic,
         learner=0,
+        journal=journal,
     )
     return verdict.metrics()
 
@@ -283,15 +289,31 @@ def lag_rung(directory: Path, iteration: int, device: str, board, players: int):
     return frozen(str(path), device, board, players)
 
 
+def eval_journal(directory: Path, label: str, name: str) -> Path:
+    """A journal of its own for one evaluation's games under a run's
+    `directory`: `evals/<label>-<name>.games.jsonl`, or its next attempt
+    (`...a2.games.jsonl`) when a resumed run repeats an evaluation already
+    kept."""
+    base = Path(directory) / "evals" / f"{label}-{name}"
+    path, attempt = base.with_name(base.name + ".games.jsonl"), 1
+    while path.exists():
+        attempt += 1
+        path = base.with_name(f"{base.name}.a{attempt}.games.jsonl")
+    return path
+
+
 def ladder(
-    policy: NetworkPolicy, rungs: dict[str, BatchPolicy], args
+    policy: NetworkPolicy, rungs: dict[str, BatchPolicy], args, label: str
 ) -> dict[str, dict]:
-    """The current weights, argmax'd, against every frozen rung.
+    """The current weights, argmax'd, against every frozen rung, each rung's
+    games kept under the run (`eval_journal(checkpoint_dir, label, rung)`).
 
     Argmax because sampling is the behaviour distribution PPO needs, not the
     policy worth scoring. One *fixed* eval seed rather than one per iteration:
     every eval replays the same boards, so differences between checkpoints are
-    paired rather than riding board luck.
+    paired rather than riding board luck. `--eval-seed` fixes it across runs
+    too, so replicates on other training seeds are paired as well; unset, it
+    is `--seed + 10_000`.
     """
     scorer = NetworkPolicy(
         policy.net, policy.space, policy.layout, device=policy.device, greedy=True
@@ -303,9 +325,10 @@ def ladder(
             games=args.eval_games,
             lanes=args.lanes,
             players=args.players,
-            seed=args.seed + 10_000,
+            seed=args.seed + 10_000 if getattr(args, "eval_seed", None) is None else args.eval_seed,
             max_offers=args.max_offers,
             trader=getattr(args, "trader", None),
+            journal=eval_journal(Path(args.checkpoint_dir), label, name),
         )
         for name, reference in rungs.items()
     }

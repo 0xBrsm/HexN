@@ -99,6 +99,7 @@ from typing import Sequence
 
 import numpy as np
 
+from hexset import seeds
 from hexset.bench.throughput import environment
 
 # Torch is imported inside `main`, as in `benchmarks.sibling`: `split` and
@@ -395,9 +396,11 @@ def main(argv: list[str] | None = None) -> int:
     # surrogate and is not the relevant precedent for a few thousand parameters
     # fit on a fixed target.
     parser.add_argument("--learning-rate", type=float, default=1e-3)
-    parser.add_argument("--seed", type=int, default=0)
+    seeds.add_arguments(parser)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
+    # The seed policy (its games are evaluation games, never training ones): hexset.seeds.
+    seeds.hold(args, 4, use="eval")
 
     import torch
 

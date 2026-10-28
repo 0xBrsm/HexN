@@ -56,6 +56,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from hexset import seeds
 from hexset.actions import space_for
 from hexset.board.board import random_base_board
 from hexset.encoding import static_graph
@@ -67,6 +68,7 @@ from hexn.rewards import reward
 from hexn.selfplay import Collector
 
 from hexset.bench.throughput import environment
+from . import add_games_dir, games_kept
 
 
 def _flat_gradient(net: torch.nn.Module) -> torch.Tensor:
@@ -244,7 +246,7 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="the network's own offer budget a turn (hexn.trade): 0 for the no-trade network, omitted for HexSet's default (unlimited); -1 also reads as unlimited. Opponents bargain as their own bots do",
     )
-    parser.add_argument("--seed", type=int, default=0)
+    seeds.add_arguments(parser)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--threads", type=int, default=12)
     parser.add_argument("--entropy", type=float, default=0.02)
@@ -274,7 +276,10 @@ def main(argv: list[str] | None = None) -> int:
         "shuffles — and report the pair correlations rho and rho_v alongside",
     )
     parser.add_argument("--json", default=None)
+    add_games_dir(parser)
     args = parser.parse_args(argv)
+    # The seed policy (it plays games the way training does): hexset.seeds.
+    seeds.hold(args, args.players, use="rl")
 
     if args.paired and args.games % 2:
         raise SystemExit("--paired deals boards in pairs; --games must be even")
@@ -312,6 +317,7 @@ def main(argv: list[str] | None = None) -> int:
         max_offers=args.max_offers,
         deal=args.games,
         pair_boards=args.paired,
+        keep=games_kept(args.games_dir, "noise_scale"),
     )
     episodes = collector.drain()
     batch = assemble(episodes, policy.layout, config).to(args.device)

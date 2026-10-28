@@ -13,6 +13,7 @@ from hexset.game import to_move
 from hexset.record import replay_to
 from hexn.replay import replay_to_ply
 from hexn.selfplay import Collector, RandomPolicy
+from _kept import kept
 
 
 def a_trade_free_episode(seed: int = 11, action_cap: int = 150):
@@ -21,7 +22,8 @@ def a_trade_free_episode(seed: int = 11, action_cap: int = 150):
     trades -- the same premise
     `test_selfplay.py`'s own `replay()` helper rests on."""
     collector = Collector(
-        RandomPolicy(random.Random(seed)), lanes=1, seed=seed, action_cap=action_cap
+        RandomPolicy(random.Random(seed)), lanes=1, seed=seed, action_cap=action_cap,
+        keep=kept(),
     )
     return collector.collect(1)[0]
 
@@ -76,6 +78,7 @@ def test_replay_to_ply_refuses_an_episode_with_an_opponent_seat():
         action_cap=200,
         opponents=[RandomPolicy(random.Random(2))],
         caster=lambda index: (0, 1, 0, 1),
+        keep=kept(),
     )
     episode = collector.collect(1)[0]
     with pytest.raises(ValueError, match="opponent"):

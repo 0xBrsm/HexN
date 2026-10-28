@@ -24,6 +24,10 @@ def pytest_addoption(parser):
 
 
 def pytest_configure(config):
+    from hexset import seeds
     from hexset.arena import load_runtime
 
     load_runtime(*config.getoption("runtime"))
+    # A suite's games are fixtures, not runs: no seed policy holds them
+    # (`hexset.seeds`), whatever a runtime requires.
+    seeds.suspend()

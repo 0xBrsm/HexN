@@ -27,6 +27,7 @@ from hexn.collect import (  # noqa: E402
     mix_opponents,
     parse_mix,
 )
+from _kept import kept
 
 SPEC = "coalition(self|self|random;members=random;size=1-2;lead=0-1;start=0.5;targeted=0.5)"
 MIX = [(SPEC, 1.0)]
@@ -180,6 +181,7 @@ def test_a_collector_hangs_the_plan_on_the_game_and_trains_on_no_member():
         opponents=opponents,
         caster=mix_caster(MIX, 4, seed),
         coalition=law,
+        keep=kept(),
     )
     for game in collector.in_flight():
         plan = game.coalition

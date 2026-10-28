@@ -22,6 +22,7 @@ from hexn.ppo import PPOConfig, assemble, fast_weight, update, win_round  # noqa
 from hexn.ppo import __main__ as ppo_main  # noqa: E402
 from hexn.rewards import win_loss  # noqa: E402
 from hexn.selfplay import Collector  # noqa: E402
+from _kept import kept
 
 CURVE = (1.0, 1.0, 0.8, 0.5)
 
@@ -42,7 +43,7 @@ def played():
     net, space, layout = a_net(fast_win=True)
     policy = NetworkPolicy(net, space, layout)
     policy.record_fast = True
-    episodes = Collector(policy, lanes=8, seed=0, action_cap=400, max_offers=0).collect(3)
+    episodes = Collector(policy, lanes=8, seed=0, action_cap=400, max_offers=0, keep=kept()).collect(3)
     return policy, [_decided(e) for e in episodes]
 
 
@@ -73,7 +74,7 @@ def test_a_grafted_head_ranks_seats_as_the_win_head_does():
     net, space, layout = a_net(fast_win=True)
     graft_fast_win(net)
     policy = NetworkPolicy(net, space, layout)
-    episodes = Collector(policy, lanes=2, seed=3, action_cap=60, max_offers=0).collect(2)
+    episodes = Collector(policy, lanes=2, seed=3, action_cap=60, max_offers=0, keep=kept()).collect(2)
     rows = [t.observation for e in episodes for t in e.trajectories[0]][:32]
     from hexn.model import pack
 

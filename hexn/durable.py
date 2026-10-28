@@ -236,11 +236,61 @@ def partials(root: Path) -> dict[int, Partial]:
     }
 
 
+#: Where a run keeps every game it collected, beside its collections' root:
+#: one compressed journal per iteration (`archive`).
+GAMES = "games"
+
+
+def archive(held: Partial, path: str | os.PathLike) -> int:
+    """Every game `held` finished, kept at `path` before the collection is
+    removed: a gzipped journal (`hexset.gamelog` lines), one line per game in
+    index order with its index, seed, seats, policy ids (`cast`), outcome,
+    cleared trades and `hexset.record.Record`. Streamed to a temporary file,
+    fsynced and renamed into place. Returns the games kept."""
+    import gzip
+    from dataclasses import asdict, is_dataclass
+
+    from hexset.record import to_json
+
+    from . import gamefile
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    kept = 0
+    with open(temporary, "wb") as raw:
+        with gzip.GzipFile(fileobj=raw, mode="wb", compresslevel=6, mtime=0) as handle:
+            for game in held.games():
+                f = gamefile.fields(game)
+                outcome = f.get("outcome")
+                record = f.get("record")
+                handle.write((json.dumps({
+                    "kind": "game", "index": f["index"], "seed": f["seed"], "players": f["players"],
+                    "cast": list(f.get("cast") or ()),
+                    "outcome": asdict(outcome) if is_dataclass(outcome) else outcome,
+                    "trades": [list(trade) for trade in f.get("trades") or ()],
+                    "record": None if record is None else json.loads(to_json(record)),
+                }, separators=(",", ":"), allow_nan=False) + "\n").encode())
+                kept += 1
+        raw.flush()
+        os.fsync(raw.fileno())
+    os.replace(temporary, path)
+    return kept
+
+
+def archived(root: Path, iteration: int) -> Path:
+    """Where iteration `iteration`'s games are kept (`archive`), for the
+    collections under `root`."""
+    return Path(root).parent / GAMES / f"iter-{iteration:05d}.games.jsonl.gz"
+
+
 def prune(root: Path, through: int) -> None:
-    """Remove the collections of every iteration up to `through`: a
-    checkpoint now holds what they were for."""
+    """Keep, then remove, the collections of every iteration up to `through`:
+    every game each holds goes to its iteration's archive (`archived`) first,
+    and only then is the collection itself removed."""
     for iteration, held in partials(root).items():
         if iteration <= through:
+            archive(held, archived(root, iteration))
             held.remove()
 
 

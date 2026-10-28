@@ -56,7 +56,7 @@ from hexset.clients.batching import coalesce
 
 from .model9 import (HexNet, Scores, chosen_scores, collate, decision_entropy, decision_scores, first_move_prior,
                      unpack9)
-from .policy import Evaluation, keyed_gumbel, keyed_gumbel_at
+from .policy import Evaluation, keyed_gumbel, keyed_gumbel_at, PRECISIONS
 from .selfplay import Choice, Request
 
 __all__ = ["Policy9", "NetworkPolicy9", "Heads9", "Scored", "ranked", "best", "option_of"]
@@ -455,9 +455,14 @@ class NetworkPolicy9:
     flat action's index, then the setup turns and the Road Building or
     discard candidates, each block after the last
     (`slots`). A request without a key takes one from `generator`. `greedy`
-    takes the best-scored option. Every seat plays at temperature 1, and only
-    in fp32 (`precision`). A double-turn decision (`Decision.double`) is
-    refused: the lanes ask it as two setup turns."""
+    takes the best-scored option. Every seat plays at temperature 1.
+    `precision` (`hexn.policy.PRECISIONS`) is the autocast the forward runs
+    under: "fp32" none; "bf16" a bf16 trunk and heads, whose scores
+    `decision_scores` hands back in fp32, so the recorded log-probability is
+    the fp32 log-softmax of the scores the bf16 forward produced -- the
+    behaviour policy, exactly, as a contract-8 worker's (`hexn.policy`). A
+    double-turn decision (`Decision.double`) is refused: the lanes ask it as
+    two setup turns."""
 
     def __init__(self, net: HexNet, space: ActionSpace, *, device: torch.device | str = "cpu", greedy: bool = False,
                  generator: torch.Generator | None = None) -> None:
@@ -483,8 +488,11 @@ class NetworkPolicy9:
     def act(self, requests: Sequence[Request]) -> list[Choice]:
         if not requests:
             return []
-        if self.precision != "fp32" or any(r.temperature != 1.0 for r in requests):
-            raise ValueError("a contract-9 policy samples in fp32 at temperature 1")
+        if any(r.temperature != 1.0 for r in requests):
+            raise ValueError("a contract-9 policy samples at temperature 1")
+        if self.precision not in PRECISIONS:
+            raise ValueError(f"precision must be one of {tuple(PRECISIONS)}, got {self.precision!r}")
+        dtype = PRECISIONS[self.precision]
         draws = [r.draw for r in requests]
         if any((d is None) != (draws[0] is None) for d in draws):
             raise ValueError("a batch mixes keyed and unkeyed requests")
@@ -498,7 +506,10 @@ class NetworkPolicy9:
         batch = {k: torch.from_numpy(v).to(self.device) for k, v in stated.items()}
         # Inference mode, not just no grad: nothing here is kept for autograd,
         # and the dispatcher's bookkeeping is a share of a 30-row forward.
-        with torch.inference_mode():
+        # The forward and the on-demand heads `decision_scores` runs under one
+        # autocast; the scores come back in fp32 and the draw and the recorded
+        # log-probability are taken on those.
+        with torch.inference_mode(), torch.autocast(self.device.type, dtype=dtype, enabled=dtype is not None):
             out = self.net(**unpack9(self.layout, x))
             scores = decision_scores(self.net, out, batch)
             kinds, indices = self._draw(scores, batch, None if self.greedy else draws)

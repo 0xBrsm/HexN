@@ -33,12 +33,14 @@ import sys
 import time
 from dataclasses import asdict, dataclass
 
+from hexset import seeds
 from hexset.bench.throughput import environment
 from hexset.board.board import random_base_board
 from hexn.expert import SearchPolicy
 from hexn.trade import trade_params
 from hexn.netbot import load, searcher_for
 from hexn.selfplay import Collector
+from . import add_games_dir, games_kept
 
 
 class Timed:
@@ -98,6 +100,7 @@ def measure(
     actions_per_game: int,
     profile: bool = False,
     barrier=None,
+    keep,
 ) -> Point:
     rng = random.Random(seed)
     board = random_base_board(rng)
@@ -121,6 +124,7 @@ def measure(
         players=players,
         board=board,
         max_offers=search.max_offers,
+        keep=keep,
     )
 
     # One move first, so a compiled forward's warm-up is not billed to the run.
@@ -170,7 +174,7 @@ def main() -> int:
     parser.add_argument("--lanes", type=int, default=1)
     parser.add_argument("--moves", type=int, default=200)
     parser.add_argument("--players", type=int, default=4)
-    parser.add_argument("--seed", type=int, default=0)
+    seeds.add_arguments(parser)
     parser.add_argument("--device", default="cpu", help="cpu or cuda")
     parser.add_argument(
         "--compile",
@@ -199,12 +203,15 @@ def main() -> int:
         help="what games_per_hour extrapolates through",
     )
     parser.add_argument("--json", action="store_true")
+    add_games_dir(parser)
     parser.add_argument(
         "--profile",
         action="store_true",
         help="print the measured region's top self-time entries to stderr",
     )
     args = parser.parse_args()
+    # The seed policy (it plays games the way training does): hexset.seeds.
+    seeds.hold(args, args.players, use="rl")
 
     points = [
         measure(
@@ -221,6 +228,7 @@ def main() -> int:
             max_offers=args.max_offers,
             actions_per_game=args.actions_per_game,
             profile=args.profile,
+            keep=games_kept(args.games_dir, "expert_cost", f"simulations-{n}"),
         )
         for n in args.simulations
     ]

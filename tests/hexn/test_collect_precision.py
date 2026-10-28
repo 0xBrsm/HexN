@@ -10,6 +10,7 @@ torch = pytest.importorskip("torch", reason="PyTorch runs on the training box on
 from hexn.collect import WorkerSpec, _build  # noqa: E402
 from hexn.model import unpack  # noqa: E402
 from hexn.policy import masked_log_softmax  # noqa: E402
+from _kept import kept
 
 
 def spec(worker: int, workers: int, **overrides) -> WorkerSpec:
@@ -40,6 +41,7 @@ def weights():
 
 def shard(weights, worker, workers, **overrides):
     policies, collector = _build(spec(worker, workers, **overrides))
+    collector.sink = kept().keep  # a worker's command names its partial
     policies[0].net.load_state_dict(weights)
     return collector
 

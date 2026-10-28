@@ -20,6 +20,7 @@ from hexn.model import HexNet, ModelConfig, packing  # noqa: E402
 from hexset.play import step_randomly  # noqa: E402
 from hexn.policy import NetworkPolicy, masked_log_softmax  # noqa: E402
 from hexn.selfplay import Collector  # noqa: E402
+from _kept import kept
 
 
 def a_policy(players: int = 4, seed: int = 0, **kwargs):
@@ -67,7 +68,7 @@ def test_a_tick_runs_exactly_one_forward_however_many_lanes_there_are():
     counter = Counting(policy.net)
     policy.net = counter
     lanes = 12
-    collector = Collector(policy, lanes=lanes, seed=1)
+    collector = Collector(policy, lanes=lanes, seed=1, keep=kept())
 
     collector.tick()
     collector.tick()
@@ -83,7 +84,7 @@ def test_every_action_it_picks_is_one_the_engine_offered():
     policy = a_policy(seed=2)
     # Trade-free: the claim is about the move a policy picks, and a gate
     # pricing candidates after every MAIN action is most of a tick's cost.
-    collector = Collector(policy, lanes=8, seed=2, max_offers=0)
+    collector = Collector(policy, lanes=8, seed=2, max_offers=0, keep=kept())
 
     kinds = set()
     for _ in range(60):
@@ -113,7 +114,7 @@ def test_evaluate_reproduces_exactly_what_act_recorded():
     # PPO's ratio is `exp(evaluate - act)`, so if these two disagree the very
     # first update is already taking ratios against the wrong distribution.
     policy = a_policy(seed=8)
-    collector = Collector(policy, lanes=16, seed=8, max_offers=0)
+    collector = Collector(policy, lanes=16, seed=8, max_offers=0, keep=kept())
 
     for _ in range(20):
         requests = collector.requests()

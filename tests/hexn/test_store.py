@@ -7,6 +7,7 @@ import pytest
 
 from hexn.selfplay import Collector, RandomPolicy
 from hexn.store import EpisodeStore, shard_path
+from _kept import kept
 
 
 def collected(seed: int, games: int = 2, action_cap: int = 80):
@@ -15,7 +16,8 @@ def collected(seed: int, games: int = 2, action_cap: int = 80):
     cheapest way to get them, and the store must not care what produced its
     positions."""
     return Collector(
-        RandomPolicy(random.Random(seed)), lanes=2, seed=seed, action_cap=action_cap
+        RandomPolicy(random.Random(seed)), lanes=2, seed=seed, action_cap=action_cap,
+        keep=kept(),
     ).collect(games)
 
 

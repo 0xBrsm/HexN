@@ -30,6 +30,7 @@ from dataclasses import asdict, dataclass
 
 import torch
 
+from hexset import seeds
 from hexset.bench.throughput import environment
 from hexset.actions import legal_actions, space_for
 from hexset.board.board import random_base_board
@@ -202,7 +203,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batch", type=int, default=64)
     parser.add_argument("--players", type=int, default=4)
-    parser.add_argument("--seed", type=int, default=0)
+    seeds.add_arguments(parser)
     parser.add_argument("--device", default="auto", help="auto, cpu or cuda")
     parser.add_argument("--width", type=int, default=64)
     parser.add_argument("--rounds", type=int, default=2)
@@ -216,6 +217,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
+    # The seed policy (it plays games the way training does): hexset.seeds.
+    seeds.hold(args, args.players, use="rl")
 
     result = run(
         batch=args.batch,

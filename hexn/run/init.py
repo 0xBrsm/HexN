@@ -11,7 +11,7 @@ rather than from whichever shell script in `tmp/` happened to survive.
         --description "what this heat is testing" \
         --plan docs/my-heat-plan.md \
         -- --base runs/base-run/latest.pt --learner "" --learner lr=1.5e-4 \
-           --iterations 60 --seed 102
+           --iterations 60 --seed 1
 
 `--category` groups the run under `runs/<category>/<name>`, which matters
 once a flat `runs/` holds enough directories that nobody can tell at a
@@ -56,6 +56,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--force", action="store_true", help="overwrite an existing run")
     parser.add_argument(
+        "--bypass-seed-policy",
+        metavar="REASON",
+        default=None,
+        help="freeze a training or evaluation seed the seed policy refuses "
+        "(hexset.seeds); the reason is kept in run.json",
+    )
+    parser.add_argument(
         "--git-commit",
         default=None,
         help="record this SHA instead of asking git. Needed only where git "
@@ -92,6 +99,7 @@ def main(argv: list[str] | None = None) -> int:
         description=args.description,
         plan=args.plan,
         parent=args.parent,
+        seed_bypass=args.bypass_seed_policy,
     )
     if args.git_commit:
         manifest.meta["git_commit"] = args.git_commit

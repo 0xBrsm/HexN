@@ -48,8 +48,8 @@ def a_net(players: int = 4, seed: int = 0, **kwargs):
     return game, space, net
 
 
-def observations(count: int, players: int = 4):
-    return [encode(a_game(players=players, seed=s, steps=60 + s)) for s in range(count)]
+def observations(count: int, players: int = 4, contract: str = "8"):
+    return [encode(a_game(players=players, seed=s, steps=60 + s), contract=contract) for s in range(count)]
 
 
 def test_output_shapes():
@@ -678,21 +678,22 @@ def test_the_value_read_is_the_last_thing_the_forward_builds():
 
 
 def test_a_contract_8_checkpoint_loads_with_zero_weights_on_the_rule_columns():
-    """Contract 8.1 only appends globals: a contract-8 `embed_global` is
-    widened with zero columns and computes what it did, and any other width
-    is still refused by name."""
-    from hexset.encoding import RULE_BLOCKS, global_columns
+    """Contract 8.1 only appends globals: a contract-8 `embed_global` loads onto
+    an 8.1 net widened with zero columns and computes what it did, and any
+    other width is still refused by name."""
+    from hexset.encoding import global_features
 
-    _, _, net = a_net()
-    contract8 = global_columns(4)[RULE_BLOCKS[0]].start
+    _, _, net = a_net(contract="8.1")
+    plain = global_features(4)
     with torch.no_grad():
-        net.embed_global.weight[:, contract8:] = 0.0
+        net.embed_global.weight[:, plain:] = 0.0
     state = {k: v.clone() for k, v in net.state_dict().items()}
-    state["embed_global.weight"] = state["embed_global.weight"][:, :contract8].clone()
+    state["embed_global.weight"] = state["embed_global.weight"][:, :plain].clone()
 
-    _, _, loaded = a_net(seed=1)
+    _, _, loaded = a_net(seed=1, contract="8.1")
     loaded.load_state_dict(state)
-    batch = collate(observations(3))
+    assert loaded.config.contract == "8.1"
+    batch = collate(observations(3, contract="8.1"))
     with torch.no_grad():
         want, got = net(*batch), loaded(*batch)
     torch.testing.assert_close(got.logits, want.logits)
@@ -701,3 +702,22 @@ def test_a_contract_8_checkpoint_loads_with_zero_weights_on_the_rule_columns():
     state["embed_global.weight"] = state["embed_global.weight"][:, :-1]
     with pytest.raises(ValueError, match="another record contract"):
         a_net()[2].load_state_dict(state)
+
+
+def test_a_net_is_contract_8_by_default_and_takes_8_1_from_its_checkpoint():
+    """A builder that does not know the checkpoint's contract still loads it:
+    the 8.1 weights make the net an 8.1 one, which then computes exactly what
+    the net that wrote them did."""
+    from hexset.encoding import global_features
+
+    _, _, plain = a_net()
+    assert plain.config.contract == "8"
+    assert plain.embed_global.in_features == global_features(4)
+    _, _, rules = a_net(seed=2, contract="8.1")
+    _, _, loaded = a_net(seed=3)
+    loaded.load_state_dict(rules.state_dict())
+    assert loaded.config.contract == "8.1"
+    assert loaded.embed_global.in_features == global_features(4, "8.1")
+    batch = collate(observations(3, contract="8.1"))
+    with torch.no_grad():
+        torch.testing.assert_close(loaded(*batch).logits, rules(*batch).logits)

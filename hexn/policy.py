@@ -63,7 +63,7 @@ from hexset.actions import Action, ActionSpace, mask_of
 from hexset.clients.netbot import NetworkBot
 from hexset.encoding import encode_batch, from_frame
 from hexset.game import Game
-from .model import HexNet, Packing, pack, packing, unpack
+from .model import HexNet, Packing, for_contract, layout_contract, pack, packing, unpack
 from .selfplay import Choice, Request
 from .trade import trade_params, trader_gate
 
@@ -176,6 +176,27 @@ class NetworkPolicy:
     policy's `log_prob` is not the one that generated anything.
     """
 
+    @property
+    def observation_contract(self) -> str:
+        """The observation contract the net reads, which it takes from its
+        checkpoint at load (`hexn.model.ModelConfig.contract`)."""
+        return getattr(getattr(self.net, "config", None), "contract", "8")
+
+    @property
+    def layout(self) -> Packing:
+        """The packing the net reads, re-sized when loading a checkpoint
+        changed the net's observation contract after this policy was built."""
+        contract = self.observation_contract
+        if self._layout_contract != contract:
+            self._layout = for_contract(self._layout, contract)
+            self._layout_contract = contract
+        return self._layout
+
+    @layout.setter
+    def layout(self, layout: Packing) -> None:
+        self._layout = layout
+        self._layout_contract = layout_contract(layout)[1]
+
     def __init__(
         self,
         net: HexNet,
@@ -188,7 +209,8 @@ class NetworkPolicy:
     ) -> None:
         self.net = net
         self.space = space
-        self.layout = layout
+        self._layout = layout
+        self._layout_contract = layout_contract(layout)[1]
         self.device = torch.device(device)
         self.greedy = greedy
         self.generator = generator
@@ -334,7 +356,7 @@ class NetworkPolicy:
         if not rows:
             return []
         observations = encode_batch(
-            [game for game, _, _ in rows], [seat for _, seat, _ in rows]
+            [game for game, _, _ in rows], [seat for _, seat, _ in rows], self.observation_contract
         )
         requests = [
             Request(
@@ -361,7 +383,7 @@ class NetworkPolicy:
         if not rows:
             return []
         seats = [seat for _, seat in rows]
-        values = self.values(encode_batch([game for game, _ in rows], seats))
+        values = self.values(encode_batch([game for game, _ in rows], seats, self.observation_contract))
         return [
             from_frame(values[row].tolist(), seat) for row, seat in enumerate(seats)
         ]
@@ -380,7 +402,7 @@ class NetworkPolicy:
         if not rows:
             return []
         seats = [seat for _, seat, _ in rows]
-        observations = encode_batch([game for game, _, _ in rows], seats)
+        observations = encode_batch([game for game, _, _ in rows], seats, self.observation_contract)
         masks = np.asarray(
             [mask_of(self.space, options) for _, _, options in rows], dtype=bool
         )

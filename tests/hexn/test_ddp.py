@@ -13,6 +13,7 @@ from hexn.ddp import UpdateCrew, UpdateSpec  # noqa: E402
 from hexn.ppo import PPOConfig, assemble, update  # noqa: E402
 from hexn.selfplay import Collector  # noqa: E402
 from hexn.loop import build  # noqa: E402
+from _kept import kept
 
 
 def _decided(episode):
@@ -38,7 +39,8 @@ def batch():
     # gives: the sharded update's claim is about the arithmetic, and a game
     # the cap truncates has no winner for the win head to be seen learning.
     collector = Collector(
-        policy, lanes=2, players=4, seed=5, action_cap=100, max_offers=0, deal=2
+        policy, lanes=2, players=4, seed=5, action_cap=100, max_offers=0, deal=2,
+        keep=kept(),
     )
     episodes = [_decided(e) for e in collector.drain()]
     return assemble(episodes, policy.layout, PPOConfig())

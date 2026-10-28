@@ -32,6 +32,7 @@ from hexn.model import HexNet, ModelConfig, packing  # noqa: E402
 from hexn.netbot import LeafEvaluator  # noqa: E402
 from hexn.policy import NetworkPolicy  # noqa: E402
 from hexn.selfplay import Collector  # noqa: E402
+from _kept import kept
 
 
 def a_policy(seed: int = 0):
@@ -56,7 +57,7 @@ def some_episodes(policy, games, searched=False):
     if searched:
         search = Search(LeafEvaluator(policy=policy), simulations=8, wave=4, rng=random.Random(0))
         player = SearchPolicy(search, rng=random.Random(0))
-    return Collector(player, lanes=2, seed=0, action_cap=300, max_offers=0).collect(games)
+    return Collector(player, lanes=2, seed=0, action_cap=300, max_offers=0, keep=kept()).collect(games)
 
 
 class Crash(Exception):

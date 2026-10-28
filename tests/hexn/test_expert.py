@@ -11,6 +11,7 @@ from hexn.selfplay import Collector, Request
 from hexset.mcts import Search
 
 from _mcts_fixtures import Stub, a_game
+from _kept import kept
 
 
 def a_policy(stub=None, *, simulations=16, wave=4, temperature=1.0, seed=0):
@@ -21,7 +22,7 @@ def a_policy(stub=None, *, simulations=16, wave=4, temperature=1.0, seed=0):
 
 
 def a_collector(policy, **kwargs):
-    return Collector(policy, lanes=1, seed=7, players=4, **kwargs)
+    return Collector(policy, lanes=1, seed=7, players=4, **kwargs, keep=kept())
 
 
 def a_request(policy: SearchPolicy, game, options=None) -> Request:
@@ -38,7 +39,7 @@ def a_request(policy: SearchPolicy, game, options=None) -> Request:
 
 def test_searches_from_several_lanes_share_one_root_evaluation():
     stub = Stub()
-    collector = Collector(a_policy(stub), lanes=4, seed=7, players=4)
+    collector = Collector(a_policy(stub), lanes=4, seed=7, players=4, keep=kept())
     collector.tick()
     assert collector.steps == 4
     assert len(stub.waves[0]) == 4

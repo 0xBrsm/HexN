@@ -26,6 +26,7 @@ from hexn.ppo import (  # noqa: E402
 )
 from hexn.rewards import relative_points, win_loss  # noqa: E402
 from hexn.selfplay import Collector  # noqa: E402
+from _kept import kept
 
 
 def a_policy(players: int = 4, seed: int = 0):
@@ -50,7 +51,8 @@ def some_episodes(policy, games: int = 4, seed: int = 0, lanes: int = 8, outlook
     `outcome.winner`.
     """
     episodes = Collector(
-        policy, lanes=lanes, seed=seed, action_cap=400, max_offers=0, outlook=outlook
+        policy, lanes=lanes, seed=seed, action_cap=400, max_offers=0, outlook=outlook,
+        keep=kept(),
     ).collect(games)
     return [decided(e) for e in episodes]
 
@@ -324,6 +326,7 @@ def paired_episodes(policy, games: int, seed: int = 0):
         max_offers=0,
         deal=games,
         pair_boards=True,
+        keep=kept(),
     ).drain()
     return [decided(e) for e in episodes]
 

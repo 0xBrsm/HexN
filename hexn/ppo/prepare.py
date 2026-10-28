@@ -340,9 +340,10 @@ def prepare_columns9(columns, config: PPOConfig, players: int):
     part, and the one-hot winner is the win head's target there; a part past
     the first carries no value row. Under `aux_target="zero_sum"` the points
     head's target is `zero_sum_targets` in each decider's frame at the
-    decision's first part, which needs every move of the game recorded, so a
-    game with another policy seated is refused; any other target is zeros
-    (`PPOConfig` holds its weight at 0)."""
+    decision's first part, which needs every move's points: a game with
+    another policy seated reads that policy's moves off its `marks`
+    (`hexn.selfplay.Episode.marks`) and is refused without them; any other
+    target is zeros (`PPOConfig` holds its weight at 0)."""
     import numpy as np
 
     from hexset.encoding import to_frame
@@ -364,17 +365,22 @@ def prepare_columns9(columns, config: PPOConfig, players: int):
         wins = win_loss(outcome)
         seats = len(wins)
         if zero_sum and rows:
-            if any(pid != 0 for pid in fields.get("cast") or ()):
-                raise ValueError("aux_target 'zero_sum' needs every decision of a game recorded; "
-                                 f"game {fields['index']} seats another policy")
+            # The learner's rows, then the other seats' moves (`marks`): the
+            # target walks every move's points, so each change lands when it
+            # happened; only the rows' own targets are kept.
+            marks = fields.get("marks") or ()
+            if any(pid != 0 for pid in fields.get("cast") or ()) and not marks:
+                raise ValueError("aux_target 'zero_sum' needs every move's points; "
+                                 f"game {fields['index']} seats another policy and carries no marks")
             moved = zero_sum_targets(
-                np.asarray([row[at["step"]] for row in rows], dtype=np.int64),
-                np.asarray([row[at["turns"]] for row in rows], dtype=np.int64),
-                np.asarray([row[at["seat_points"]] for row in rows], dtype=np.float64).reshape(len(rows), seats),
+                np.asarray([row[at["step"]] for row in rows] + [m[0] for m in marks], dtype=np.int64),
+                np.asarray([row[at["turns"]] for row in rows] + [m[1] for m in marks], dtype=np.int64),
+                np.asarray([row[at["seat_points"]] for row in rows] + [m[2] for m in marks],
+                           dtype=np.float64).reshape(len(rows) + len(marks), seats),
                 outcome.points, config.zero_sum,
                 live=[s not in (fields["record"].locked if fields.get("record") is not None else ())
                       for s in range(seats)],
-            )
+            )[: len(rows)]
         k = 0
         for seat, count in enumerate(game["counts"]):
             if not count:

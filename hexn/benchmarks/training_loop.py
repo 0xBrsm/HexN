@@ -25,6 +25,7 @@ from pathlib import Path
 
 from hexn.ppo import __main__ as train
 
+from hexset import seeds
 from hexset.bench.throughput import environment
 
 
@@ -114,13 +115,16 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="the network's own offer budget a turn (hexn.trade): 0 for the no-trade network, omitted for HexSet's default (unlimited); -1 also reads as unlimited. Opponents bargain as their own bots do",
     )
-    parser.add_argument("--seed", type=int, default=0)
+    seeds.add_arguments(parser)
     parser.add_argument("--width", type=int, default=64)
     parser.add_argument("--rounds", type=int, default=2)
     parser.add_argument("--epochs", type=int, default=4)
     parser.add_argument("--minibatch", type=int, default=4096)
     parser.add_argument("--collect-workers", type=int, default=24)
     args = parser.parse_args(argv)
+    # The seed policy (it plays games the way training does): hexset.seeds.
+    seeds.hold(args, 4, use="rl")
+
     if args.iterations < 3:
         parser.error("at least three iterations are needed after pipeline fill")
     if args.collect_workers <= 1:

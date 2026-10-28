@@ -128,6 +128,7 @@ from torch import Tensor, nn
 # loss, so there is nothing left to keep importable without it.
 from .floor import Sampling, collect, pool, split as split_error, _stages
 from .head_shape import rows, split as split_games
+from hexset import seeds
 from hexset.bench.throughput import environment
 from .value_head import explained
 from hexset.board.board import random_base_board
@@ -154,6 +155,7 @@ from hexn.model import (
 from hexn.netbot import load
 from hexn.policy import NetworkPolicy
 from hexn.selfplay import Collector
+from . import add_games_dir, games_kept
 
 # `benchmarks.floor` seeds the collector that produces the dump's positions at
 # `dump_seed + 1`. The training cohort is offset far away from that so the two
@@ -419,6 +421,7 @@ def recover(
     players: int,
     action_cap: int,
     tolerance: float,
+    keep,
 ) -> tuple[HeldOut, object]:
     """Replay `benchmarks.floor`'s seeding phase to get the dumped positions back.
 
@@ -454,6 +457,7 @@ def recover(
         max_offers=loaded.max_offers,
         deal=seed_games,
         board=board,
+        keep=keep,
     )
     kept = collect(seeding.drain())
     wanted = dump["positions"]
@@ -634,9 +638,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--block", type=int, default=32, help="games encoded at once")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--bins", type=int, default=5)
-    parser.add_argument("--seed", type=int, default=0)
+    seeds.add_arguments(parser)
     parser.add_argument("--json", action="store_true")
+    add_games_dir(parser)
     args = parser.parse_args(argv)
+    # The seed policy (its games are evaluation games, never training ones): hexset.seeds.
+    seeds.hold(args, args.players, use="eval")
 
     device = torch.device(args.device)
     started = time.perf_counter()
@@ -650,6 +657,7 @@ def main(argv: list[str] | None = None) -> int:
         players=args.players,
         action_cap=args.dump_action_cap,
         tolerance=args.prediction_tolerance,
+        keep=games_kept(args.games_dir, "head_swap", "seeding"),
     )
     recovered = time.perf_counter() - started
 
@@ -681,6 +689,7 @@ def main(argv: list[str] | None = None) -> int:
         max_offers=loaded.max_offers,
         deal=args.games,
         board=None if args.random_boards else board,
+        keep=games_kept(args.games_dir, "head_swap", "cohort"),
     )
     episodes = collector.drain()
     collected = time.perf_counter() - started

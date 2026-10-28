@@ -91,7 +91,7 @@ from ..ppo import attach_prior
 from ..reanalyse import reanalyse
 from ..selfplay import Collector
 from ..store import EpisodeStore
-from ..loop import add_head_flags, build, duel, prune_recent, save, summarise
+from ..loop import add_head_flags, build, duel, eval_journal, prune_recent, save, summarise
 from ..steps import Steps, by_index, fingerprint, remove as remove_steps
 
 
@@ -113,6 +113,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="the network's own offer budget a turn (hexn.trade): 0 for the no-trade network, omitted for HexSet's default (unlimited); -1 also reads as unlimited. Opponents bargain as their own bots do",
     )
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--eval-seed", type=int, default=None,
+        help="the seed every evaluation plays, the same for every replicate so their "
+        "evaluations are paired (hexn.run.init fills it from the seed policy); "
+        "unset, --seed + 10000 + the iteration",
+    )
 
     parser.add_argument("--simulations", type=int, default=256)
     parser.add_argument("--wave", type=int, default=16)
@@ -289,7 +295,7 @@ def build_parser() -> argparse.ArgumentParser:
         "from its last such step rather than from the round's start "
         "(hexn.steps). 0 disables",
     )
-    parser.add_argument("--keep-every", type=int, default=10, help="0 disables")
+    parser.add_argument("--keep-every", type=int, default=10, help="ignored: every iteration's checkpoint is kept (iter-XXXXX.pt), so each game's behaviour policy is; the key stays so frozen configs load")
     parser.add_argument(
         "--keep-recent",
         type=int,
@@ -485,19 +491,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         # Kept as this run's own iteration 0, as `hexn.ppo` does: the same
         # weights, recording this run's arguments, so the starting point is
         # an ordinary checkpoint of the run beside the ones it produces.
-        if args.keep_every:
-            save(
-                directory / "iter-00000.pt",
-                {
-                    "iteration": 0,
-                    "games_started": 0,
-                    "net": policy.net.state_dict(),
-                    "optimiser": optimiser.state_dict(),
-                    "torch_rng": torch.get_rng_state(),
-                    "args": vars(args),
-                    "config": asdict(config),
-                },
-            )
+        # Every checkpoint is kept, iteration 0 among them.
+        save(
+            directory / "iter-00000.pt",
+            {
+                "iteration": 0,
+                "games_started": 0,
+                "net": policy.net.state_dict(),
+                "optimiser": optimiser.state_dict(),
+                "torch_rng": torch.get_rng_state(),
+                "args": vars(args),
+                "config": asdict(config),
+            },
+        )
 
     search = Search(
         LeafEvaluator(policy=policy),
@@ -578,6 +584,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             seed=args.seed + 9_000,
             network_seats=(0, 2),
             max_offers=args.max_offers,
+            journal=eval_journal(directory, f"start-{start_iteration:05d}", "random"),
         )
         print(durable.append_line(log, {"iteration": -1, "duel": baseline}), flush=True)
 
@@ -719,8 +726,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             if keep_recent:
                 save(directory / f"recent-{iteration + 1:05d}.pt", state)
                 prune_recent(directory, keep_recent)
-            if args.keep_every and (iteration + 1) % args.keep_every == 0:
-                save(directory / f"iter-{iteration + 1:05d}.pt", state)
+            # Every iteration's checkpoint is kept (`hexn.ppo`'s reason).
+            save(directory / f"iter-{iteration + 1:05d}.pt", state)
             # Only now is this iteration's collection held elsewhere -- in the
             # checkpoint's weights, when there is no store to hold the games.
             durable.prune(collecting, iteration)
@@ -731,9 +738,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 games=args.eval_games,
                 lanes=max(args.lanes, 64),
                 players=args.players,
-                seed=args.seed + 10_000 + iteration,
+                seed=(args.seed + 10_000 + iteration if getattr(args, "eval_seed", None) is None
+                      else args.eval_seed),
                 network_seats=(0, 2),
                 max_offers=args.max_offers,
+                journal=eval_journal(directory, f"iter-{iteration + 1:05d}", "random"),
             )
             print(
                 durable.append_line(log, {"iteration": iteration, "duel": evaluation}),

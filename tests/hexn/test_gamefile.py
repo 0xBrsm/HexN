@@ -22,6 +22,7 @@ from hexset.actions import space_for  # noqa: E402
 from hexset.board.board import random_base_board  # noqa: E402
 from hexset.encoding import static_graph  # noqa: E402
 from hexset.game import start  # noqa: E402
+from _kept import kept
 
 BATCH_FIELDS = ("buffer", "mask", "chosen", "log_prob", "advantage", "value_target", "margin_target")
 
@@ -40,7 +41,7 @@ def a_policy(seed: int = 0):
 def collected():
     """A network's games: log-probs, values and every field a trainer reads."""
     policy = a_policy()
-    episodes = Collector(policy, lanes=4, seed=3, action_cap=300, max_offers=0).collect(4)
+    episodes = Collector(policy, lanes=4, seed=3, action_cap=300, max_offers=0, keep=kept()).collect(4)
     return policy, episodes
 
 
@@ -110,7 +111,7 @@ def test_empty_seats_and_empty_games_come_back(collected):
 
 
 def test_a_policy_with_no_estimates_comes_back():
-    episodes = Collector(First(), lanes=2, seed=3, action_cap=60, max_offers=0).collect(2)
+    episodes = Collector(First(), lanes=2, seed=3, action_cap=60, max_offers=0, keep=kept()).collect(2)
     for episode in episodes:
         same(episode, gamefile.decode(gamefile.encode(episode)))
 

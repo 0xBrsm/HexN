@@ -16,6 +16,7 @@ from hexn.collect import WorkerSpec, _build
 from hexn.model9 import HexNet, ModelConfig, unpack9
 from hexn.ppo import PPOConfig, update, zero_sum_targets
 from hexn.ppo.prepare import prepare_games
+from _kept import kept
 
 
 def spec():
@@ -82,6 +83,7 @@ def test_a_rule_mixed_cohort_is_durable_resumable_and_trains(tmp_path):
                         sample_stream="game", trunk="fused", rules_mix=json.dumps(spec()),
                         net9=(("double_turn", "parts"), ("points", True)))
     policies, collector = _build(worker)
+    collector.sink = kept().keep  # a worker's command names its partial
     episodes = collector.cohort(6)
     law = Distribution(worker.rules_mix, 4, 5)
     encoded = []
@@ -93,6 +95,7 @@ def test_a_rule_mixed_cohort_is_durable_resumable_and_trains(tmp_path):
         assert all(not episode.trajectories[s] for s in episode.record.locked)
     # A missing game is replayed from its index, with another lane count.
     _, replay = _build(replace(worker, lanes=1))
+    replay.sink = kept().keep  # a worker's command names its partial
     repeated = replay.listed([episodes[2].index])[0]
     assert repeated.record == episodes[2].record
     config = PPOConfig(contract="9.1", aux_target="zero_sum", aux_margin_weight=0.1, epochs=1, minibatch=128)

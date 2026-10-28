@@ -1012,6 +1012,9 @@ class WorkerSpec:
     # Read the outlook label (`hexn.selfplay.Collector`'s `outlook`), which
     # `--aux-target outlook` trains the margin head on.
     outlook: bool = False
+    # Fill `hexn.selfplay.Episode.marks` (`hexn.selfplay.Collector`'s
+    # `marks`), which `--aux-target zero_sum` reads at a mixed table.
+    marks: bool = False
     # The worker's forward: `trunk` is the net's path ("reference" message
     # passing, or "fused", the same numbers as dense GEMMs up to float
     # reassociation) and `precision` the autocast `act` samples under
@@ -1045,9 +1048,11 @@ def _build9(spec: WorkerSpec) -> tuple[list, Collector]:
 
     unbuilt = {"learners": spec.learners > 1, "simulations": spec.simulations > 0, "fast_win": spec.fast_win,
                "vp_reward": bool(spec.vp_reward), "outlook": spec.outlook, "trader": spec.trader is not None,
-               "pair_boards": spec.pair_boards, "precision": spec.precision != "fp32"}
+               "pair_boards": spec.pair_boards}
     if any(unbuilt.values()):
         raise ValueError(f"not built for a contract-9 worker: {sorted(k for k, v in unbuilt.items() if v)}")
+    if spec.precision not in PRECISIONS:
+        raise ValueError(f"precision must be one of {tuple(PRECISIONS)}, got {spec.precision!r}")
     game = deal_game(spec.seed, 0, spec.players)
     net = HexNet9(space_for(game), game.state(0, hidden=False).board.topology, spec.players,
                   ModelConfig9(width=spec.width, rounds=spec.rounds,
@@ -1055,6 +1060,9 @@ def _build9(spec: WorkerSpec) -> tuple[list, Collector]:
     net.fused = spec.trunk == "fused"
     policy = NetworkPolicy9(net.eval(), space_for(game), device="cpu",
                             generator=torch.Generator().manual_seed(spec.torch_seed))
+    # As a contract-8 worker's (`_build`): the forward `act` samples under,
+    # recorded exactly (`hexn.policy9.NetworkPolicy9.act`).
+    policy.precision = spec.precision
     board = random_base_board(random.Random(spec.seed))
     opponents = mix_opponents(spec.mix, seed=spec.seed, lanes=spec.lanes, parent=None, board=board,
                               players=spec.players, device="cpu", torch_seed=spec.torch_seed)
@@ -1074,6 +1082,7 @@ def _build9(spec: WorkerSpec) -> tuple[list, Collector]:
         game_law=mix_deal(spec.mix, spec.players, spec.seed) if spec.mix else None,
         deal_law=Distribution(spec.rules_mix, spec.players, spec.seed) if spec.rules_mix else None,
         coalition=mix_coalitions(spec.mix, spec.players, spec.seed) if spec.mix else None,
+        marks=spec.marks,
         contract=spec.contract,
         discard_order=spec.discard_order,
         board_mode=spec.board_mode,
@@ -1286,13 +1295,14 @@ class _Keep:
     partial when there is one, and handed back to the collector to hold in
     the episode's place -- so a worker never holds its cohort as objects."""
 
-    def __init__(self, partial: Partial | None) -> None:
+    def __init__(self, partial: Partial) -> None:
+        if partial is None:
+            raise ValueError("a worker keeps every game it plays: its command names no partial")
         self.partial = partial
 
     def __call__(self, episode: Episode) -> bytes:
         game = gamefile.encode(episode)
-        if self.partial is not None:
-            self.partial.write(game)
+        self.partial.write(game)
         return game
 
 
@@ -1535,10 +1545,10 @@ class ParallelCollector:
             for worker in range(len(self._connections))
         ]
 
-    def start_collect(self, episodes: int, partial: Partial | None = None) -> None:
+    def start_collect(self, episodes: int, partial: Partial) -> None:
         """Dispatch a fixed cohort without waiting for workers to finish it.
 
-        With a `partial`, every worker keeps each game there as it finishes.
+        Every worker keeps each game in `partial` as it finishes.
         A cohort's plan -- every index its workers will deal, asked of them
         first -- is written before any game is played; a partial that already
         holds one is a cohort a crash interrupted, and only its missing
@@ -1554,11 +1564,8 @@ class ParallelCollector:
         # whole collection at once.
         kept: list[bytes] = []
         if partial is None:
-            commands = [
-                (self._command, quota) if quota else None
-                for quota in self._quotas(episodes)
-            ]
-        elif self._command == "cohort":
+            raise ValueError("a collection keeps every game it plays: name its partial")
+        if self._command == "cohort":
             kept = partial.games()
             plan = partial.plan()
             if plan is None and kept:
@@ -1634,8 +1641,9 @@ class ParallelCollector:
         self.games += len(out)
         return out
 
-    def collect(self, episodes: int, partial: Partial | None = None) -> list[Episode]:
-        """Each worker plays out an equal share of the quota.
+    def collect(self, episodes: int, partial: Partial) -> list[Episode]:
+        """Each worker plays out an equal share of the quota, every game kept in
+        `partial`.
 
         Fixed shares rather than first-`n`-across-workers, so the cohort is
         decided before anyone plays — taking whichever games finish first

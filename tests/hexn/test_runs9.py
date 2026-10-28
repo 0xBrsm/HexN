@@ -45,6 +45,7 @@ BC_SHAPES = {
 }
 # The double turn's own heads, which a "parts" net reads nowhere.
 from hexn.model9 import JOINT_HEADS, without_joint_head
+from _kept import kept
 
 
 def net(config: ModelConfig = SMALL, seed: int = 0, scale: float = 1.0) -> HexNet:
@@ -67,7 +68,7 @@ def played():
     """Three games of self-play, their rows and their batch."""
     pol = policy()
     episodes = Collector(pol, lanes=3, deal=3, contract="9", sample_stream="game", discard_order="random",
-                         action_cap=700, turn_cap=UNSTRUCTURED_TURN_CAP, seed=7).drain()
+                         action_cap=700, turn_cap=UNSTRUCTURED_TURN_CAP, seed=7, keep=kept()).drain()
     episodes = sorted(episodes, key=lambda e: e.index)
     games = [gamefile.encode(e) for e in episodes]
     batch, _, _ = prepare_columns9(gamefile.decode_columns(games), CONFIG, 4)
@@ -304,7 +305,7 @@ def test_a_contract_9_checkpoint_loads_and_plays_in_self_play(path):
     model.load_state_dict(without_joint_head(state["net"])[0])
     pol = NetworkPolicy9(model.eval(), model.space)
     episode = Collector(pol, lanes=1, deal=1, contract="9", sample_stream="game", discard_order="random",
-                        action_cap=400, turn_cap=UNSTRUCTURED_TURN_CAP, seed=3).drain()[0]
+                        action_cap=400, turn_cap=UNSTRUCTURED_TURN_CAP, seed=3, keep=kept()).drain()[0]
     assert rows([episode]) and all(t.kind != D.DecisionKind.DOUBLE for t in rows([episode]))
 
 

@@ -237,6 +237,21 @@ def _encode9(episode: Episode, rows: Sequence[Transition9]) -> bytes:
     return header + zlib.compress(body, LEVEL)
 
 
+def fields(blob: bytes) -> dict:
+    """The game's own fields -- `Episode`'s, its trajectories aside: index,
+    seed, players, outcome, cast, trades and record -- read from its metadata
+    without decoding a row."""
+    found, body = _inflate(blob)
+    if found.contract == "9":
+        mask_len, setup_len, rb_len, disc_len, meta_len = SECTIONS9.unpack_from(body)
+        offset = SECTIONS9.size + 4 * found.positions * found.width + mask_len + setup_len + rb_len + disc_len
+        meta = pickle.loads(body[offset : offset + meta_len])
+    else:
+        _, _, meta_len = SECTIONS.unpack_from(body)
+        meta = pickle.loads(body[len(body) - meta_len :])
+    return dict(zip(meta[1], meta[2]))
+
+
 def _inflate(blob: bytes) -> tuple[Head, bytes]:
     found = head(blob)
     try:

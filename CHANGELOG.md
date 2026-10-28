@@ -2,6 +2,103 @@
 
 All notable changes to the `hexn` package are recorded here.
 
+## 0.47.0
+
+### Breaking
+
+- **A contract-8 net reads contract 8 unless its weights say 8.1.**
+  `hexn.model.ModelConfig.contract` (`"8"` by default, `"8.1"` for a net
+  trained across rule sets) sizes `HexNet`'s global projection; a checkpoint
+  carries its own, and loading 8.1 weights makes a contract-8 net an 8.1 one,
+  so every existing loader keeps its nets. `packing` takes the contract;
+  `NetworkPolicy` encodes and packs under its net's
+  (`NetworkPolicy.observation_contract`), and the collector encodes each seat
+  under its policy's. `export_onnx` writes a contract-8 graph (27 inputs,
+  `contract` "8") for a contract-8 net and an 8.1 graph only for an 8.1 net;
+  `migrate_c8` migrates onto contract 8.
+
+- **Every game HexN plays is kept.**
+  - `hexn.selfplay.Collector` takes `keep` (a `hexn.durable.Partial`) and
+    plays no game with nowhere to keep it: `tick` refuses unless `keep` or a
+    call's `partial` names where each game goes.
+  - `hexn.collect.ParallelCollector.collect` and `start_collect` require
+    their `partial`.
+  - `hexn.durable.prune` archives each collection before it removes it:
+    every game's index, seed, seats, outcome, trades and `hexset.record.Record`
+    go to `<run>/games/iter-XXXXX.games.jsonl.gz` (`durable.archive`,
+    `durable.archived`).
+  - The trainers (`hexn.ppo`, `hexn.league`, `hexn.exit`) keep every
+    iteration's checkpoint (`iter-XXXXX.pt`): `--keep-every` is read but no
+    longer thins them.
+  - `hexn.loop.duel` and `versus` require a `journal`, and `ladder` takes a
+    label and keeps each rung's games under `<run>/evals/`
+    (`loop.eval_journal`).
+  - Every benchmark that plays games keeps them under `--games-dir` (default
+    `runs/benchmarks/<benchmark>/<UTC time>`).
+
+### Added
+
+- **The zero-sum points target trains at a mixed table.** A contract-9
+  learner beside scripted opponents (`--mix`) under `--aux-target zero_sum`
+  no longer refuses: each game carries `Episode.marks`, every seat's points
+  and the turn count before each opponent move, read off the game's record
+  in the worker (`hexn.selfplay.unrecorded_points`, `Collector`'s `marks`),
+  and the target walks the learner's rows and those marks together, so it
+  is the per-move target self-play gives. A mixed game without marks is
+  still refused.
+
+- **`--eval-seed` for `hexn.ppo` and `hexn.exit`**: the seed every evaluation
+  during training plays (the ladder, ExIt's duel), the same for every
+  replicate so their evaluations are paired. Unset, it is `--seed + 10000`
+  (plus the iteration for ExIt), as before; a manifest frozen without it
+  loads with that.
+
+- **`hexn.gamefile.fields`** reads a game file's own fields (outcome, cast,
+  trades, record) without decoding its rows.
+
+### Changed
+
+- **A contract-9 decision loss no longer stalls the device.** `chosen_scores`
+  reads each row's chosen Road Building, discard and double-turn candidate
+  without boolean masks, whose sizes the host had to wait for, in the forward
+  and again in the backward. `decision_scores` takes the rows it selects
+  (robber, setup, double turn) from the batch where it carries them, and
+  `host_rows` finds them while the batch is still on the host. Scores and
+  gradients are unchanged, bit for bit where the backward runs in a fixed
+  order.
+
+- **Every HexN tool takes its seed from the seed policy** (`hexset.seeds`),
+  with `--bypass-seed-policy` and `--registration`. The benchmarks that read
+  a checkpoint's value head on its own games (`value_head`, `sibling`,
+  `rank`, `horizon`, `floor`, `head_swap`, `head_shape`) take an evaluation
+  seed, never a training one. The ones that time or measure training
+  (`rollout`, `model_forward`, `mix_cost`, `noise_scale`,
+  `minibatch_iso_kl`, `expert_scale`, `expert_cost`, `training_loop`), and
+  `widen` and `migrate_c8`, take an `rl` training seed. `return_shape
+  --null-seed` takes an analysis seed. With no policy, each keeps its old
+  default.
+
+- **`hexn.run.init` holds a run's seeds to the seed policy** (`hexset.seeds`):
+  `--seed` to the `rl` training seeds, and the new `--eval-seed` to the
+  evaluation seeds, filled with the policy's default for the table when
+  unset; a confirmation seed takes `--plan` as its registration. A refused
+  seed stops the freeze unless `--bypass-seed-policy REASON` is given; how
+  the seeds passed is kept in `run.json` as `seeds`. With no policy nothing
+  is checked or filled.
+
+- **Contract-9 collect workers sample in bf16 too** (`--collect-precision
+  bf16`, `hexn.policy9.NetworkPolicy9.act`, `hexn.collect._build9`): the
+  forward and the decision's on-demand heads run under bf16 autocast and the
+  scores come back in fp32, so the recorded log-probability is the fp32
+  log-softmax of what the bf16 forward produced, as a contract-8 worker's.
+  `hexn.ppo` no longer lists it among what contract 9 is not built for.
+
+### Fixed
+
+- The network-entrant tournament test names a journal, as HexSet's
+  `compete` requires.
+
+
 ## 0.46.0
 
 ### Added

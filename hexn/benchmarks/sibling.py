@@ -59,6 +59,7 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 
+from hexset import seeds
 from hexset.bench.throughput import environment
 from hexset.actions import ActionType, legal_actions
 from hexset.board.board import random_base_board
@@ -67,6 +68,7 @@ from hexset.mcts import Leaf, draws_hidden, sampled_children
 from hexn.rewards import reward, relative_points
 from hexn.selfplay import Collector, Episode
 from hexset.victory import victory_points
+from . import add_games_dir, games_kept
 
 # Torch is imported inside `main` rather than here, which keeps `Probing` and
 # `rows` — everything with arithmetic worth getting wrong — importable and
@@ -252,7 +254,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--lanes", type=int, default=16)
     parser.add_argument("--players", type=int, default=4)
     parser.add_argument("--action-cap", type=int, default=4000)
-    parser.add_argument("--seed", type=int, default=0)
+    seeds.add_arguments(parser)
     parser.add_argument(
         "--probe",
         type=float,
@@ -267,7 +269,10 @@ def main(argv: list[str] | None = None) -> int:
              "single-draw path this module previously used",
     )
     parser.add_argument("--json", action="store_true")
+    add_games_dir(parser)
     args = parser.parse_args(argv)
+    # The seed policy (its games are evaluation games, never training ones): hexset.seeds.
+    seeds.hold(args, args.players, use="eval")
 
     import torch
 
@@ -304,6 +309,7 @@ def main(argv: list[str] | None = None) -> int:
         max_offers=loaded.max_offers,
         deal=args.games,
         board=board,
+        keep=games_kept(args.games_dir, "sibling"),
     )
     episodes: list[Episode] = collector.drain()
     elapsed = time.perf_counter() - started

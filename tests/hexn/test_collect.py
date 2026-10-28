@@ -11,6 +11,7 @@ torch = pytest.importorskip("torch", reason="PyTorch runs on the training box on
 
 from hexn import gamefile  # noqa: E402
 from hexn.collect import ParallelCollector, WorkerSpec, _build, _serve  # noqa: E402
+from _kept import kept
 
 
 def spec(worker: int, workers: int, **overrides) -> WorkerSpec:
@@ -87,7 +88,7 @@ def served(worker: WorkerSpec, *commands) -> list:
 
 def test_workers_deal_disjoint_strided_indices_and_ship_valid_episodes(pool):
     before = pool.games
-    episodes = pool.collect(4)
+    episodes = pool.collect(4, kept())
 
     assert len(episodes) == 4
     indices = sorted(e.index for e in episodes)
@@ -102,9 +103,9 @@ def test_workers_deal_disjoint_strided_indices_and_ship_valid_episodes(pool):
 
 def test_collection_can_be_started_then_finished_around_other_work(pool):
     before = pool.games
-    pool.start_collect(4)
+    pool.start_collect(4, kept())
     with pytest.raises(RuntimeError, match="already in flight"):
-        pool.start_collect(2)
+        pool.start_collect(2, kept())
 
     # Production uses this window for the preceding batch's GPU update.
     assert pool.games == before
@@ -118,7 +119,7 @@ def test_collection_can_be_started_then_finished_around_other_work(pool):
 
 
 def test_a_parallel_resume_never_redeals_a_seen_index(pool):
-    seen = {e.index for e in pool.collect(4)}
+    seen = {e.index for e in pool.collect(4, kept())}
     base = pool.games_started()
 
     # The resume rule: base is the max over worker counters, so indices the
@@ -129,6 +130,7 @@ def test_a_parallel_resume_never_redeals_a_seen_index(pool):
     fresh: set[int] = set()
     for worker in range(2):
         _, resumed = _build(spec(base + worker, 2, mix=POOL, runtime=RUNTIME))
+        resumed.sink = kept().keep  # a worker's command names its partial
         fresh |= {e.index for e in resumed.cohort(1)}
     assert not (seen & fresh)
     assert min(fresh) >= base
@@ -148,7 +150,7 @@ def test_sync_ships_weights_the_workers_actually_load(pool):
     net = HexNet(space, static_graph(topology), 4, ModelConfig(width=8, rounds=1))
 
     pool.sync(net)
-    episodes = pool.collect(1)
+    episodes = pool.collect(1, kept())
     assert episodes and len(episodes[0]) > 0
 
 
@@ -157,7 +159,7 @@ def test_a_worker_casts_a_table_and_records_only_the_learner_seat(pool):
     the rest drawn from the pool by id, opponent seats never recorded."""
     from hexn.selfplay import owned
 
-    episodes = pool.collect(4)
+    episodes = pool.collect(4, kept())
 
     seen: set[int] = set()
     for episode in episodes:
@@ -169,8 +171,8 @@ def test_a_worker_casts_a_table_and_records_only_the_learner_seat(pool):
     assert seen == {1, 2}
     # `owned` is the assemble-side gate on the same fact, and the two must agree:
     # nothing an opponent did may reach an update.
-    for kept, episode in zip(owned(episodes, 0), episodes):
-        assert kept.trajectories == episode.trajectories
+    for own, episode in zip(owned(episodes, 0), episodes):
+        assert own.trajectories == episode.trajectories
 
 
 def test_a_searched_worker_returns_episodes_whose_transitions_carry_targets():
@@ -180,7 +182,7 @@ def test_a_searched_worker_returns_episodes_whose_transitions_carry_targets():
     from hexn.expert import Target
 
     (kind, payload), = served(
-        spec(0, 1, width=16, simulations=8, wave=4, action_cap=120), ("cohort", 1)
+        spec(0, 1, width=16, simulations=8, wave=4, action_cap=120), ("cohort", (1, kept()))
     )
     assert kind == "games", payload
     episodes = gamefile.decode_all(payload)
@@ -223,7 +225,7 @@ def test_a_league_worker_records_every_seat_and_loads_a_weight_list():
     assert len(policies) == 2
     states = [policy.net.state_dict() for policy in policies]
 
-    loaded, (kind, payload) = served(league, ("weights", states), ("cohort", 2))
+    loaded, (kind, payload) = served(league, ("weights", states), ("cohort", (2, kept())))
 
     assert loaded == ("ok", None)
     assert kind == "games", payload
@@ -282,6 +284,7 @@ def test_a_paired_worker_wraps_its_caster_and_deals_paired_boards():
     from hexn.collect import league_caster
 
     _, collector = _build(spec(0, 1, learners=2, pair_boards=True))
+    collector.sink = kept().keep  # a worker's command names its partial
     assert collector.pair_boards
     plain = league_caster(2, 4)
     for k in range(6):
@@ -502,8 +505,9 @@ def test_a_worker_hands_tempered_self_seats_their_temperature():
         opponents=[RandomPolicy(random.Random(1))],
         caster=lambda index: mix_table(mix, 4, 11)(index)[0],
         temperatures=mix_temperatures(mix, 4, 11),
+        keep=kept(),
     )
-    episodes = collector.collect(4)
+    episodes = collector.collect(4, partial=kept())
     temperatures = [t for _, t in Recording.seen]
     assert temperatures and all(0.6 <= t <= 1.4 for t in temperatures)
     assert any(t != 1.0 for t in temperatures) and any(t == 1.0 for t in temperatures)
@@ -559,7 +563,7 @@ def test_a_worker_plays_duel_variant_games_on_the_live_seats_only():
     mix = (("duel(self|random)", 1.0),)
     collector = ParallelCollector([spec(0, 1, lanes=4, mix=mix)])
     try:
-        episodes = collector.collect(12)
+        episodes = collector.collect(12, partial=kept())
     finally:
         collector.close()
 
@@ -587,7 +591,7 @@ def test_a_self_only_duel_records_both_live_seats():
     mix = (("duel(self)", 1.0),)
     collector = ParallelCollector([spec(0, 1, lanes=4, mix=mix)])
     try:
-        episodes = collector.collect(8)
+        episodes = collector.collect(8, partial=kept())
     finally:
         collector.close()
 

@@ -11,6 +11,7 @@ from hexn.collect import WorkerSpec, _build  # noqa: E402
 from hexn.ppo import PPOConfig  # noqa: E402
 from hexn.ppo.prepare import Prepared, Preparer, games_digest, prepare  # noqa: E402
 from hexn.steps import by_index  # noqa: E402
+from _kept import kept
 
 
 @pytest.fixture(scope="module")
@@ -18,6 +19,7 @@ def cohort():
     """Six encoded games from a real (tiny) shard, as a worker sends them."""
     policies, collector = _build(WorkerSpec(seed=5, players=4, lanes=3, action_cap=200, max_offers=0, first_game=0,
                                             stride=1, width=8, rounds=1, torch_seed=1, mix=(), parent=""))
+    collector.sink = kept().keep  # a worker's command names its partial
     episodes = collector.cohort(6)
     return policies[0].layout, [gamefile.encode(e) for e in episodes]
 
@@ -28,6 +30,7 @@ def outlook_cohort():
     policies, collector = _build(WorkerSpec(seed=5, players=4, lanes=3, action_cap=200, max_offers=0, first_game=0,
                                             stride=1, width=8, rounds=1, torch_seed=1, mix=(), parent="",
                                             outlook=True))
+    collector.sink = kept().keep  # a worker's command names its partial
     episodes = collector.cohort(6)
     return policies[0].layout, [gamefile.encode(e) for e in episodes]
 

@@ -47,10 +47,11 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 
+from hexset import seeds
 from hexset.actions import apply, options_for, space_for
 from hexset.board.board import random_base_board
 from hexset.board.terrain import NUM_RESOURCES
-from hexset.encoding import RULE_BLOCKS, encode, global_columns, static_graph, vertex_features
+from hexset.encoding import encode, global_columns, static_graph, vertex_features
 from hexset.game import Game, is_over, start, to_move
 from hexset.onnx_record import record_batch
 from hexset.state import NO_OWNER
@@ -265,9 +266,10 @@ class _Contract7Inputs(nn.Module):
 
 
 
-# The global blocks a contract-7 net has nothing to say about, contract 8's
-# and contract 8.1's rules: fitted at zero weight. Every other block is fitted.
-_NEW_GLOBALS = ("own_dev_playable", "opponent_dev_ages", "dev_odds", *RULE_BLOCKS)
+# The global blocks a contract-7 net has nothing to say about, contract 8's:
+# fitted at zero weight. Every other block is fitted. The migrated net reads
+# contract 8 (`hexset.encoding`'s default), which has no rule blocks.
+_NEW_GLOBALS = ("own_dev_playable", "opponent_dev_ages", "dev_odds")
 
 
 def _fitted_columns(name: str, players: int) -> np.ndarray:
@@ -453,10 +455,12 @@ def main(argv: list[str] | None = None) -> int:
                         help="the bot all four seats play, as hexset.arena names it; random plays uniformly")
     parser.add_argument("--games", type=int, default=64)
     parser.add_argument("--stride", type=int, default=7, help="decisions between sampled positions")
-    parser.add_argument("--seed", type=int, default=0)
+    seeds.add_arguments(parser)
     parser.add_argument("--force", action="store_true")
     runtime.add_argument(parser)
     args = parser.parse_args(argv)
+    # The seed policy (its games are fitting data): hexset.seeds.
+    seeds.hold(args, 4, use="rl")
 
     if args.out.exists() and not args.force:
         raise SystemExit(f"{args.out} exists; pass --force to overwrite")

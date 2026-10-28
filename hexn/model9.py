@@ -319,6 +319,9 @@ class HexNet(nn.Module):
         self.register_buffer("slot_city", block(ActionType.BUILD_CITY), persistent=False)
         self.register_buffer("slot_road", block(ActionType.BUILD_ROAD), persistent=False)
         self.register_buffer("slot_robber", block(ActionType.MOVE_ROBBER), persistent=False)
+        # The same slots kept on the host, never moved with the module: `host_rows`
+        # reads them where the batch still is, so finding rows costs no device read.
+        self.slot_robber_host = block(ActionType.MOVE_ROBBER)
         self.register_buffer("slot_setup_road", block(ActionType.SETUP_ROAD), persistent=False)
         self.register_buffer("slot_global", torch.cat([block(k) for k in _GLOBAL_KINDS]), persistent=False)
 
@@ -683,19 +686,38 @@ class Scores:
     total: Tensor         # (B,)
 
 
+def host_rows(net: HexNet, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+    """The rows `decision_scores` selects, found from a batch still on the
+    host: `robber_rows` (rows with robber options), `setup_rows` (rows with
+    setup options) and, with `double`, `double_within` (the double-turn rows
+    among `setup_rows`, as positions in it). Exactly the indices it would find
+    on the device. Passed in the batch, they spare the step a device-to-host
+    read for each, which stalls the queue every time."""
+    rows = {"robber_rows": batch["mask"][:, net.slot_robber_host].any(1).nonzero().squeeze(1),
+            "setup_rows": batch["setup"].any(1).nonzero().squeeze(1)}
+    if batch.get("double") is not None:
+        rows["double_within"] = batch["double"][rows["setup_rows"]].nonzero().squeeze(1)
+    return rows
+
+
 def decision_scores(net: HexNet, out: Prediction, batch: dict[str, Tensor]) -> Scores:
     """`Scores` for a batch as `decision_log_prob` takes one. The robber and
     setup heads run only on the rows whose decision has such options. A batch
     without `double` has no double turn (self-play asks it in two setup
-    turns), and the first, second and pair heads are not read."""
+    turns), and the first, second and pair heads are not read. Those rows are
+    the batch's `host_rows` where it carries them, else found here."""
     neg = float("-inf")
     rows = out.logits.shape[0]
     logits = out.logits.float()
-    robbing = batch["mask"][:, net.slot_robber].any(1).nonzero().squeeze(1)
+    robbing = batch.get("robber_rows")
+    if robbing is None:
+        robbing = batch["mask"][:, net.slot_robber].any(1).nonzero().squeeze(1)
     if len(robbing):
         logits = logits.index_put((robbing[:, None], net.slot_robber[None, :]),
                                   net.robber_logits(out, robbing).float())
-    setting = batch["setup"].any(1).nonzero().squeeze(1)
+    setting = batch.get("setup_rows")
+    if setting is None:
+        setting = batch["setup"].any(1).nonzero().squeeze(1)
     count = batch["setup"].shape[1]
     setup_raw = logits.new_zeros(rows, count)
     double = batch.get("double")
@@ -720,7 +742,9 @@ def decision_scores(net: HexNet, out: Prediction, batch: dict[str, Tensor]) -> S
     d = setting[:0]
     pairs = logits.new_zeros(0, count * count)
     if len(setting) and double is not None:
-        within = double[setting].nonzero().squeeze(1)               # double rows, as positions in `setting`
+        within = batch.get("double_within")                          # double rows, as positions in `setting`
+        if within is None:
+            within = double[setting].nonzero().squeeze(1)
         if len(within):
             d = setting[within]
             legal = batch["setup"][d]
@@ -745,17 +769,22 @@ def chosen_scores(scores: Scores, batch: dict[str, Tensor]) -> Tensor:
                          chosen)
     chosen = torch.where(tkind == DecisionKind.SETUP, setup.gather(1, y.clamp(max=setup.shape[1] - 1)[:, None]).squeeze(1),
                          chosen)
-    if scores.rb.numel():
-        taken = (tkind[scores.rb_row] == DecisionKind.ROAD_BUILDING) & (batch["rb_index"] == y[scores.rb_row])
-        chosen = chosen.index_put((scores.rb_row[taken],), scores.rb[taken])
-    if scores.disc.numel():
-        taken = (tkind[scores.disc_row] == DecisionKind.DISCARD) & (batch["disc_index"] == y[scores.disc_row])
-        chosen = chosen.index_put((scores.disc_row[taken],), scores.disc[taken])
+    # No boolean-mask reads, whose size the host would have to wait for: a row
+    # takes at most one candidate, so the row's maximum over its taken
+    # candidates (the rest -inf) is that candidate's score, and the gradient
+    # reaches it alone.
+    for kind, score, row, index in ((DecisionKind.ROAD_BUILDING, scores.rb, scores.rb_row, batch["rb_index"]),
+                                    (DecisionKind.DISCARD, scores.disc, scores.disc_row, batch["disc_index"])):
+        if score.numel():
+            taken = (tkind[row] == kind) & (index == y[row])
+            picked = chosen.new_full(chosen.shape, neg).scatter_reduce(
+                0, row, torch.where(taken, score, torch.full_like(score, neg)), reduce="amax", include_self=True)
+            chosen = torch.where(tkind == kind, picked, chosen)
     if len(scores.double_rows):
         d = scores.double_rows
         taken = tkind[d] == DecisionKind.DOUBLE
         picked = scores.double.gather(1, y[d].clamp(max=scores.double.shape[1] - 1)[:, None]).squeeze(1)
-        chosen = chosen.index_put((d[taken],), picked[taken])
+        chosen = chosen.index_put((d,), torch.where(taken, picked, chosen[d]))
     return chosen
 
 

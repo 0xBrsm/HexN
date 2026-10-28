@@ -8,6 +8,7 @@ torch = pytest.importorskip("torch")
 
 from hexn.run import freeze, load  # noqa: E402
 from hexn.run import resources  # noqa: E402
+from _kept import kept
 
 
 def flags(mode, directory):
@@ -100,6 +101,7 @@ def test_fused_workers_keep_the_collected_moves_and_search_targets(searched):
             learners=1 if searched else 2, simulations=4 if searched else 0, wave=4,
             **({} if trunk is None else {"trunk": trunk}))
         policies, collector = _build(spec)
+        collector.sink = kept().keep  # a worker's command names its partial
         assert all(policy.net.fused == (trunk != "reference") for policy in policies)
         return collector.cohort(2)
 

@@ -15,6 +15,7 @@ import pytest
 import hexn
 from hexn import durable
 from hexn.selfplay import Choice, Collector, RandomPolicy
+import _kept
 
 PACKAGE = Path(hexn.__file__).resolve().parent
 
@@ -57,13 +58,13 @@ QUICK = dict(lanes=2, seed=3, action_cap=40, max_offers=0)
 
 
 def test_a_killed_cohort_resumes_to_exactly_the_games_it_planned(tmp_path):
-    whole = Collector(First(), fill=False, **QUICK).cohort(6)
+    whole = Collector(First(), fill=False, **QUICK, keep=_kept.kept()).cohort(6)
 
     partial = durable.Partial(tmp_path / "iter-00000")
     with pytest.raises(Crash):
         # Two lanes of 40-action games, and the process dies at tick 90 with
         # the last of them still in flight.
-        Collector(Dies(First(), 90), fill=False, **QUICK).cohort(6, partial)
+        Collector(Dies(First(), 90), fill=False, **QUICK, keep=_kept.kept()).cohort(6, partial)
     assert partial.plan() == [0, 1, 2, 3, 4, 5]
     assert 0 < len(partial.finished()) < 6
 
@@ -72,6 +73,7 @@ def test_a_killed_cohort_resumes_to_exactly_the_games_it_planned(tmp_path):
         fill=False,
         first_game=durable.resume_base(0, partial.indices()),
         **QUICK,
+        keep=_kept.kept(),
     )
     episodes = resumed.cohort(6, partial)
 
@@ -86,14 +88,14 @@ def test_a_killed_cohort_resumes_to_exactly_the_games_it_planned(tmp_path):
 def test_a_killed_stream_tops_up_past_the_games_it_kept(tmp_path):
     partial = durable.Partial(tmp_path / "iter-00003")
     with pytest.raises(Crash):
-        Collector(Dies(RandomPolicy(random.Random(1)), 90), **QUICK).collect(8, partial)
+        Collector(Dies(RandomPolicy(random.Random(1)), 90), **QUICK, keep=_kept.kept()).collect(8, partial)
     kept = partial.finished()
     assert 0 < len(kept) < 8
 
     base = durable.resume_base(0, partial.indices())
     episodes = Collector(
         RandomPolicy(random.Random(2)), first_game=base, **QUICK
-    ).collect(8, partial)
+    , keep=_kept.kept()).collect(8, partial)
 
     indices = [e.index for e in episodes]
     assert len(indices) >= 8 and len(set(indices)) == len(indices)
@@ -200,7 +202,7 @@ def test_a_partial_keeps_each_game_encoded_and_still_reads_the_old_pickles(tmp_p
 
     from hexn import gamefile
 
-    episodes = Collector(First(), fill=False, **QUICK).cohort(4)
+    episodes = Collector(First(), fill=False, **QUICK, keep=_kept.kept()).cohort(4)
     partial = durable.Partial(tmp_path / "iter-00002")
     for episode in episodes[:2]:
         partial.keep(episode)
@@ -220,7 +222,7 @@ def test_a_partial_keeps_each_game_encoded_and_still_reads_the_old_pickles(tmp_p
 
 
 def test_a_damaged_game_file_is_removed_and_played_again(tmp_path):
-    episodes = Collector(First(), fill=False, **QUICK).cohort(2)
+    episodes = Collector(First(), fill=False, **QUICK, keep=_kept.kept()).cohort(2)
     partial = durable.Partial(tmp_path / "iter-00003")
     partial.write_plan([e.index for e in episodes])
     for episode in episodes:
@@ -231,3 +233,25 @@ def test_a_damaged_game_file_is_removed_and_played_again(tmp_path):
     assert len(partial.done()) == 1
     assert partial.finished() == [episodes[1].index], "the damaged game is missing now"
     assert partial.indices() == {e.index for e in episodes}
+
+
+def test_pruning_keeps_every_game_and_its_record_before_removing_the_collection(tmp_path):
+    """`durable.prune` archives a collection before it removes it: one gzipped
+    journal line per game, its record among the fields, the record replaying
+    to the game's own winner and turns."""
+    import gzip
+
+    from hexset.record import from_json, replay
+
+    root = tmp_path / "partial"
+    held = durable.partial(root, 0)
+    episodes = Collector(First(), fill=False, **QUICK, keep=held).cohort(4)
+    durable.prune(root, 0)
+    assert not held.directory.exists()
+    path = durable.archived(root, 0)
+    lines = [json.loads(line) for line in gzip.decompress(path.read_bytes()).decode().splitlines()]
+    assert sorted(line["index"] for line in lines) == sorted(e.index for e in episodes)
+    for line in lines:
+        record = from_json(json.dumps(line["record"]))
+        game = replay(record)
+        assert (game.won_by, game.turns) == (line["outcome"]["winner"], line["outcome"]["turns"])

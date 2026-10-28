@@ -58,7 +58,7 @@ from hexset.gym.lanes import Episode as LaneEpisode
 from hexset.outlook import outlook_of
 from hexset.victory import victory_points
 from hexset.gym.lanes import Request as LaneRequest
-from hexset.record import Record
+from hexset.record import Record, advance, moves, open_record, shown_by_step
 from hexset.rules import STANDARD_GAME, GameType
 
 if TYPE_CHECKING:
@@ -389,6 +389,13 @@ class Episode:
     `hexset.record.Tape` and a few KB a game). `None` for an episode collected
     before this field existed, exactly like `trades` above; `replay_to_ply`
     is what reads it.
+
+    `marks` is `(step, turns, seat_points)` before every move of a seat the
+    collector did not record, read off `record` (`unrecorded_points`), when
+    the collector was asked for them (`Collector`'s `marks`): what lets the
+    points head's zero-sum target see each change in points when it happened
+    at a table the learner shares (`hexn.ppo.prepare.prepare_columns9`).
+    Empty in self-play, where every move is a row, and unless asked for.
     """
 
     index: int
@@ -399,6 +406,7 @@ class Episode:
     cast: tuple[int, ...] = ()
     trades: tuple[tuple[int, int, int, tuple[int, ...]], ...] = ()
     record: Record | None = None
+    marks: tuple[tuple[int, int, tuple[int, ...]], ...] = ()
 
     def stream(self) -> list[Transition]:
         """Every transition back in the order it was taken."""
@@ -436,9 +444,32 @@ def owned(episodes: Sequence[Episode], learner: int) -> list[Episode]:
                 cast=episode.cast,
                 trades=episode.trades,
                 record=episode.record,
+                marks=episode.marks,
             )
         )
     return out
+
+
+def unrecorded_points(record: Record, steps: Sequence[int]) -> tuple[tuple[int, int, tuple[int, ...]], ...]:
+    """`(step, turns, seat_points)` before each of `steps`, in step order,
+    off one walk of `record` (`Episode.marks`): the same clock and true
+    points a recorded row carries (`Request.turns`, `Request.seat_points`)."""
+    wanted = set(steps)
+    if not wanted:
+        return ()
+    last = max(wanted)
+    game = open_record(record)
+    shown = shown_by_step(record)
+    out = []
+    for step, (actor, action, trades) in enumerate(moves(record)):
+        if step in wanted:
+            out.append((step, game.turns, _seat_points(game)))
+        if step == last:
+            break
+        advance(game, action, trades, actor, shown.get(step, ()))
+    if len(out) != len(wanted):
+        raise ValueError(f"the record holds {len(out)} of the {len(wanted)} steps asked for")
+    return tuple(out)
 
 
 class RuledLaneEnv(LaneEnv):
@@ -561,11 +592,19 @@ class Collector:
         coalition: Callable[[int], object] | None = None,
         sample_stream: str = "worker",
         outlook: bool = False,
+        marks: bool = False,
         contract: str = "8",
         discard_order: str = "seat",
         board_mode: str = "random",
+        keep: "Partial | None" = None,
     ) -> None:
-        """`first_game` is where the game counter starts.
+        """`keep` is where every game is written as it finishes
+        (`hexn.durable.Partial`, each game's file holding its
+        `hexset.record.Record`), unless a call names its own `partial`
+        (`collect`, `cohort`). A collector plays no game with nowhere to keep
+        it: `tick` refuses.
+
+        `first_game` is where the game counter starts.
 
         A training run that crashes and resumes would otherwise replay the games
         it had already learned from, since a game is a pure function of the seed
@@ -599,6 +638,9 @@ class Collector:
 
         `outlook` reads `Request.outlook`, the `--aux-target outlook` label, on
         `OUTLOOK_SHARE` of the turn's own decisions; off, it costs nothing.
+
+        `marks` fills `Episode.marks` for a game a scripted opponent sat in,
+        one walk of its record as it finishes; off, it costs nothing.
 
         `contract` is `CONTRACTS`' choice. Under "9" the learner (policy 0) is
         asked for whole decisions and files a `Transition9` per decision;
@@ -650,6 +692,7 @@ class Collector:
         self.board_mode = board_mode
         self.sample_stream = sample_stream
         self.outlook = outlook
+        self.marks = marks
         self.opponents = tuple(opponents)
         self.caster = caster
         # Game index -> per-seat sampling temperature, pure in the index like
@@ -692,7 +735,7 @@ class Collector:
         self._deal = deal
         self._next_game = first_game
         self._stop = None if deal is None else first_game + deal * stride
-        self.sink: Callable[[Episode], None] | None = None
+        self.sink: Callable[[Episode], object] | None = None if keep is None else keep.keep
         self.beat: Callable[[], None] | None = None
 
         # A scripted opponent is played by the environment, which seats it as
@@ -801,7 +844,6 @@ class Collector:
             # (`hexn.replay.replay_to_ply` reads it) -- a few KB a game
             # against observation arrays already dwarfing it, so there is no
             # cohort this should be switched off for.
-            records=True,
             discard_order=self.discard_order,
             board_mode=self.board_mode,
             decisions=(0,) if self.contract in ("9", "9.1") else (),
@@ -822,9 +864,7 @@ class Collector:
             return []
         if self.contract in ("9", "9.1"):
             return self._requests9(asked)
-        observations = encode_batch(
-            [request.game for request in asked], [request.seat for request in asked]
-        )
+        observations = self._encode8(asked)
         keyed = self.sample_stream == "game"
         return [
             Request(
@@ -854,6 +894,19 @@ class Collector:
             )
             for request, observation in zip(asked, observations, strict=True)
         ]
+
+    def _encode8(self, asked: Sequence[LaneRequest]) -> list:
+        """A contract-8 tick's observations, each under the observation
+        contract its seat's policy reads (`NetworkPolicy.observation_contract`:
+        "8", or "8.1" for a net trained across rule sets), one batch a contract."""
+        contracts = [getattr(self._batched.get(r.policy, self.policy), "observation_contract", "8") for r in asked]
+        observations: list = [None] * len(asked)
+        for contract in sorted(set(contracts)):
+            rows = [i for i, c in enumerate(contracts) if c == contract]
+            encoded = encode_batch([asked[i].game for i in rows], [asked[i].seat for i in rows], contract)
+            for i, observation in zip(rows, encoded):
+                observations[i] = observation
+        return observations
 
     def _requests9(self, asked: Sequence[LaneRequest]) -> list[Request]:
         """Contract 9's tick: every learner decision as `hexset.contract9`
@@ -972,7 +1025,17 @@ class Collector:
             trades=played.trades,
             record=played.record,
             outcome=played.outcome,
+            marks=self._marks(played),
         )
+
+    def _marks(self, played: LaneEpisode) -> tuple[tuple[int, int, tuple[int, ...]], ...]:
+        """`Episode.marks`: every scripted seat's moves, if asked for."""
+        if not self.marks:
+            return ()
+        steps = [d.step for decisions in played.decisions for d in decisions if d.policy in self._benches]
+        if steps and played.record is None:
+            raise ValueError(f"game {played.index} has no record to read its unrecorded moves' points off")
+        return unrecorded_points(played.record, steps) if steps else ()
 
     def _mine(self, outstanding: Sequence[LaneRequest]) -> list[LaneRequest]:
         """The decisions a `BatchPolicy` answers: everything not played by a bot
@@ -993,7 +1056,13 @@ class Collector:
         return self._requests(self._mine(self._env.requests()))
 
     def tick(self) -> list[Episode]:
-        """Step every live lane once. Returns the games that ended on this tick."""
+        """Step every live lane once. Returns the games that ended on this tick,
+        each already written where this collector keeps its games."""
+        if self.sink is None:
+            raise RuntimeError(
+                "a collector keeps every game it plays: build it with keep=<hexn.durable.Partial> "
+                "or name a partial for the call"
+            )
         if self._env is None:
             return []
         outstanding = self._env.requests()

@@ -35,6 +35,7 @@ from dataclasses import replace
 import numpy as np
 import torch
 
+from hexset import seeds
 from hexset.bench.throughput import environment
 from hexn.netbot import load
 from hexn.policy import NetworkPolicy
@@ -43,6 +44,7 @@ from hexn.rewards import reward
 from hexset.arena import entrant_from_name, spawn
 from hexn.selfplay import Choice, Collector, Episode
 from hexset.board.board import random_base_board
+from . import add_games_dir, games_kept
 
 
 class Scored:
@@ -109,7 +111,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--lanes", type=int, default=64)
     parser.add_argument("--players", type=int, default=4)
     parser.add_argument("--action-cap", type=int, default=4000)
-    parser.add_argument("--seed", type=int, default=0)
+    seeds.add_arguments(parser)
     parser.add_argument("--bins", type=int, default=5)
     parser.add_argument(
         "--behaviour",
@@ -131,7 +133,10 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument("--json", action="store_true")
+    add_games_dir(parser)
     args = parser.parse_args(argv)
+    # The seed policy (its games are evaluation games, never training ones): hexset.seeds.
+    seeds.hold(args, args.players, use="eval")
 
     board = random_base_board(random.Random(args.seed))
     loaded = load(args.checkpoint, board.topology)
@@ -166,6 +171,7 @@ def main(argv: list[str] | None = None) -> int:
         max_offers=loaded.max_offers,
         deal=args.games,
         board=board if fixed else None,
+        keep=games_kept(args.games_dir, "value_head"),
     )
     episodes: list[Episode] = collector.drain()
     elapsed = time.perf_counter() - started

@@ -15,6 +15,7 @@ import multiprocessing as mp
 import sys
 
 from .expert_cost import measure
+from hexset import seeds
 from hexset.bench.throughput import environment
 
 
@@ -33,11 +34,13 @@ def main() -> int:
     parser.add_argument("--simulations", type=int, default=256)
     parser.add_argument("--wave", type=int, default=16)
     parser.add_argument("--players", type=int, default=4)
-    parser.add_argument("--seed", type=int, default=0)
+    seeds.add_arguments(parser)
     parser.add_argument("--compile", dest="compile_mode", default="default")
     parser.add_argument("--actions-per-game", type=int, default=950)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
+    # The seed policy (it plays games the way training does): hexset.seeds.
+    seeds.hold(args, args.players, use="rl")
 
     context = mp.get_context("spawn")
     points = []

@@ -63,9 +63,9 @@ read. A contract-7 checkpoint is carried over by `hexn.migrate_c8`.
 played to, and appends 15 globals (90 at four seats): the table's rules
 (the points the game is played to, the discard limit, the friendly robber,
 the balanced dice) and each sum's chance on the next roll, from five more
-record fields. A contract-8 checkpoint loads onto it with zero weights on
-the new columns (`hexn.model.HexNet`), and so plays a standard game exactly
-as it did.
+record fields. It is the contract of a net trained across rule sets
+(`hexn.model.ModelConfig.contract`, which a checkpoint carries in its
+weights); every other contract-8 net exports a contract-8 graph.
 
 **Contract 9** reads HexSet's own contract-9 observation and the arrays of
 the decision at hand, which the server builds, and answers the whole
@@ -74,10 +74,11 @@ decision. A contract-9 checkpoint (`hexn.model9.HexNet`) is exported by
 command line dispatch to it by the checkpoint's own `contract`.
 
 * **Inputs**, a dynamic leading batch axis, named as
-  `hexset.onnx_record.RECORD_FIELDS` names them, in its order: the 32 of its
-  38 a contract-8.1 graph reads (`_INPUT_NAMES`; board, position, information
-  set, rules, legality — see that module's docstring). All int64 except
-  `expected_hand`, `dev_ages` and `roll_odds` (float32) and `action_mask` (bool). `B` is
+  `hexset.onnx_record.RECORD_FIELDS` names them, in its order: the 27 of its
+  38 a contract-8 graph reads, or the 32 a contract-8.1 graph reads
+  (`_input_names`; board, position, information set, 8.1's rules, legality —
+  see that module's docstring). All int64 except `expected_hand`, `dev_ages`
+  and 8.1's `roll_odds` (float32) and `action_mask` (bool). `B` is
   1 for a single decision and a whole wave of leaves for the UI's MCTS
   `LeafEvaluator`, so the axis must really be dynamic.
 * **Outputs**, in this order: `action_index` (`(B,)` int64, argmax over the
@@ -89,7 +90,8 @@ command line dispatch to it by the checkpoint's own `contract`.
   margin. One forward serves both callers:
   `NetworkBot` reads the index, a search reads the two distributions.
 * **Metadata props** (`hexset.clients._modelmeta` and `onnxbot._load_cached`):
-  `contract` is `hexset.onnx_record.CONTRACT_VERSION` (`"8.1"`); `players` and the
+  `contract` is `"8"`, or `hexset.onnx_record.CONTRACT_VERSION` (`"8.1"`) for
+  an 8.1 net; `players` and the
   `num_hexes`/`num_vertices`/
   `num_edges` fingerprint are required; `max_offers` (`""` for none) and
   `iteration` are read with defaults; and only when asked for on the command
@@ -181,6 +183,14 @@ _UNREAD = frozenset({
     "hand_totals", "ledger_known", "ledger_unknown",
 })
 _INPUT_NAMES = tuple(name for name in RECORD_FIELDS if name not in _UNREAD)
+# The record fields only a contract-8.1 graph reads: the table's rules and the
+# next roll's odds. A contract-8 graph declares the rest.
+_RULE_FIELDS = frozenset({"winning_points", "discard_limit", "friendly_robber", "balanced_dice", "roll_odds"})
+
+
+def _input_names(contract: str) -> tuple[str, ...]:
+    """The record fields a graph of observation `contract` reads, in order."""
+    return _INPUT_NAMES if contract == "8.1" else tuple(n for n in _INPUT_NAMES if n not in _RULE_FIELDS)
 _OUTPUT_NAMES = ("action_index", "prior", "value")
 _BATCH = "batch"
 
@@ -256,12 +266,14 @@ def _sample_games(players: int, count: int, seed: int = 0) -> list[tuple[Game, i
     return pairs
 
 
-def _sample_inputs(space: ActionSpace, players: int, batch: int, seed: int = 0) -> dict[str, np.ndarray]:
+def _sample_inputs(
+    space: ActionSpace, players: int, batch: int, seed: int = 0, contract: str = "8"
+) -> dict[str, np.ndarray]:
     """Real information-set records, for tracing and for the parity check
     alike — `_sample_games` plus `hexset.onnx_record.record_batch` — as the
-    graph's inputs: the fields it reads (`_INPUT_NAMES`)."""
+    graph's inputs: the fields it reads (`_input_names(contract)`)."""
     record = record_batch(_sample_games(players, batch, seed), space)
-    return {name: record[name] for name in _INPUT_NAMES}
+    return {name: record[name] for name in _input_names(contract)}
 
 
 def _onehot(index: Tensor, num_classes: int) -> Tensor:
@@ -302,7 +314,7 @@ def _pips_table() -> list[float]:
 
 class RecordEncoder(nn.Module):
     """`record -> (hexes, vertices, edges, globals)`: the traceable half of
-    `hexset.encoding.encode`/`encode_batch` (contract 8.1), reading
+    `hexset.encoding.encode`/`encode_batch` (observation `contract`, 8 or 8.1), reading
     `hexset.onnx_record`'s torch-free record by field name.
 
     No data-dependent control flow -- every branch below is a `where` or a
@@ -317,9 +329,10 @@ class RecordEncoder(nn.Module):
     robber column.
     """
 
-    def __init__(self, graph: StaticGraph, players: int) -> None:
+    def __init__(self, graph: StaticGraph, players: int, contract: str = "8") -> None:
         super().__init__()
         self.players = players
+        self.contract = contract
         self.num_hexes = graph.num_hexes
         self.register_buffer(
             "pips_table", torch.tensor(_pips_table(), dtype=torch.float32), persistent=False
@@ -385,8 +398,11 @@ class RecordEncoder(nn.Module):
             parts.append(torch.where(ages < 0, torch.zeros_like(ages), (ages + 1.0) / AGE_SCALE))
 
         award = torch.stack([gather_seat(r["award_points"], seats[i]).to(f32) for i in range(players)], dim=1)
-        winning = r["winning_points"].to(f32).unsqueeze(-1)
-        parts.append((building_points + award) / winning)
+        if self.contract == "8.1":
+            winning = r["winning_points"].to(f32).unsqueeze(-1)
+            parts.append((building_points + award) / winning)
+        else:
+            parts.append((building_points + award) / POINTS_SCALE)
         parts.append(torch.stack([closeness(gather_seat(r["roads_to_take"], seats[i])) for i in range(players)], dim=1))
         parts.append(torch.stack([closeness(gather_seat(r["knights_needed"], seats[i])) for i in range(players)], dim=1))
         parts.append(_onehot(_rotate_slot(r["to_move"], perspective, players), players)[:, 1:])
@@ -399,12 +415,13 @@ class RecordEncoder(nn.Module):
         parts.append(_onehot(r["phase"], NUM_PHASES)[:, :ENCODED_PHASES])
         parts.append((r["free_roads"].to(f32) / FREE_ROADS_SCALE).unsqueeze(-1))
         parts.append(torch.clamp(r["turns"].to(f32) / TURN_SCALE, max=1.0).unsqueeze(-1))
-        # Contract 8.1: the table's rules and the next roll's odds.
-        parts.append(winning / POINTS_SCALE)
-        parts.append((r["discard_limit"].to(f32) / HAND_SCALE).unsqueeze(-1))
-        parts.append(r["friendly_robber"].to(f32).unsqueeze(-1))
-        parts.append(r["balanced_dice"].to(f32).unsqueeze(-1))
-        parts.append(r["roll_odds"].to(f32))
+        if self.contract == "8.1":
+            # The table's rules and the next roll's odds.
+            parts.append(winning / POINTS_SCALE)
+            parts.append((r["discard_limit"].to(f32) / HAND_SCALE).unsqueeze(-1))
+            parts.append(r["friendly_robber"].to(f32).unsqueeze(-1))
+            parts.append(r["balanced_dice"].to(f32).unsqueeze(-1))
+            parts.append(r["roll_odds"].to(f32))
 
         globals_ = torch.cat(parts, dim=-1)
         return hexes, vertices, edges, globals_
@@ -423,10 +440,11 @@ class _ExportWrapper(nn.Module):
         self.encoder = encoder
         self.net = net
         self.players = players
+        self.names = _input_names(encoder.contract)
 
     def forward(self, *fields: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         """Positional inputs in `RECORD_FIELDS` order, as the graph names them."""
-        record = dict(zip(_INPUT_NAMES, fields, strict=True))
+        record = dict(zip(self.names, fields, strict=True))
         action_mask = record["action_mask"]
         perspective = record["perspective"]
         hexes, vertices, edges, globals_ = self.encoder(record)
@@ -575,6 +593,7 @@ def _embed_metadata(
     gate_plies: int | None,
     trader: str | None = None,
     serving: dict[str, str] | None = None,
+    contract: str = "8",
 ) -> None:
     """The facts `hexset.clients.onnxbot.load()` needs back at runtime: which
     contract the graph speaks, enough to build an `ActionSpace`, enough to
@@ -596,7 +615,9 @@ def _embed_metadata(
     import onnx
 
     props = {
-        "contract": _CONTRACT_VERSION,
+        # The record contract the graph speaks: 8.1 only for a net that reads
+        # the table's rules, which `_CONTRACT_VERSION` names.
+        "contract": _CONTRACT_VERSION if contract == "8.1" else "8",
         "players": str(players),
         "num_hexes": str(topology.num_hexes),
         "num_vertices": str(topology.num_vertices),
@@ -639,7 +660,7 @@ def _check_tensor(tensor, shapes: dict[str, tuple], expected_dtype) -> None:
         raise ValueError(f"{tensor.name} is shaped {dims}, not {expected}")
 
 
-def _verify_contract(onnx_path: Path, shapes: dict[str, tuple]) -> None:
+def _verify_contract(onnx_path: Path, shapes: dict[str, tuple], contract: str = "8") -> None:
     """Read the graph back and hold it to the names, dtypes and shapes
     `hexset.clients.onnxbot`'s v2 path hard-codes — the parity check below would
     pass a graph whose outputs were merely *renamed*, and the UI would then
@@ -651,7 +672,7 @@ def _verify_contract(onnx_path: Path, shapes: dict[str, tuple]) -> None:
         "input": [t.name for t in model.graph.input],
         "output": [t.name for t in model.graph.output],
     }
-    expected = {"input": list(_INPUT_NAMES), "output": list(_OUTPUT_NAMES)}
+    expected = {"input": list(_input_names(contract)), "output": list(_OUTPUT_NAMES)}
     if found != expected:
         raise ValueError(f"graph signature {found} is not hexset's {expected}")
     for tensor in model.graph.input:
@@ -702,7 +723,8 @@ def _verify_parity(
 
     from hexset.encoding import encode
 
-    observations = [encode(game, seat) for game, seat in pairs]
+    contract = encoder.contract
+    observations = [encode(game, seat, contract) for game, seat in pairs]
     hexes = torch.from_numpy(np.stack([o.hexes for o in observations]))
     vertices = torch.from_numpy(np.stack([o.vertices for o in observations]))
     edges = torch.from_numpy(np.stack([o.edges for o in observations]))
@@ -720,7 +742,7 @@ def _verify_parity(
         ref_value = pred.value.gather(1, rotate).numpy()
 
     session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
-    feed = {name: record[name] for name in _INPUT_NAMES}
+    feed = {name: record[name] for name in _input_names(contract)}
     onnx_out = dict(zip(_OUTPUT_NAMES, session.run(list(_OUTPUT_NAMES), feed)))
 
     np.testing.assert_array_equal(onnx_out["action_index"], ref_action_index, err_msg="action_index")
@@ -794,13 +816,15 @@ def export(
     graph = static_graph(topology)
     shapes = _shapes(graph, players, space)
 
-    encoder = RecordEncoder(graph, players)
+    contract = net.config.contract
+    names = _input_names(contract)
+    encoder = RecordEncoder(graph, players, contract)
     encoder.eval()
     wrapper = _ExportWrapper(encoder, net, players)
     wrapper.eval()
 
-    dummy = _sample_inputs(space, players, batch=1, seed=0)
-    dummy_tensors = tuple(torch.from_numpy(dummy[name]) for name in _INPUT_NAMES)
+    dummy = _sample_inputs(space, players, batch=1, seed=0, contract=contract)
+    dummy_tensors = tuple(torch.from_numpy(dummy[name]) for name in names)
 
     torch.onnx.export(
         wrapper,
@@ -812,9 +836,9 @@ def export(
         # forward has data-dependent control flow, so tracing is safe and
         # there's nothing the dynamo path would buy here.
         dynamo=False,
-        input_names=list(_INPUT_NAMES),
+        input_names=list(names),
         output_names=list(_OUTPUT_NAMES),
-        dynamic_axes={n: {0: _BATCH} for n in (*_INPUT_NAMES, *_OUTPUT_NAMES)},
+        dynamic_axes={n: {0: _BATCH} for n in (*names, *_OUTPUT_NAMES)},
         opset_version=opset,
     )
     _embed_metadata(
@@ -826,9 +850,10 @@ def export(
         wave=wave,
         gate_plies=gate_plies,
         serving=serving,
+        contract=contract,
         **meta,
     )
-    _verify_contract(out, shapes)
+    _verify_contract(out, shapes, contract)
     _verify_parity(net, encoder, space, players, out)
     return out
 

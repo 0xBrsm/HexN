@@ -60,6 +60,7 @@ from dataclasses import asdict, dataclass
 
 import torch
 
+from hexset import seeds
 from hexset.bench.throughput import environment
 from hexset.actions import build_space
 from hexset.board.board import random_base_board
@@ -77,6 +78,7 @@ from hexn.policy import NetworkPolicy
 from hexset.gym.lanes import BoardBots
 
 from hexn.selfplay import Collector
+from . import add_games_dir, games_kept
 
 
 class Timed:
@@ -228,8 +230,10 @@ def shard(
     action_cap: int,
     parent: str,
     learner: str = "",
+    keep,
 ) -> Point:
-    """One worker's cohort, in this process, with every side on a stopwatch."""
+    """One worker's cohort, in this process, with every side on a stopwatch,
+    every game kept in `keep`."""
     torch.set_num_threads(1)
     torch.manual_seed(seed)
 
@@ -277,7 +281,7 @@ def shard(
     )
 
     start = time.perf_counter()
-    episodes = collector.cohort(games)
+    episodes = collector.cohort(games, partial=keep)
     seconds = time.perf_counter() - start
 
     actions = sum(e.outcome.actions for e in episodes)
@@ -312,8 +316,10 @@ def sharded(
     max_offers: int | None,
     action_cap: int,
     parent: str,
+    keep,
 ) -> Point:
-    """The real thing: `workers` shards over pipes, wall clock only.
+    """The real thing: `workers` shards over pipes, wall clock only, every game
+    kept in `keep`.
 
     Weights are never synced. A worker builds its net from the spec and plays
     with it; the learner's parameters change which games get played and not what
@@ -343,7 +349,7 @@ def sharded(
     collector = ParallelCollector(specs)
     try:
         start = time.perf_counter()
-        episodes = collector.collect(games)
+        episodes = collector.collect(games, partial=keep)
         seconds = time.perf_counter() - start
     finally:
         collector.close()
@@ -385,7 +391,7 @@ def main(argv: list[str] | None = None) -> int:
         "N times N real worker processes and reports wall clock only",
     )
     parser.add_argument("--players", type=int, default=4)
-    parser.add_argument("--seed", type=int, default=0)
+    seeds.add_arguments(parser)
     parser.add_argument("--width", type=int, default=64)
     parser.add_argument("--rounds", type=int, default=2)
     parser.add_argument(
@@ -406,7 +412,10 @@ def main(argv: list[str] | None = None) -> int:
         "mode only -- a worker process builds its net from its own spec",
     )
     parser.add_argument("--json", action="store_true")
+    add_games_dir(parser)
     args = parser.parse_args(argv)
+    # The seed policy (it plays games the way training does): hexset.seeds.
+    seeds.hold(args, args.players, use="rl")
 
     mixes = args.mix if args.mix is not None else [""]
     points = []
@@ -425,9 +434,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.workers:
             if args.learner:
                 raise SystemExit("--learner is single-shard only; drop --workers")
-            point = sharded(mix, workers=args.workers, **common)
+            point = sharded(mix, workers=args.workers, **common,
+                            keep=games_kept(args.games_dir, "mix_cost", f"mix-{len(points)}"))
         else:
-            point = shard(mix, learner=args.learner, **common)
+            point = shard(mix, learner=args.learner, **common,
+                          keep=games_kept(args.games_dir, "mix_cost", f"mix-{len(points)}"))
         points.append(point)
         if not args.json:
             print(

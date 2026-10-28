@@ -42,12 +42,13 @@ import hashlib
 import json
 import random
 import sys
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import torch
 from torch import Tensor
 
+from hexset import seeds
 from hexset.actions import space_for
 from hexset.board.board import random_base_board
 from hexset.encoding import encode, static_graph
@@ -159,7 +160,7 @@ def widen_state_dict(
     return out
 
 
-def _observations(players: int, count: int, seed: int) -> list:
+def _observations(players: int, count: int, seed: int, contract: str = "8") -> list:
     """Real positions from seeded random play, the same recipe the model
     tests use, so the exactness check sees legal masks and full hands."""
     out = []
@@ -171,7 +172,7 @@ def _observations(players: int, count: int, seed: int) -> list:
             if is_over(game):
                 break
             step_randomly(game, rng)
-        out.append(encode(game))
+        out.append(encode(game, contract=contract))
     return out
 
 
@@ -244,6 +245,8 @@ def widen_checkpoint(
     )
     narrow = _net(players, old_config, board_seed)
     narrow.load_state_dict(state["net"])
+    # The source's observation contract, which its weights carry (`HexNet`).
+    new_config = replace(new_config, contract=narrow.config.contract)
     wide = _net(players, new_config, board_seed)
     widened = widen_state_dict(
         state["net"], wide.state_dict(), old_config.width, width, noise=noise, seed=seed
@@ -251,7 +254,7 @@ def widen_checkpoint(
     wide.load_state_dict(widened, strict=True)
     narrow.eval()
     wide.eval()
-    report = compare(narrow, wide, _observations(players, observations, seed=1000))
+    report = compare(narrow, wide, _observations(players, observations, seed=1000, contract=new_config.contract))
     report["parameters_before"] = float(sum(p.numel() for p in narrow.parameters()))
     report["parameters_after"] = float(sum(p.numel() for p in wide.parameters()))
 
@@ -290,13 +293,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--noise", type=float, default=0.01,
                         help="Gaussian noise on the copies' incoming weights, as a "
                              "fraction of each row's RMS; 0 is exact and useless to train")
-    parser.add_argument("--seed", type=int, default=0)
+    seeds.add_arguments(parser)
     parser.add_argument("--players", type=int, default=4)
     parser.add_argument("--observations", type=int, default=256,
                         help="real positions the exactness report is computed on")
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args(argv)
+    # The seed policy (a widened net starts a training run): hexset.seeds.
+    seeds.hold(args, args.players, use="rl")
 
     if args.out.exists() and not args.force:
         raise SystemExit(f"{args.out} exists; pass --force to overwrite")

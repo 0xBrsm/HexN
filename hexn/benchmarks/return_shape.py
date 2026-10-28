@@ -91,6 +91,7 @@ from statistics import NormalDist
 
 import numpy as np
 
+from hexset import seeds
 from hexset.victory import WINNING_POINTS
 
 _STANDARD_NORMAL = NormalDist()
@@ -303,8 +304,10 @@ def main(argv: list[str] | None = None) -> int:
         "Gaussian data of the same size on the same lattice, which is the only "
         "baseline a W1 reading can honestly be judged against",
     )
-    parser.add_argument("--null-seed", type=int, default=11)
+    seeds.add_arguments(parser, flag="--null-seed", fallback=11)
     args = parser.parse_args(argv)
+    # The seed policy (its null draws play no game): hexset.seeds.
+    seeds.hold(args, 4, use="analysis", dest="null_seed", fallback=11)
 
     payload = load_dump(args.dump)
     result = analyse(payload, bins=args.bins)

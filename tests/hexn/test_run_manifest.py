@@ -237,3 +237,66 @@ def test_a_contract_9_run_frozen_before_decisions_were_grouped_is_refused(tmp_pa
     _drop(nine, "ppo", "c9_clip")
     with pytest.raises(SystemExit, match="c9_clip"):
         run.load(nine / "unit")
+
+
+@pytest.fixture
+def seed_policy(tmp_path, monkeypatch):
+    """A seed policy installed for one test (the suite runs with none)."""
+    import copy
+
+    from hexset import seeds
+
+    saved = copy.deepcopy(seeds._state)
+    monkeypatch.delenv(seeds.POLICY_ENV, raising=False)
+    path = tmp_path / seeds.FILENAME
+    path.write_text(json.dumps({
+        "eval": {"default": {"2": 2000, "*": 1000}, "screen": [1000, 2000], "confirm": [3000]},
+        "train": {"rl": [0, 1, 11], "bc": [10]},
+    }))
+    yield seeds.register_seed_policy(path)
+    seeds._state.clear()
+    seeds._state.update(saved)
+
+
+def _ppo(tmp_path, *flags, **kwargs):
+    return run.freeze("ppo", "unit", tmp_path / "unit", ["--checkpoint-dir", "runs/unit", *flags],
+                      repo=tmp_path, **kwargs)
+
+
+def test_a_freeze_holds_the_training_seed_to_the_policy(tmp_path, seed_policy):
+    from hexset.seeds import SeedRefused
+
+    assert freeze(tmp_path).meta["seeds"]["train"]["status"] == "train"
+    refused = [*LEAGUE[:-3], "12", *LEAGUE[-2:]]
+    with pytest.raises(SeedRefused, match="rl training seed"):
+        run.freeze("league", "refused", tmp_path / "refused", refused, repo=tmp_path)
+    assert not (tmp_path / "refused").exists()  # refused before anything is written
+    bypassed = freeze(tmp_path, refused, seed_bypass="a probe")
+    assert bypassed.meta["seeds"]["train"]["reason"] == "a probe"
+
+
+def test_a_freeze_fills_the_eval_seed_from_the_policy(tmp_path, seed_policy):
+    manifest = _ppo(tmp_path, "--seed", "1")
+    assert manifest.config["eval_seed"] == 1000
+    assert manifest.meta["seeds"]["eval"]["status"] == "screen"
+    assert _ppo(tmp_path, "--seed", "1", "--players", "2").config["eval_seed"] == 2000
+
+
+def test_a_confirmation_eval_seed_takes_the_plan_as_its_registration(tmp_path, seed_policy):
+    from hexset.seeds import SeedRefused
+
+    with pytest.raises(SeedRefused, match="registration"):
+        _ppo(tmp_path, "--eval-seed", "3000")
+    plan = tmp_path / "plan.md"
+    plan.write_text("evaluations on seed 3000")
+    manifest = _ppo(tmp_path, "--eval-seed", "3000", plan=str(plan))
+    assert manifest.meta["seeds"]["eval"]["status"] == "confirm"
+
+
+def test_a_manifest_frozen_before_eval_seed_keeps_seed_plus_10000(tmp_path):
+    _ppo(tmp_path)
+    path = tmp_path / "unit" / "config" / "ppo.json"
+    config = json.loads(path.read_text())
+    del config["eval_seed"]
+    path.write_text(json.dumps(config))
+    assert run.load(tmp_path / "unit").config["eval_seed"] is None

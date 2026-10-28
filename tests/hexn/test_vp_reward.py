@@ -21,6 +21,7 @@ from hexn.ppo import PPOConfig, advantages, assemble, update  # noqa: E402
 from hexn.ppo import __main__ as ppo_main  # noqa: E402
 from hexn.rewards import win_loss  # noqa: E402
 from hexn.selfplay import Collector  # noqa: E402
+from _kept import kept
 
 C = 0.05
 
@@ -39,7 +40,7 @@ def a_policy(seed: int = 0) -> NetworkPolicy:
 def played():
     policy = a_policy()
     policy.vp_reward = C
-    episodes = Collector(policy, lanes=8, seed=0, action_cap=400, max_offers=0).collect(3)
+    episodes = Collector(policy, lanes=8, seed=0, action_cap=400, max_offers=0, keep=kept()).collect(3)
     return policy, episodes
 
 

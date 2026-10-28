@@ -296,3 +296,111 @@ def test_the_points_head_reads_each_seat_with_the_table_and_is_off_unless_asked(
                                                   "messages": "pooled"}))
     again.load_state_dict(state)
     assert again.points_head is None
+
+
+def _old_chosen_scores(scores, batch):
+    """`chosen_scores` as it read the chosen candidate by boolean masks: the
+    reference the stall-free version is held to."""
+    from hexn.model9 import DecisionKind
+    neg = float("-inf")
+    flat, setup = scores.flat, scores.setup
+    tkind, y = batch["tkind"].long(), batch["y"].long()
+    chosen = flat.new_full((flat.shape[0],), neg)
+    chosen = torch.where(tkind == DecisionKind.FLAT, flat.gather(1, y.clamp(max=flat.shape[1] - 1)[:, None]).squeeze(1),
+                         chosen)
+    chosen = torch.where(tkind == DecisionKind.SETUP, setup.gather(1, y.clamp(max=setup.shape[1] - 1)[:, None]).squeeze(1),
+                         chosen)
+    if scores.rb.numel():
+        taken = (tkind[scores.rb_row] == DecisionKind.ROAD_BUILDING) & (batch["rb_index"] == y[scores.rb_row])
+        chosen = chosen.index_put((scores.rb_row[taken],), scores.rb[taken])
+    if scores.disc.numel():
+        taken = (tkind[scores.disc_row] == DecisionKind.DISCARD) & (batch["disc_index"] == y[scores.disc_row])
+        chosen = chosen.index_put((scores.disc_row[taken],), scores.disc[taken])
+    if len(scores.double_rows):
+        d = scores.double_rows
+        taken = tkind[d] == DecisionKind.DOUBLE
+        picked = scores.double.gather(1, y[d].clamp(max=scores.double.shape[1] - 1)[:, None]).squeeze(1)
+        chosen = chosen.index_put((d[taken],), picked[taken])
+    return chosen
+
+
+def _losses_and_grads(net, layout, batch, scorer=None):
+    """The decision loss's log-probabilities and every parameter's gradient,
+    on one thread: several make the backward's sums run in varying order, so
+    the same code differs from itself in the last bits."""
+    from hexn import model9
+    threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        return _losses_and_grads_one_thread(net, layout, batch, scorer or model9.chosen_scores)
+    finally:
+        torch.set_num_threads(threads)
+
+
+def _losses_and_grads_one_thread(net, layout, batch, scorer):
+    from hexn import model9
+    net.zero_grad(set_to_none=True)
+    out = net(**unpack9(layout, batch["x"]))
+    scores = model9.decision_scores(net, out, batch)
+    chosen = scorer(scores, batch)
+    log_prob = chosen - scores.total
+    (-log_prob[torch.isfinite(log_prob)].mean()).backward()
+    return log_prob.detach(), {n: p.grad.clone() for n, p in net.named_parameters() if p.grad is not None}
+
+
+def test_rows_found_on_the_host_give_the_same_loss_and_gradients(setting):
+    """`host_rows` names exactly the rows `decision_scores` finds itself, so a
+    batch carrying them scores, and trains, identically."""
+    from hexn.model9 import host_rows
+    net, _, layout = setting
+    rows, _ = _positions(count=400, seed=1)
+    batch = _batch(rows)
+    found = host_rows(net, batch)
+    assert len(found["robber_rows"]) and len(found["setup_rows"])
+    plain, grads = _losses_and_grads(net, layout, batch)
+    hosted, grads_hosted = _losses_and_grads(net, layout, {**batch, **found})
+    assert torch.equal(plain, hosted)
+    assert grads.keys() == grads_hosted.keys()
+    for name in grads:
+        assert torch.equal(grads[name], grads_hosted[name]), name
+
+
+def test_the_chosen_candidate_reads_without_masks_as_it_read_with_them(setting):
+    """The stall-free `chosen_scores` gives the boolean-mask version's scores
+    and gradients, Road Building, discard and double-turn rows included."""
+    from hexn import model9
+    from hexn.model9 import DecisionKind
+    net, _, layout = setting
+    rows, _ = _positions(count=400, seed=1)
+    batch = _batch(rows)
+    kinds = batch["tkind"].tolist()
+    assert DecisionKind.DISCARD in kinds or DecisionKind.ROAD_BUILDING in kinds or DecisionKind.DOUBLE in kinds
+    new, grads_new = _losses_and_grads(net, layout, batch)
+    old, grads_old = _losses_and_grads(net, layout, batch, _old_chosen_scores)
+    assert torch.equal(new, old)
+    for name in grads_old:
+        assert torch.equal(grads_new[name], grads_old[name]), name
+    # Every kind, forced: each row's taken candidate moved to every position.
+    torch.manual_seed(3)
+    scores = model9.Scores(flat=torch.randn(6, 5), setup=torch.randn(6, 4), rb=torch.randn(7, requires_grad=True),
+                           rb_row=torch.tensor([0, 0, 1, 1, 1, 4, 4]), disc=torch.randn(5, requires_grad=True),
+                           disc_row=torch.tensor([2, 2, 3, 5, 5]), double_rows=torch.tensor([1, 4, 5]),
+                           double=torch.randn(3, 9, requires_grad=True), total=torch.zeros(6))
+    for case in range(12):
+        tkind = torch.tensor([[DecisionKind.ROAD_BUILDING, DecisionKind.FLAT, DecisionKind.DISCARD, DecisionKind.SETUP,
+                               DecisionKind.DOUBLE, DecisionKind.DISCARD][(i + case) % 6] for i in range(6)])
+        b = {"tkind": tkind, "y": torch.tensor([(case + i) % 4 for i in range(6)]),
+             "rb_index": torch.tensor([0, 1, 0, 1, 2, 0, 1]), "disc_index": torch.tensor([0, 1, 0, 0, 1])}
+        for tensor in (scores.rb, scores.disc, scores.double):
+            tensor.grad = None
+        a = model9.chosen_scores(scores, b)
+        a[torch.isfinite(a)].sum().backward()
+        ga = [t.grad.clone() if t.grad is not None else None for t in (scores.rb, scores.disc, scores.double)]
+        for tensor in (scores.rb, scores.disc, scores.double):
+            tensor.grad = None
+        r = _old_chosen_scores(scores, b)
+        r[torch.isfinite(r)].sum().backward()
+        gr = [t.grad.clone() if t.grad is not None else None for t in (scores.rb, scores.disc, scores.double)]
+        assert torch.equal(a, r), case
+        for x, z in zip(ga, gr):
+            assert (x is None and (z is None or not z.any())) or (z is None and not x.any()) or torch.equal(x, z), case

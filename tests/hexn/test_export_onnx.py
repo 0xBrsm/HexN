@@ -18,6 +18,7 @@ from hexset.board.board import random_base_board  # noqa: E402
 from hexset.encoding import encode, encode_batch, static_graph, to_frame  # noqa: E402
 from hexn.export_onnx import (  # noqa: E402
     _INPUT_NAMES,
+    _input_names,
     _OUTPUT_NAMES,
     RecordEncoder,
     _rotate_slot,
@@ -171,7 +172,7 @@ def test_record_encoder_matches_encode_off_turn_and_with_longest_road_held():
         assert_exact(tuple(g[i] for g in got), obs)
 
 
-def a_checkpoint(path, *, players: int = 4, max_offers: int | None = 3, seed: int = 0):
+def a_checkpoint(path, *, players: int = 4, max_offers: int | None = 3, seed: int = 0, contract: str = "8"):
     """A checkpoint in the shape `hexn.loop.save` writes, tiny enough to
     export quickly. Mirrors `test_netbot.py::a_checkpoint` — kept as its own
     copy rather than a cross-file import, same as that file does for itself.
@@ -181,7 +182,7 @@ def a_checkpoint(path, *, players: int = 4, max_offers: int | None = 3, seed: in
     game = start(board, players, rng)
     graph = static_graph(board.topology)
     torch.manual_seed(seed)
-    net = HexNet(space_for(game), graph, players, ModelConfig(width=16, rounds=1))
+    net = HexNet(space_for(game), graph, players, ModelConfig(width=16, rounds=1, contract=contract))
     torch.save(
         {
             "iteration": 7,
@@ -224,7 +225,7 @@ def test_the_graph_is_shaped_the_way_hexset_feeds_and_reads_it_v2(tmp_path):
     export(str(checkpoint), out, topology=board.topology)
 
     model = onnx.load(str(out))
-    assert [t.name for t in model.graph.input] == list(_INPUT_NAMES)
+    assert [t.name for t in model.graph.input] == list(_input_names("8"))
     assert [t.name for t in model.graph.output] == list(_OUTPUT_NAMES)
 
     bool_inputs = {"action_mask"}
@@ -267,7 +268,7 @@ def test_the_graph_is_shaped_the_way_hexset_feeds_and_reads_it_v2(tmp_path):
             assert prior[row].sum() == pytest.approx(1.0, abs=1e-4)
 
 
-def test_the_exported_metadata_says_contract_8_1_and_matches_the_checkpoints_own_args(tmp_path):
+def test_the_exported_metadata_says_contract_8_and_matches_the_checkpoints_own_args(tmp_path):
     checkpoint = tmp_path / "latest.pt"
     board = a_checkpoint(checkpoint, players=3, max_offers=5)
     out = tmp_path / "latest.onnx"
@@ -276,7 +277,7 @@ def test_the_exported_metadata_says_contract_8_1_and_matches_the_checkpoints_own
 
     session = ort.InferenceSession(str(out), providers=["CPUExecutionProvider"])
     meta = session.get_modelmeta().custom_metadata_map
-    assert meta["contract"] == "8.1"
+    assert meta["contract"] == "8"
     assert meta["players"] == "3"
     assert meta["max_offers"] == "5"
     assert meta["iteration"] == "7"
@@ -322,7 +323,7 @@ def test_a_search_export_declares_itself_in_the_keys_hexset_reads(tmp_path):
     meta = ort.InferenceSession(
         str(out), providers=["CPUExecutionProvider"]
     ).get_modelmeta().custom_metadata_map
-    assert meta["contract"] == "8.1"
+    assert meta["contract"] == "8"
     assert meta["search"] == "mcts"
     assert meta["simulations"] == "256"
     assert meta["wave"] == "32"
@@ -341,7 +342,7 @@ def test_a_gate_plies_export_declares_itself_in_the_keys_hexset_reads(tmp_path):
     meta = ort.InferenceSession(
         str(out), providers=["CPUExecutionProvider"]
     ).get_modelmeta().custom_metadata_map
-    assert meta["contract"] == "8.1"
+    assert meta["contract"] == "8"
     assert meta["gate_plies"] == "8"
     assert "search" not in meta
 
@@ -375,6 +376,20 @@ def test_a_search_budget_without_a_search_is_refused_not_written(tmp_path):
         export(str(checkpoint), tmp_path / "x.onnx", topology=board.topology, simulations=64)
     with pytest.raises(ValueError, match="search must be one of"):
         export(str(checkpoint), tmp_path / "x.onnx", topology=board.topology, search="puct")
+
+
+def test_an_8_1_checkpoint_exports_an_8_1_graph(tmp_path):
+    """A net trained across rule sets declares the table's rules and the next
+    roll's odds, says contract 8.1, and passes the export's own parity check
+    against `encode(..., contract="8.1")`."""
+    checkpoint = tmp_path / "rules.pt"
+    board = a_checkpoint(checkpoint, contract="8.1")
+    out = tmp_path / "rules.onnx"
+    export(str(checkpoint), out, topology=board.topology)
+    model = onnx.load(str(out))
+    assert [t.name for t in model.graph.input] == list(_input_names("8.1")) == list(_INPUT_NAMES)
+    meta = ort.InferenceSession(str(out), providers=["CPUExecutionProvider"]).get_modelmeta().custom_metadata_map
+    assert meta["contract"] == "8.1"
 
 
 def test_input_names_are_the_record_fields_the_graph_reads_in_record_order():

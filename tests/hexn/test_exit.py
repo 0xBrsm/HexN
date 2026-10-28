@@ -31,6 +31,7 @@ from hexn.netbot import LeafEvaluator  # noqa: E402
 from hexn.policy import NetworkPolicy  # noqa: E402
 from hexn.rewards import win_loss  # noqa: E402
 from hexn.selfplay import Collector  # noqa: E402
+from _kept import kept
 
 
 def a_setup(players: int = 4, seed: int = 0):
@@ -64,7 +65,8 @@ def searched_episodes(policy, space, games: int = 2, seed: int = 0):
     )
     expert = SearchPolicy(search, rng=random.Random(seed))
     episodes = Collector(
-        expert, lanes=2, seed=seed, action_cap=400, max_offers=0
+        expert, lanes=2, seed=seed, action_cap=400, max_offers=0,
+        keep=kept(),
     ).collect(games)
     return [decided(e) for e in episodes]
 
@@ -162,7 +164,8 @@ def test_a_batch_refuses_transitions_that_carry_no_search_target(corpus):
     # The plain policy path, a few dozen actions: all it has to supply is a
     # transition with no `Target` on it.
     episodes = Collector(
-        policy, lanes=1, seed=0, action_cap=40, max_offers=0
+        policy, lanes=1, seed=0, action_cap=40, max_offers=0,
+        keep=kept(),
     ).collect(1)
     with pytest.raises(ValueError, match="search targets"):
         assemble(episodes, space, layout, DistillConfig())
@@ -292,6 +295,7 @@ def test_a_searched_worker_roots_on_the_movers_belief_in_k_worlds():
         stride=1, width=8, rounds=1, torch_seed=1000, simulations=4, wave=2, k=3,
     )
     _, collector = _build(spec)
+    collector.sink = kept().keep  # a worker's command names its partial
     acting = collector.policy
     assert isinstance(acting, SearchPolicy)
     assert acting.search.k == 3

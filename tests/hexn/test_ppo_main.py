@@ -12,6 +12,7 @@ torch = pytest.importorskip("torch", reason="PyTorch runs on the training box on
 from hexn import loop  # noqa: E402
 from hexn.collect import parse_mix  # noqa: E402
 from hexn.ppo import __main__ as ppo_main  # noqa: E402
+from _kept import fresh
 
 
 TINY = [
@@ -69,13 +70,15 @@ def run(directory, iterations, extra=()):
     return ppo_main.main([str(directory)])
 
 
-def test_numbered_checkpoints_are_kept_alongside_the_one_that_gets_overwritten(
+def test_every_iterations_checkpoint_is_kept_alongside_the_one_that_gets_overwritten(
     tmp_path,
 ):
+    """Whatever `--keep-every` says: each is the behaviour policy of the next
+    iteration's games."""
     assert run(tmp_path, 4, ["--checkpoint-every", "1", "--keep-every", "2"]) == 0
 
     kept = sorted(p.name for p in tmp_path.glob("iter-*.pt"))
-    assert kept == ["iter-00002.pt", "iter-00004.pt"]
+    assert kept == ["iter-00001.pt", "iter-00002.pt", "iter-00003.pt", "iter-00004.pt"]
     assert (tmp_path / "latest.pt").exists()
     # The point of keeping them is that they differ; identical copies of the
     # final weights would answer nothing about when training stopped helping.
@@ -378,7 +381,8 @@ def test_an_antithetic_self_duel_is_exactly_zero():
     """
     stub = Streamless()
     result = loop.versus(
-        stub, stub, games=8, lanes=4, players=4, seed=21, max_offers=3
+        stub, stub, games=8, lanes=4, players=4, seed=21, max_offers=3,
+        journal=fresh(),
     )
 
     assert result["antithetic"] and result["boards"] == 4 and result["games"] == 8
@@ -414,6 +418,7 @@ def test_versus_is_the_engines_own_verdict_and_nothing_added():
         players=4,
         seed=17,
         max_offers=1,
+        journal=fresh(),
     )
     theirs = compete_batched(
         {
@@ -428,6 +433,7 @@ def test_versus_is_the_engines_own_verdict_and_nothing_added():
         action_cap=4000,
         antithetic=True,
         learner=0,
+        journal=fresh(),
     ).metrics()
 
     assert {"wins", "boards", "paired_vp"} <= set(mine)
@@ -495,6 +501,7 @@ def test_the_same_self_duel_reads_off_zero_without_the_pairing():
     result = loop.versus(
         stub, stub, games=8, lanes=4, players=4, seed=21, max_offers=3,
         antithetic=False,
+        journal=fresh(),
     )
 
     # The verdict stamps the key either way now (`Verdict.metrics`), which is
@@ -796,13 +803,15 @@ def test_a_run_killed_mid_update_resumes_from_its_last_step_to_the_uninterrupted
         assert rows[1][name] == reference_rows[1][name], name
 
 
-def test_the_recent_ring_keeps_the_last_n_whatever_keep_every_keeps(tmp_path):
+def test_the_recent_ring_keeps_the_last_n_beside_every_numbered_checkpoint(tmp_path):
     assert run(tmp_path, 4, ["--keep-every", "0", "--keep-recent", "2"]) == 0
     assert sorted(p.name for p in tmp_path.glob("recent-*.pt")) == [
         "recent-00003.pt",
         "recent-00004.pt",
     ]
-    assert not list(tmp_path.glob("iter-*.pt"))
+    assert sorted(p.name for p in tmp_path.glob("iter-*.pt")) == [
+        f"iter-{i:05d}.pt" for i in range(1, 5)
+    ]
 
 
 def test_a_run_killed_in_its_first_update_resumes_from_its_last_step_not_its_init(

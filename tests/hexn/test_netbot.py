@@ -208,7 +208,7 @@ def test_a_seated_network_answers_a_gate(checkpoint):
     assert off.accepts(view, received, counterparty) is False
 
 
-def test_a_network_entrant_can_play_a_whole_tournament(checkpoint):
+def test_a_network_entrant_can_play_a_whole_tournament(checkpoint, tmp_path):
     path, board = checkpoint
     # Short, and one of the two network seats trade-free: the claim is that
     # the arena can seat and score the kind through a full rotation, not
@@ -221,7 +221,8 @@ def test_a_network_entrant_can_play_a_whole_tournament(checkpoint):
     ]
     # Untrained networks and random seats: HexSet's cap for unstructured play,
     # since a game past the default cap aborts the run rather than counting.
-    result = compete(lineup, 4, seed=1, action_cap=150, turn_cap=UNSTRUCTURED_TURN_CAP)
+    result = compete(lineup, 4, seed=1, action_cap=150, turn_cap=UNSTRUCTURED_TURN_CAP,
+                     journal=tmp_path / "run.games.jsonl")
     assert result.games == 4
     assert sum(s.wins for s in result.standings) + result.unfinished == 4
 

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-only
 """Rebuild a stored episode's live `Game` at any ply, from its own record.
 
-`hexn.selfplay.Collector` deals every game with `records=True`, so an
+`hexn.selfplay.Collector` records every game it deals, so an
 `Episode` already carries the exact `hexset.record.Record` of the game it
 played -- every seat's actions, the chance stream and the trades the table
 actually cleared. `hexset.record.replay_to` is the one path that walks a
@@ -54,6 +54,6 @@ def replay_to_ply(episode: Episode, ply: int) -> Game:
     if episode.record is None:
         raise ValueError(
             f"episode {episode.index} carries no record; collect it with "
-            "Collector(..., records=True) -- the default -- to replay it"
+            "a Collector, which records every game, to replay it"
         )
     return replay_to(episode.record, ply)

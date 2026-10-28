@@ -59,12 +59,14 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 
+from hexset import seeds
 from hexset.bench.throughput import environment
 from hexset.board.board import random_base_board
 from hexset.game import imagine
 from hexn import durable
 from hexn.rewards import reward
 from hexn.selfplay import Collector, Episode
+from . import add_games_dir, games_kept
 
 # Torch is imported inside `main`, so the sampling and branching machinery —
 # everything with arithmetic worth getting wrong — stays testable without it.
@@ -173,9 +175,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--rollouts", type=int, default=64)
     parser.add_argument("--players", type=int, default=4)
     parser.add_argument("--action-cap", type=int, default=4000)
-    parser.add_argument("--seed", type=int, default=0)
+    seeds.add_arguments(parser)
     parser.add_argument("--bins", type=int, default=4)
     parser.add_argument("--json", action="store_true")
+    add_games_dir(parser)
     parser.add_argument(
         "--dump-returns",
         default=None,
@@ -192,6 +195,8 @@ def main(argv: list[str] | None = None) -> int:
         "the one a rerun resumes from; named from the settings when omitted",
     )
     args = parser.parse_args(argv)
+    # The seed policy (its games are evaluation games, never training ones): hexset.seeds.
+    seeds.hold(args, args.players, use="eval")
 
     import torch
 
@@ -220,6 +225,7 @@ def main(argv: list[str] | None = None) -> int:
         max_offers=loaded.max_offers,
         deal=args.seed_games,
         board=board,
+        keep=games_kept(args.games_dir, "floor", "seeding"),
     )
     kept = collect(seeding.drain())
     if len(kept) < args.positions:

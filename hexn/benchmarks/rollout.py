@@ -29,7 +29,9 @@ from typing import Sequence
 
 from hexn.selfplay import Choice, Collector, RandomPolicy, Request
 
+from hexset import seeds
 from hexset.bench.throughput import environment
+from . import add_games_dir, games_kept
 
 
 @dataclass
@@ -61,9 +63,10 @@ class _Timed:
         return out
 
 
-def run(*, lanes: int, players: int, ticks: int, seed: int, warmup: int) -> Result:
+def run(*, lanes: int, players: int, ticks: int, seed: int, warmup: int, keep) -> Result:
+    """Every game played, warm-up included, is kept in `keep`."""
     policy = _Timed(RandomPolicy(random.Random(seed)))
-    collector = Collector(policy, lanes=lanes, players=players, seed=seed)
+    collector = Collector(policy, lanes=lanes, players=players, seed=seed, keep=keep)
     collector.run(warmup)
 
     policy.seconds = 0.0
@@ -100,9 +103,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--players", type=int, default=4)
     parser.add_argument("--ticks", type=int, default=200)
     parser.add_argument("--warmup", type=int, default=20)
-    parser.add_argument("--seed", type=int, default=0)
+    seeds.add_arguments(parser)
     parser.add_argument("--json", action="store_true")
+    add_games_dir(parser)
     args = parser.parse_args(argv)
+    # The seed policy (it plays games the way training does): hexset.seeds.
+    seeds.hold(args, args.players, use="rl")
 
     results = [
         run(
@@ -111,6 +117,7 @@ def main(argv: list[str] | None = None) -> int:
             ticks=args.ticks,
             seed=args.seed,
             warmup=args.warmup,
+            keep=games_kept(args.games_dir, "rollout", f"lanes-{lanes}"),
         )
         for lanes in args.lanes
     ]

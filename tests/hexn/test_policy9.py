@@ -16,10 +16,12 @@ from hexset import contract9, decisions as D  # noqa: E402
 from hexset.actions import space_for  # noqa: E402
 from hexset.arena import deal_game  # noqa: E402
 from hexset.game import UNSTRUCTURED_TURN_CAP  # noqa: E402
-from hexn.model9 import HexNet, ModelConfig, collate, decision_entropy, decision_scores, unpack9  # noqa: E402
+from hexn.collect import WorkerSpec, _build  # noqa: E402
+from hexn.model9 import HexNet, ModelConfig, chosen_scores, collate, decision_entropy, decision_scores, unpack9  # noqa: E402
 from hexn.policy9 import NetworkPolicy9  # noqa: E402
 from hexn.ppo import Batch, attach_proximal, decision_rows  # noqa: E402
 from hexn.selfplay import Collector, Request  # noqa: E402
+from _kept import kept
 
 CONFIG = ModelConfig(width=16, rounds=2, messages="pooled", attention=False, points=True)
 
@@ -122,7 +124,7 @@ def policy(seed: int = 0, scale: float = 1.0) -> NetworkPolicy9:
 def collector(pol, lanes: int, games: int, first_game: int = 0, stride: int = 1, order: str = "random"):
     return Collector(pol, lanes=lanes, deal=games, first_game=first_game, stride=stride, contract="9",
                      sample_stream="game", discard_order=order, action_cap=600, turn_cap=UNSTRUCTURED_TURN_CAP,
-                     seed=7)
+                     seed=7, keep=kept())
 
 
 @pytest.fixture(scope="module")
@@ -254,8 +256,10 @@ def test_a_keyed_draw_follows_the_decisions_distribution():
     assert [c.decision for c in again] == [c.decision for c in choices[:20]]
 
 
-def test_a_game_is_the_same_whatever_the_lanes_and_shards():
+@pytest.mark.parametrize("precision", ["fp32", "bf16"])
+def test_a_game_is_the_same_whatever_the_lanes_and_shards(precision):
     pol = policy(scale=0.05)
+    pol.precision = precision
     alone = {e.index: e.record for e in collector(pol, lanes=1, games=3).drain()}
     sharded = {}
     for worker in range(2):
@@ -281,7 +285,7 @@ def test_greedy_takes_the_best_scored_decision(played):
 def test_a_contract_9_collector_seats_only_bots_beside_its_learner():
     pol = policy()
     with pytest.raises(ValueError, match="scripted bots"):
-        Collector(pol, contract="9", opponents=[pol], caster=lambda i: (0, 1, 0, 1))
+        Collector(pol, contract="9", opponents=[pol], caster=lambda i: (0, 1, 0, 1), keep=kept())
 
 
 def test_fp16_autocast_moves_the_log_prob_only_by_its_rounding(played):
@@ -379,3 +383,81 @@ def test_the_forward_without_grad_is_the_forward_with_it_bit_for_bit(played, fus
         pol.net.fused = was
     for name in ("logits", "road", "value", "value_logits", "points", "seats", "vertices", "hexes", "table"):
         assert torch.equal(getattr(fast, name), getattr(slow, name).detach()), name
+
+
+def real_requests(pol, ticks: int = 60, lanes: int = 4):
+    """Positions from real contract-9 games: a collector ticked forward, its
+    (keyed) requests gathered every few ticks."""
+    col = collector(pol, lanes=lanes, games=lanes)
+    out = []
+    for tick in range(ticks):
+        if tick % 4 == 0:
+            out.extend(col.requests())
+        col.tick()
+    return [r for r in out if not r.decision.double]
+
+
+def _scores_under(pol, requests, dtype):
+    x = torch.from_numpy(np.stack([r.observation for r in requests]))
+    stated = collate([r.decision for r in requests])
+    del stated["double"]
+    batch = {k: torch.from_numpy(v) for k, v in stated.items()}
+    with torch.inference_mode(), torch.autocast("cpu", dtype=dtype, enabled=dtype is not None):
+        out = pol.net(**unpack9(pol.layout, x))
+        scores = decision_scores(pol.net, out, batch)
+    return scores, batch
+
+
+def test_a_bf16_policy_records_the_fp32_log_softmax_of_its_own_scores():
+    """`precision="bf16"`: the forward and the on-demand heads run in bf16, the
+    scores come back in fp32, and the recorded log-probability is the fp32
+    log-softmax of *those* scores (the behaviour policy, exactly), as a
+    contract-8 worker's (`test_collect_precision`)."""
+    pol = policy(scale=0.05)
+    requests = real_requests(pol)
+    assert len(requests) >= 40 and all(r.draw is not None for r in requests)
+    pol.precision = "bf16"
+    choices = pol.act(requests)
+    scores, batch = _scores_under(pol, requests, torch.bfloat16)
+    assert scores.flat.dtype == torch.float32 and scores.total.dtype == torch.float32
+    kinds, indices = pol._draw(scores, batch, [r.draw for r in requests])
+    batch["tkind"] = torch.from_numpy(kinds)
+    batch["y"] = torch.from_numpy(indices)
+    expected = (chosen_scores(scores, batch) - scores.total).numpy()
+    np.testing.assert_allclose([c.log_prob for c in choices], expected, rtol=0, atol=1e-6)
+    assert all(np.isfinite(c.log_prob) and c.log_prob <= 1e-6 for c in choices)
+    # Not vacuous: bf16's scores are not fp32's.
+    fp32, _ = _scores_under(pol, requests, None)
+    assert not torch.allclose(fp32.total, scores.total, rtol=0, atol=1e-6)
+
+
+def test_bf16_moves_the_log_prob_only_by_its_rounding():
+    """fp32 and bf16 on the same positions and draws: the gap decoupled PPO's
+    behaviour weight absorbs, next to the one an iteration of async staleness
+    already puts through it."""
+    pol = policy(scale=0.05)
+    requests = real_requests(pol)
+    pol.precision = "fp32"
+    reference = pol.act(requests)
+    pol.precision = "bf16"
+    half = pol.act(requests)
+    gap = np.abs(np.array([c.log_prob for c in half]) - np.array([c.log_prob for c in reference]))
+    same = np.mean([a.action == b.action for a, b in zip(half, reference)])
+    print(f"bf16 log-prob gap: max {gap.max():.2e}, mean {gap.mean():.2e}; same choice {same:.3f}")
+    assert float(gap.max()) < 0.1
+    assert same > 0.9
+
+
+def test_a_contract_9_worker_builds_its_policy_at_the_specs_precision():
+    def spec(**overrides):
+        base = dict(seed=5, players=4, lanes=2, action_cap=200, max_offers=0, first_game=0, stride=1, width=16,
+                    rounds=2, torch_seed=11, mix=(), parent="", sample_stream="game", contract="9",
+                    net9=(("messages", "pooled"), ("attention", False), ("points", True)))
+        base.update(overrides)
+        return WorkerSpec(**base)
+    policies, _ = _build(spec(precision="bf16"))
+    assert isinstance(policies[0], NetworkPolicy9) and policies[0].precision == "bf16"
+    policies, _ = _build(spec())
+    assert policies[0].precision == "fp32"
+    with pytest.raises(ValueError, match="precision"):
+        _build(spec(precision="fp8"))

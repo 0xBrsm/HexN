@@ -46,6 +46,7 @@ from pathlib import Path
 
 import torch
 
+from hexset import seeds
 from hexset.actions import space_for
 from hexset.board.board import random_base_board
 from hexn.collect import ParallelCollector, WorkerSpec, check_mix, parse_mix
@@ -54,6 +55,7 @@ from hexset.game import start
 from hexn.model import HexNet, ModelConfig, config_from_args, packing
 from hexn.policy import NetworkPolicy
 from hexn.ppo import PPOConfig, _minibatches, assemble, minibatch_terms
+from . import add_games_dir, games_kept
 
 
 # `torch.OutOfMemoryError` is only an alias from 2.5; fall back to the message.
@@ -148,7 +150,7 @@ def main(argv: list[str] | None = None) -> int:
         help="the network's own offer budget a turn (hexn.trade): 0 for the no-trade network, omitted for HexSet's default (unlimited); -1 also reads as unlimited. Opponents bargain as their own bots do",
     )
     p.add_argument("--action-cap", type=int, default=4000)
-    p.add_argument("--seed", type=int, default=0)
+    seeds.add_arguments(p)
     p.add_argument("--device", default="cuda")
     p.add_argument("--threads", type=int, default=8)
     p.add_argument("--epochs", type=int, default=4)
@@ -163,7 +165,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("--reference", default="4096:3e-4", help="the arm every other matches")
     p.add_argument("--json", default="minibatch_iso_kl.json")
+    add_games_dir(p)
     args = p.parse_args(argv)
+    # The seed policy (it plays games the way training does): hexset.seeds.
+    seeds.hold(args, args.players, use="rl")
 
     torch.set_num_threads(args.threads)
     state = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
@@ -207,7 +212,7 @@ def main(argv: list[str] | None = None) -> int:
           f"workers (mix {args.mix or 'none'})...", flush=True)
     began = time.perf_counter()
     collector.sync(policy.net)
-    episodes = collector.collect(args.games)
+    episodes = collector.collect(args.games, partial=games_kept(args.games_dir, "minibatch_iso_kl"))
     collect_seconds = time.perf_counter() - began
     collector.close()
 

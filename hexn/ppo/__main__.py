@@ -153,6 +153,12 @@ def build_parser() -> argparse.ArgumentParser:
     # the runtime registering it is loaded (`hexn.runtime`).
     runtime.add_argument(parser)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--eval-seed", type=int, default=None,
+        help="the seed every evaluation plays, the same for every replicate so their "
+        "evaluations are paired (hexn.run.init fills it from the seed policy); "
+        "unset, --seed + 10000",
+    )
     parser.add_argument("--width", type=int, default=64)
     parser.add_argument("--rounds", type=int, default=2)
     add_head_flags(parser)
@@ -318,7 +324,7 @@ def build_parser() -> argparse.ArgumentParser:
     # after the fact, when the policy stopped improving -- a question that is
     # unanswerable if only `latest.pt` is kept, since the earlier weights are
     # already gone by the time you would want them.
-    parser.add_argument("--keep-every", type=int, default=25, help="0 disables")
+    parser.add_argument("--keep-every", type=int, default=25, help="ignored: every iteration's checkpoint is kept (iter-XXXXX.pt), so each game's behaviour policy is; the key stays so frozen configs load")
     parser.add_argument(
         "--keep-recent",
         type=int,
@@ -605,7 +611,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             ("--eval-every", args.eval_every), ("--eval-at-start", args.eval_at_start), ("--parent", args.parent),
             ("--rival", args.rival), ("--lag-rung", args.lag_rung), ("--search-rung", args.search_rung),
             ("--update-workers", args.update_workers > 1), ("--trader", getattr(args, "trader", None)),
-            ("--collect-precision bf16", args.collect_precision != "fp32"),
         ) if on]
         if unbuilt:
             parser.error(f"not built for --contract 9: {', '.join(unbuilt)}")
@@ -765,20 +770,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         # file records whatever its own trainer did. A comparison against the
         # starting point is then between two files that bargain alike, and the
         # lag rung's iteration 0 is an ordinary kept checkpoint.
-        if args.keep_every:
-            save(
-                directory / "iter-00000.pt",
-                {
-                    "iteration": 0,
-                    "games_started": 0,
-                    "net": policy.net.state_dict(),
-                    "optimiser": optimiser.state_dict(),
-                    "torch_rng": torch.get_rng_state(),
-                    "args": vars(args),
-                    "config": asdict(config),
-                    **model_record(policy),
-                },
-            )
+        # Every checkpoint is kept, iteration 0 among them.
+        save(
+            directory / "iter-00000.pt",
+            {
+                "iteration": 0,
+                "games_started": 0,
+                "net": policy.net.state_dict(),
+                "optimiser": optimiser.state_dict(),
+                "torch_rng": torch.get_rng_state(),
+                "args": vars(args),
+                "config": asdict(config),
+                **model_record(policy),
+            },
+        )
     elif args.resume:
         state = torch.load(latest, map_location=args.device, weights_only=False)
         policy.net.load_state_dict(state["net"])
@@ -877,6 +882,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     cohort=args.collect_mode == "cohort",
                     sample_stream=args.sample_stream,
                     outlook=config.aux_target == "outlook",
+                    marks=config.aux_target == "zero_sum" and bool(mix),
                     trunk=args.collect_trunk,
                     precision=args.collect_precision,
                     contract=str(getattr(args, "contract", "8")),
@@ -926,6 +932,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             coalition=mix_coalitions(mix, args.players, args.seed) if mix else None,
             sample_stream=args.sample_stream,
             outlook=config.aux_target == "outlook",
+            marks=config.aux_target == "zero_sum" and bool(mix),
             contract=config.contract,
             discard_order=getattr(args, "discard_order", "seat"),
             board_mode=getattr(args, "board_mode", "random"),
@@ -969,7 +976,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         # A resumed run's first ladder reading doubles as a regression control:
         # against its own parent the starting weights must duel to a dead heat,
         # so a first reading away from 50% flags the harness, not the policy.
-        baseline = ladder(policy, rungs, args)
+        baseline = ladder(policy, rungs, args, f"start-{start_iteration:05d}")
         line = durable.append_line(
             log, {"iteration": start_iteration - 1, "ladder": baseline}
         )
@@ -1255,10 +1262,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.keep_recent:
                 save(directory / f"recent-{iteration + 1:05d}.pt", state)
                 prune_recent(directory, args.keep_recent)
-            if args.keep_every and (iteration + 1) % args.keep_every == 0:
-                save(directory / f"iter-{iteration + 1:05d}.pt", state)
-            # Only now is this iteration's collection held elsewhere. A
-            # prefetched next one stays: it is the next iteration's.
+            # Every iteration's checkpoint is kept: it is the behaviour policy
+            # of the next iteration's games.
+            save(directory / f"iter-{iteration + 1:05d}.pt", state)
+            # Only now is this iteration's collection held elsewhere, its games
+            # archived (`durable.prune`). A prefetched next one stays: it is
+            # the next iteration's.
             durable.prune(collecting, iteration)
 
         if args.eval_every and (iteration + 1) % args.eval_every == 0:
@@ -1286,7 +1295,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     evaluation["lag_checkpoint_missing"] = iteration + 1 - args.lag_rung
                 else:
                     eval_rungs["lag"] = lagged
-            evaluation["ladder"] = ladder(policy, eval_rungs, args)
+            evaluation["ladder"] = ladder(policy, eval_rungs, args, f"iter-{iteration + 1:05d}")
             print(durable.append_line(log, evaluation), flush=True)
 
         # Nothing of this iteration is read past here. What is left of the

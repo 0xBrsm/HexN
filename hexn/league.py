@@ -230,7 +230,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint-dir", required=True)
     parser.add_argument("--checkpoint-every", type=int, default=1)
     parser.add_argument("--keep-recent", type=int, default=5)
-    parser.add_argument("--keep-every", type=int, default=25)
+    parser.add_argument("--keep-every", type=int, default=25, help="ignored: every iteration's checkpoint is kept (iter-XXXXX.pt), so each game's behaviour policy is; the key stays so frozen configs load")
     parser.add_argument(
         "--dump-blowout-batch", action=argparse.BooleanOptionalAction, default=True
     )
@@ -565,8 +565,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if args.keep_recent:
                     save(seat_dir / f"recent-{iteration + 1:05d}.pt", payload)
                     prune_recent(seat_dir, args.keep_recent)
-                if args.keep_every and (iteration + 1) % args.keep_every == 0:
-                    save(seat_dir / f"iter-{iteration + 1:05d}.pt", payload)
+                # Every iteration's checkpoint is kept (`hexn.ppo`'s reason).
+                save(seat_dir / f"iter-{iteration + 1:05d}.pt", payload)
             durable.prune(collecting, iteration)
 
         # Nothing of this iteration is read past here: without this the next

@@ -22,6 +22,7 @@ from hexn.selfplay import (
     Request,
     Transition,
 )
+from _kept import kept
 
 
 def replay(episode: Episode) -> Iterator[tuple[Game, Transition]]:
@@ -53,7 +54,7 @@ class First:
 
 
 def test_seats_are_demultiplexed_against_a_replay():
-    collector = Collector(RandomPolicy(random.Random(3)), lanes=1, seed=11)
+    collector = Collector(RandomPolicy(random.Random(3)), lanes=1, seed=11, keep=kept())
     episode = collector.collect(1)[0]
     stream = episode.stream()
 
@@ -83,7 +84,7 @@ def test_seats_are_demultiplexed_against_a_replay():
 
 
 def test_the_mask_marks_exactly_the_legal_actions():
-    collector = Collector(RandomPolicy(random.Random(8)), lanes=1, seed=4, action_cap=150)
+    collector = Collector(RandomPolicy(random.Random(8)), lanes=1, seed=4, action_cap=150, keep=kept())
     episode = collector.collect(1)[0]
     space = space_for(deal_game(episode.seed, episode.index, episode.players))
 
@@ -101,7 +102,7 @@ def test_the_mask_marks_exactly_the_legal_actions():
 
 def test_a_finished_lane_is_replaced_without_stalling_the_others():
     ticks = 1500
-    collector = Collector(RandomPolicy(random.Random(2)), lanes=3, seed=13)
+    collector = Collector(RandomPolicy(random.Random(2)), lanes=3, seed=13, keep=kept())
     episodes = collector.run(ticks)
 
     assert collector.games == len(episodes) > 0
@@ -115,7 +116,7 @@ def test_a_finished_lane_is_replaced_without_stalling_the_others():
 
 
 def test_the_action_cap_truncates_rather_than_running_forever():
-    collector = Collector(RandomPolicy(random.Random(4)), lanes=2, seed=9, action_cap=25)
+    collector = Collector(RandomPolicy(random.Random(4)), lanes=2, seed=9, action_cap=25, keep=kept())
     episodes = collector.run(75)
 
     assert len(episodes) == 6
@@ -126,7 +127,7 @@ def test_the_action_cap_truncates_rather_than_running_forever():
 
 
 def test_the_policys_extras_are_recorded_against_the_seat_that_acted():
-    collector = Collector(First(), lanes=2, seed=17, action_cap=200)
+    collector = Collector(First(), lanes=2, seed=17, action_cap=200, keep=kept())
     episodes = collector.run(200)
 
     assert episodes
@@ -153,7 +154,7 @@ def test_the_same_seed_collects_the_same_games_at_any_lane_count():
     """
 
     def once(lanes: int) -> list[tuple]:
-        collector = Collector(First(), lanes=lanes, seed=19, deal=4, action_cap=300)
+        collector = Collector(First(), lanes=lanes, seed=19, deal=4, action_cap=300, keep=kept())
         return sorted(
             (e.index, e.outcome, tuple(t.index for t in e.stream()))
             for e in collector.drain()
@@ -169,7 +170,8 @@ def test_a_collector_game_is_the_arenas_game_for_the_same_index():
     `hexset.arena.deal_game` rather than mirroring each other's derivation.
     """
     from hexset.actions import legal_actions
-    from hexset.arena import play_game
+    from hexset.arena import run_seated, seat_bots
+    from hexset.record import Tape
     from hexset.victory import victory_points
 
     class Scripted:
@@ -194,11 +196,14 @@ def test_a_collector_game_is_the_arenas_game_for_the_same_index():
         action_cap=1500,
         opponents=[BoardBots(lambda board: lane_bot)],
         caster=lambda index: (1, 1, 1, 1),
+        keep=kept(),
     )
     (played,) = collector.drain()
 
     alone = Scripted()
-    game = play_game(deal_game(31, 7, 4), [alone] * 4, action_cap=1500)
+    game = deal_game(31, 7, 4)
+    seat_bots(game, [alone] * 4)
+    run_seated(game, [alone] * 4, 1500, tape=Tape())
 
     assert lane_bot.taken == alone.taken
     assert played.index == 7
@@ -220,7 +225,8 @@ def test_a_bounded_collector_deals_exactly_the_cohort_and_stops():
     plays every one of them in full first. `deal` stops them being started.
     """
     collector = Collector(
-        RandomPolicy(random.Random(3)), lanes=4, seed=5, deal=6, action_cap=200
+        RandomPolicy(random.Random(3)), lanes=4, seed=5, deal=6, action_cap=200,
+        keep=kept(),
     )
     episodes = collector.drain()
 
@@ -239,7 +245,7 @@ def test_a_collector_seats_its_policies_as_the_tables_gates():
     already carries `gains_many` -- and a policy with no `trader` hook seats
     `None`, which the engine reads as "this seat never trades".
     """
-    collector = Collector(RandomPolicy(random.Random(12)), lanes=2, seed=6)
+    collector = Collector(RandomPolicy(random.Random(12)), lanes=2, seed=6, keep=kept())
     for game in collector.in_flight():
         assert game.gates == (None,) * 4
         # The table caps nothing (HexSet 0.60): every seat declares its own
@@ -248,7 +254,8 @@ def test_a_collector_seats_its_policies_as_the_tables_gates():
 
     # The collector keeps the budget for its own network's gate (`trader`).
     switched_off = Collector(
-        RandomPolicy(random.Random(12)), lanes=2, seed=6, max_offers=0
+        RandomPolicy(random.Random(12)), lanes=2, seed=6, max_offers=0,
+        keep=kept(),
     )
     assert (collector.max_offers, switched_off.max_offers) == (None, 0)
 
@@ -264,7 +271,7 @@ def test_a_collector_hands_its_trader_to_every_network_gate():
             asked.append((seat, max_offers, trader))
             return None
 
-    collector = Collector(Hooked(random.Random(12)), lanes=1, seed=6, trader="rehex")
+    collector = Collector(Hooked(random.Random(12)), lanes=1, seed=6, trader="rehex", keep=kept())
     next(collector.in_flight())
     assert asked and all(entry[1:] == (None, "rehex") for entry in asked)
 
@@ -293,6 +300,7 @@ def test_a_scripted_opponent_is_seated_as_its_own_trader():
         seed=7,
         opponents=[bots],
         caster=lambda index: (0, 1, 0, 1),
+        keep=kept(),
     )
     game = next(collector.in_flight())
     assert game.gates[0] is None
@@ -315,6 +323,7 @@ def test_the_cast_is_taken_from_the_game_index_not_the_lane():
         action_cap=200,
         opponents=[RandomPolicy(random.Random(3))],
         caster=swaps,
+        keep=kept(),
     )
     episodes = collector.collect(4)
     assert {e.index % 2 for e in episodes} == {0, 1}, "both parities must appear"
@@ -335,6 +344,7 @@ def test_a_strided_cohort_collector_keeps_its_shard_across_cohorts():
         first_game=1,
         stride=3,
         action_cap=200,
+        keep=kept(),
     )
     assert {e.index for e in collector.cohort(3)} == {1, 4, 7}
     assert {e.index for e in collector.cohort(3)} == {10, 13, 16}
@@ -357,6 +367,7 @@ def test_two_learners_share_a_table_and_each_records_only_its_seats():
         opponents=(RandomPolicy(random.Random(99)),),
         caster=lambda index: (0, 1, 0, 1) if index % 2 == 0 else (1, 0, 1, 0),
         learners=(0, 1),
+        keep=kept(),
     )
     episodes = collector.collect(4)
 
@@ -391,6 +402,7 @@ def test_a_board_pair_shares_its_geometry_and_not_its_dice():
         pair_boards=True,
         deal=4,
         action_cap=200,
+        keep=kept(),
     )
     # public field
     boards = [game.state(0, hidden=False).board for game in collector.in_flight()]

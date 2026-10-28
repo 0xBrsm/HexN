@@ -159,6 +159,7 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 
+from hexset import seeds
 from hexset.bench.throughput import environment
 from hexset.actions import ActionType, legal_actions
 from hexset.board.board import random_base_board
@@ -168,6 +169,7 @@ from hexn.rewards import relative_points, reward
 from hexn.selfplay import Collector, Episode
 from hexset.victory import victory_points
 from hexn import durable
+from . import add_games_dir, games_kept
 
 DRAWS = 8
 """Draws per chance child. See "Averaging a chance child" in the docstring."""
@@ -670,7 +672,7 @@ def main(argv: list[str] | None = None) -> int:
                              "ordering question is the same on a sample of them")
     parser.add_argument("--players", type=int, default=4)
     parser.add_argument("--action-cap", type=int, default=4000)
-    parser.add_argument("--seed", type=int, default=0)
+    seeds.add_arguments(parser)
     parser.add_argument("--fork-rate", type=float, default=0.02)
     parser.add_argument(
         "--chance-draws",
@@ -701,6 +703,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--json", default="")
+    add_games_dir(parser)
     parser.add_argument(
         "--rows",
         default="",
@@ -708,6 +711,8 @@ def main(argv: list[str] | None = None) -> int:
         "the one a rerun resumes from; named from the settings when omitted",
     )
     args = parser.parse_args(argv)
+    # The seed policy (its games are evaluation games, never training ones): hexset.seeds.
+    seeds.hold(args, args.players, use="eval")
 
     import torch
 
@@ -755,6 +760,7 @@ def main(argv: list[str] | None = None) -> int:
         max_offers=loaded.max_offers,
         deal=args.seed_games,
         board=board,
+        keep=games_kept(args.games_dir, "rank", "seeding"),
     )
     forks = kept(seeding.drain())
     if len(forks) < args.positions:

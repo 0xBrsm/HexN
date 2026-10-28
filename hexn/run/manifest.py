@@ -121,6 +121,7 @@ ADDED: dict[str, dict[str, Any]] = {
         "discard_order": "seat",
         "zero_sum": 0.6,
         "c9_clip": "per-decision",
+        "eval_seed": None,
     },
     "exit": {
         "collect_trunk": "reference",
@@ -129,6 +130,7 @@ ADDED: dict[str, dict[str, Any]] = {
         "step_checkpoint_every": 0,
         "micro_batch": 0,
         "prior_kl": 0.0,
+        "eval_seed": None,
     },
     "league": {"collect_trunk": "reference"},
 }
@@ -291,6 +293,7 @@ def freeze(
     plan: str | None = None,
     parent: str | None = None,
     now: datetime | None = None,
+    seed_bypass: str | None = None,
 ) -> Manifest:
     """Resolve `argv` through the mode's parser and write the run directory.
 
@@ -298,11 +301,15 @@ def freeze(
     every parameter with an explicit value, so training never consults a
     default and a later change to a default cannot silently alter what a
     recorded run meant.
+
+    The seeds are held to the seed policy (`hold_seeds`) before anything is
+    written, and how they passed is kept in `run.json` as `seeds`.
     """
     parser = _parser_for(mode)
     from .resources import resolve
     args = parser.parse_args(argv)
     resolve(args)
+    seed_notes = hold_seeds(args, plan=plan, bypass=seed_bypass)
     resolved = vars(args)
     expected = parameters(mode)
     missing = expected - set(resolved)
@@ -338,10 +345,31 @@ def freeze(
         "created": now.isoformat(),
         "argv": argv,
         "engine": engine,
+        "seeds": seed_notes,
         **prov,
     }
     (directory / "run.json").write_text(json.dumps(meta, indent=1) + "\n")
     return Manifest(name=name, mode=mode, directory=directory, config=resolved, meta=meta)
+
+
+def hold_seeds(args: argparse.Namespace, *, plan: str | None = None, bypass: str | None = None) -> dict:
+    """Hold a run's training seed to the seed policy's `rl` list, and fill
+    and hold its evaluation seed (`hexset.seeds`). An `--eval-seed` left
+    unset takes the policy's default for the table, so every replicate is
+    evaluated on the same games; a confirmation seed takes the run's `plan`
+    as its registration. Returns the notes `run.json` keeps; with no policy,
+    nothing is checked or filled."""
+    from hexset import seeds
+
+    notes = {"train": seeds.check_train(args.seed, kind="rl", bypass=bypass)}
+    if hasattr(args, "eval_seed"):
+        if args.eval_seed is None and seeds.policy() is not None:
+            args.eval_seed = seeds.default_eval(args.players)
+        if args.eval_seed is not None:
+            notes["eval"] = seeds.check_eval(
+                args.eval_seed, seats=args.players, bypass=bypass, registration=plan,
+            )
+    return notes
 
 
 def load(directory: str | Path) -> Manifest:
