@@ -420,10 +420,11 @@ def test_versus_is_the_engines_own_verdict_and_nothing_added():
         max_offers=1,
         journal=fresh(),
     )
+    mine_bench, their_bench = named_opponent("random-too", 3, 2), named_opponent("random", 4, 2)
     theirs = compete_batched(
         {
-            0: BotPolicy(named_opponent("random-too", 3, 2).spawn),
-            1: BotPolicy(named_opponent("random", 4, 2).spawn),
+            0: BotPolicy(mine_bench.spawn, seat_spawn=mine_bench.seat_spawn),
+            1: BotPolicy(their_bench.spawn, seat_spawn=their_bench.seat_spawn),
         },
         2,
         caster=alternating(4),

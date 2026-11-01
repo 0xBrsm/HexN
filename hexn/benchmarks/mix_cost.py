@@ -135,7 +135,8 @@ class TimedBench(BoardBots):
 
     def __init__(self, bench: BoardBots) -> None:
         super().__init__(
-            lambda board: TimedBot(bench.bot(board), self), capacity=bench.capacity
+            lambda board: TimedBot(bench.bot(board), self), capacity=bench.capacity,
+            seat_spawn=lambda board, rng: TimedBot(bench.fresh(board, rng), self),
         )
         self.seconds = 0.0
         self.decisions = 0

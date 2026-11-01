@@ -2,6 +2,37 @@
 
 All notable changes to the `hexn` package are recorded here.
 
+## 0.47.1
+
+### Fixed
+
+- **`hexn.ppo` trains every layer of a contract-8 net started from 8.1
+  weights.** `--init` (and a resume) loading contract-8.1 weights onto the
+  contract-8 net `build` makes replaces its `embed_global`, and the optimiser
+  built before the load did not hold the new weight: that layer never trained,
+  and under `--amp fp16` its unscaled gradient dominated the clipped norm and
+  shrank every update to almost nothing. The optimiser is now rebuilt over the
+  net's live parameters after each load (`hexn.ppo.__main__.bind_optimiser`).
+
+- A lane opponent that reads the table (a bot with a `seen` hook) now plays
+  a collector's games as it plays an arena table: `named_opponent` builds
+  one per seat per game off the stream the lane hands it
+  (`hexset.gym.lanes.BoardBots.fresh`), and the `Collector` hands the lane
+  the bench itself, so every move of the game is shown to it. Every other
+  opponent plays exactly as before.
+
+- Every lane opponent draws a stream of its own game and seat
+  (`hexset.arena.seat_key`), not one stream per board that every game
+  started again from the same number: `named_opponent`'s bots are built per
+  seat per game off `seat_spawn`, and so are a ladder rung's (`duellist`
+  hands `BotPolicy` the bench's `seat_spawn`), the floor duel's random seats
+  (`hexn.loop.duel`) and `mix_cost`'s timed opponents. **New runs and
+  evaluations whose lane opponents draw (a sampling seat, a random seat, a
+  bot's random tie-break) play different games from before at the same
+  seed**; an opponent that draws nothing plays the same games. The `seed`
+  `named_opponent` takes now keys only `BoardBots.bot`'s one bot per board.
+
+
 ## 0.47.0
 
 ### Breaking

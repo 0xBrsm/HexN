@@ -103,9 +103,10 @@ def duellist(policy, max_offers: int | None = None, trader: str | None = None) -
 
     A scripted rung is a `hexset.gym.lanes.BoardBots` bench
     (`hexn.collect.named_opponent`), and HexSet's `BotPolicy` is that bench
-    plus the two protocol methods -- rebuilt from the bench's own spawn law,
-    so a rung stays literally the entrant the arena scores and is gated by
-    the same bot that plays it.
+    plus the two protocol methods -- rebuilt from the bench's own spawn laws,
+    so a rung stays literally the entrant the arena scores, the lanes build
+    each of its seats a bot of their own per game off that seat's stream
+    (`seat_spawn`), and it is gated by the same bot that plays it.
     A network answers `act_rows` and is `hexset.bench.versus.PolicyPolicy`
     over a `_Checkpoint` built from its own `space`/`players`; HexSet seats
     the gate it builds (0.45.1). Anything
@@ -118,7 +119,7 @@ def duellist(policy, max_offers: int | None = None, trader: str | None = None) -
     rung brings its own gate and ignores both.
     """
     if isinstance(policy, BoardBots):
-        return BotPolicy(policy.spawn, capacity=policy.capacity)
+        return BotPolicy(policy.spawn, capacity=policy.capacity, seat_spawn=policy.seat_spawn)
     if hasattr(policy, "act_rows") and trader is not None:
         return _Traded(policy, trader)
     if hasattr(policy, "act_rows"):
@@ -168,7 +169,10 @@ def duel(
     verdict = compete_batched(
         {
             0: duellist(policy, max_offers, trader),
-            1: BotPolicy(lambda board: RandomBot(random.Random(seed))),
+            # Each random seat draws from its own stream for its game
+            # (`hexset.arena.seat_key`), not one stream every game repeats.
+            1: BotPolicy(lambda board: RandomBot(random.Random(seed)),
+                         seat_spawn=lambda board, rng: RandomBot(rng)),
         },
         games,
         caster=lambda index: cast,

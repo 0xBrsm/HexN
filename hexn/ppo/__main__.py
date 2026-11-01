@@ -95,6 +95,7 @@ from . import (
     win_round,
 )
 from ..model import graft_fast_win
+from ..optim import adam
 from ..schedule import AdaptiveLR, current_lr, linear_anneal, set_lr
 from ..selfplay import SAMPLE_STREAMS, BatchPolicy, Collector, Episode
 from ..steps import Steps, by_index, fingerprint, remove as remove_steps
@@ -520,6 +521,24 @@ def resolve_defaults(args) -> None:
         args.decoupled = bool(args.async_collect)
 
 
+def bind_optimiser(net: torch.nn.Module, optimiser: torch.optim.Optimizer, args) -> torch.optim.Optimizer:
+    """`optimiser` if it holds every parameter `net` has now, else a fresh one
+    over them.
+
+    `build` makes the optimiser before any checkpoint is loaded, and a load can
+    replace a layer: a contract-8 net given contract-8.1 weights swaps in a
+    wider `embed_global` (`hexn.model.HexNet._refuse_other_inputs`). A weight
+    in no parameter group never trains, and under AMP `scaler.unscale_` leaves
+    its gradient at the loss scale, where it dominates `clip_grad_norm_` and
+    shrinks every other parameter's step to almost nothing. Called after every
+    load, before an optimiser state is loaded into the result."""
+    held = {id(p) for group in optimiser.param_groups for p in group["params"]}
+    live = list(net.parameters())
+    if {id(p) for p in live} == held:
+        return optimiser
+    return adam(live, lr=args.learning_rate, eps=args.adam_eps)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the directory named on the command line, and take nothing else.
 
@@ -765,6 +784,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             policy.net.load_state_dict(seed_state["net"])
         print(f"initialised from {args.init}", file=sys.stderr)
+        optimiser = bind_optimiser(policy.net, optimiser, args)
         # Kept as this run's own iteration 0: the same weights, but recording
         # this run's arguments -- its offer budget among them -- where the init
         # file records whatever its own trainer did. A comparison against the
@@ -787,6 +807,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     elif args.resume:
         state = torch.load(latest, map_location=args.device, weights_only=False)
         policy.net.load_state_dict(state["net"])
+        optimiser = bind_optimiser(policy.net, optimiser, args)
         optimiser.load_state_dict(state["optimiser"])
         if scaler is not None and "scaler" in state:
             scaler.load_state_dict(state["scaler"])

@@ -167,9 +167,14 @@ def named_opponent(name: str, seed: int, lanes: int) -> BoardBots:
         # Matching `--mix`'s style: a mistyped rung should fail with a sentence
         # before the run starts, not a bare KeyError traceback out of a lambda.
         raise SystemExit(f"unknown entrant: {name}") from None
+    # A lane builds every seat's bot for its game off the stream it hands it
+    # (`BoardBots.fresh`, `hexset.arena.seat_key`), as the arena builds each
+    # entrant off its own, so no two games or seats draw alike. `seed` keys
+    # only `BoardBots.bot`'s one bot per board, for a caller without lanes.
     return BoardBots(
         lambda board: spawn(entrant, board, random.Random(seed)),
         capacity=max(256, 2 * lanes),
+        seat_spawn=lambda board, rng: spawn(entrant, board, rng),
     )
 
 
@@ -320,8 +325,10 @@ def mix_opponents(
                 raise ValueError("the 'parent' mix opponent needs a parent checkpoint")
             out.append(parent())
         else:
-            # A stream per entry, so two entrants in one mix do not break
-            # their tie-breaks in lockstep. 77 stays where it was.
+            # A stream per entry for a `sampled:` member and for a bench's
+            # one bot per board (`BoardBots.bot`); a lane's own bots draw off
+            # their game and seat (`hexset.arena.seat_key`). 77 stays where
+            # it was.
             out.append(
                 rung_opponent(
                     name,

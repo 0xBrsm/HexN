@@ -721,3 +721,27 @@ def test_a_net_is_contract_8_by_default_and_takes_8_1_from_its_checkpoint():
     batch = collate(observations(3, contract="8.1"))
     with torch.no_grad():
         torch.testing.assert_close(loaded(*batch).logits, rules(*batch).logits)
+
+
+def test_ppo_rebinds_its_optimiser_when_8_1_weights_widen_the_net():
+    """A contract-8 net loading 8.1 weights replaces `embed_global`; the
+    optimiser `build` made before the load must be rebuilt over the new
+    parameter, or that layer never trains and AMP's unscale misses its
+    gradient (`hexn.ppo.__main__.bind_optimiser`)."""
+    from types import SimpleNamespace
+
+    from hexn.optim import adam
+    from hexn.ppo.__main__ import bind_optimiser
+
+    _, _, rules = a_net(seed=2, contract="8.1")
+    _, _, net = a_net(seed=3)
+    args = SimpleNamespace(learning_rate=2e-4, adam_eps=1e-5)
+    before = adam(net.parameters(), lr=args.learning_rate, eps=args.adam_eps)
+    assert bind_optimiser(net, before, args) is before
+    net.load_state_dict(rules.state_dict())
+    held = {id(p) for group in before.param_groups for p in group["params"]}
+    assert id(net.embed_global.weight) not in held
+    after = bind_optimiser(net, before, args)
+    assert after is not before
+    assert {id(p) for group in after.param_groups for p in group["params"]} == {id(p) for p in net.parameters()}
+    assert after.param_groups[0]["lr"] == 2e-4 and after.param_groups[0]["eps"] == 1e-5

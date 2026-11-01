@@ -18,10 +18,10 @@ this module is imported -- a run names it with `--runtime hexn.coalition`,
 the way every bot a run names is loaded (`hexn.runtime`). `hexn.collect`
 spells a coalition member `targeted:<spec>` from the entry's `members=`.
 
-One `Targeted` serves every seat and lane of its board that casts the same
-checkpoint (`hexset.gym.lanes.BoardBots`), so it keeps no per-game state:
-the targets are re-read from the game at every `seat_at` and `choose`, and
-the trigger's latch lives on the plan, which is the game's.
+A lane builds each seat its own `Targeted` for the game
+(`hexset.gym.lanes.BoardBots.fresh`), but it keeps no per-game state all the
+same: the targets are re-read from the game at every `seat_at` and `choose`,
+and the trigger's latch lives on the plan, which is the game's.
 """
 from __future__ import annotations
 

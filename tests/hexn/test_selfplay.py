@@ -288,12 +288,121 @@ def test_a_trader_is_named_alone_and_must_resolve():
         check_trader("nobody-by-that-name", None)
 
 
+def test_an_opponent_that_reads_the_table_is_shown_every_move_from_a_seat_of_its_own():
+    """A `named_opponent` bot with a `seen` hook (`hexset.bots.watch`): one
+    per seat per game, each built off its own stream and shown its game's
+    every move, the learner's included, from its own seat."""
+    from hexset import arena
+    from hexset.actions import options_for
+    from hexn.collect import named_opponent
+
+    made: list = []
+
+    class Watching:
+        def __init__(self, rng) -> None:
+            self.salt = rng.getrandbits(16)
+            self.calls: list = []
+            made.append(self)
+
+        def seen(self, game, actor, action, viewer):
+            self.calls.append((actor, action, viewer))
+
+        def choose(self, game):
+            options = options_for(game)
+            return options[(len(self.calls) + self.salt) % len(options)]
+
+    arena.register_entrant_kind("test-watching", lambda entrant, board, rng: Watching(rng))
+    arena.register_preset("test-watching", arena.Entrant("test-watching", kind="test-watching"), listed=False)
+    try:
+        collector = Collector(
+            RandomPolicy(random.Random(4)),
+            lanes=2,
+            seed=5,
+            deal=3,
+            action_cap=400,
+            turn_cap=UNSTRUCTURED_TURN_CAP,
+            opponents=[named_opponent("test-watching", 5, 2)],
+            caster=lambda index: (0, 1, 1, 1),
+            keep=kept(),
+        )
+        played = collector.drain()
+    finally:
+        arena.unregister_preset("test-watching")
+        arena.unregister_entrant_kind("test-watching")
+    assert len(played) == 3
+    shown = [bot for bot in made if bot.calls]
+    assert len(shown) == 3 * len(played), "a bot of its own for each opponent seat of each game"
+    assert len({bot.salt for bot in shown}) == len(shown)
+    from hexset.record import actions_of
+
+    streams = {tuple(actions_of(episode.record)) for episode in played}
+    for bot in shown:
+        (viewer,) = {v for _, _, v in bot.calls}
+        assert viewer in (1, 2, 3)
+        assert any(actor == 0 for actor, _, _ in bot.calls), "the learner's moves are shown"
+        assert tuple(action for _, action, _ in bot.calls) in streams
+
+
+def test_a_drawing_opponent_draws_its_own_stream_per_game_and_seat_however_collected():
+    """A `named_opponent` bot without `seen` that draws every move: each
+    seat of each game draws a stream of its own (`hexset.arena.seat_key`),
+    never one every game repeats, and the same one whether a collector plays
+    the games in one lane, three, or split over two workers. Every seat is
+    the bot's, so nothing else draws in tick order."""
+    from hexset import arena
+    from hexset.actions import options_for
+    from hexn.collect import named_opponent
+
+    class Drawing:
+        def __init__(self, rng) -> None:
+            self.rng = rng
+            self.draws: list = []
+
+        def choose(self, game):
+            options = options_for(game)
+            pick = self.rng.randrange(1 << 30)
+            self.draws.append(pick)
+            return options[pick % len(options)]
+
+    def collect(lanes, first, stride):
+        collector = Collector(
+            RandomPolicy(random.Random(4)), lanes=lanes, seed=5, deal=4 // stride,
+            first_game=first, stride=stride, action_cap=300, turn_cap=UNSTRUCTURED_TURN_CAP,
+            opponents=[named_opponent("test-drawing", 5, lanes)],
+            caster=lambda index: (1, 1, 1, 1), keep=kept(),
+        )
+        draws, played = {}, {}
+        while collector.running:
+            for lane in collector._env._lanes:
+                if lane is not None:
+                    for seat in range(4):
+                        draws[(lane.index, seat)] = lane.seat_bots[seat]
+            for episode in collector.tick():
+                played[episode.index] = episode.record
+        return {key: tuple(bot.draws) for key, bot in draws.items()}, played
+
+    arena.register_entrant_kind("test-drawing", lambda entrant, board, rng: Drawing(rng))
+    arena.register_preset("test-drawing", arena.Entrant("test-drawing", kind="test-drawing"), listed=False)
+    try:
+        one = collect(1, 0, 1)
+        three = collect(3, 0, 1)
+        workers = [collect(2, w, 2) for w in (0, 1)]
+    finally:
+        arena.unregister_preset("test-drawing")
+        arena.unregister_entrant_kind("test-drawing")
+    split = ({**workers[0][0], **workers[1][0]}, {**workers[0][1], **workers[1][1]})
+    assert sorted(one[1]) == [0, 1, 2, 3] and len(one[0]) == 4 * 4
+    assert one == three == split
+    assert len({draws[:4] for draws in one[0].values()}) == 4 * 4, "no two games or seats draw alike"
+
+
 @needs("heximax")
 def test_a_scripted_opponent_is_seated_as_its_own_trader():
     from hexset.arena import entrant_from_name, spawn
 
     entrant = entrant_from_name("heximax")
-    bots = BoardBots(lambda board: spawn(entrant, board, random.Random(0)))
+    bots = BoardBots(lambda board: spawn(entrant, board, random.Random(0)),
+                     seat_spawn=lambda board, rng: spawn(entrant, board, rng))
     collector = Collector(
         RandomPolicy(random.Random(1)),
         lanes=1,
@@ -305,11 +414,12 @@ def test_a_scripted_opponent_is_seated_as_its_own_trader():
     game = next(collector.in_flight())
     assert game.gates[0] is None
     assert game.gates[2] is None
-    # public field
-    seated = bots.bot(game.state(0, hidden=False).board)
-    assert game.gates[1] is seated
-    assert game.gates[3] is seated
-    assert hasattr(seated, "gains_many")
+    # Each of its seats is its own bot for the game, and that bot its gate.
+    (lane,) = [lane for lane in collector._env._lanes if lane is not None and lane.game is game]
+    assert game.gates[1] is lane.seat_bots[1]
+    assert game.gates[3] is lane.seat_bots[3]
+    assert game.gates[1] is not game.gates[3]
+    assert all(hasattr(game.gates[seat], "gains_many") for seat in (1, 3))
 
 
 def test_the_cast_is_taken_from_the_game_index_not_the_lane():

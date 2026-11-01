@@ -828,11 +828,12 @@ class Collector:
             board=self._paired_board if self.pair_boards else self.board,
             deal_law=self.deal_law,
             caster=None if self.caster is None else self._cast,
-            # `bench.bot` rather than `bench.spawn`: the bench a caller built
+            # The bench itself: the one a caller built
             # (`hexn.collect.named_opponent`) is the one that must hold the
-            # bots, so the capacity it chose is the capacity that applies and a
-            # bot survives a cohort boundary.
-            bots={pid: bench.bot for pid, bench in self._benches.items()},
+            # bots, so the capacity it chose is the capacity that applies, a
+            # bot survives a cohort boundary, and a bot that reads the table
+            # is built per seat by its `seat_spawn` (`BoardBots.fresh`).
+            bots=dict(self._benches),
             gates={
                 pid: self._trader(pid)
                 for pid in self._batched
