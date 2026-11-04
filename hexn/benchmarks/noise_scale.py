@@ -41,6 +41,12 @@ manufacture exactly the batch-size dependence being measured. And the loss is
 the full PPO objective, value and entropy terms included, because that is what
 the optimiser sees.
 
+What the reading bears on is the optimiser's step batch -- the samples one
+gradient step averages over, `hexn.ppo`'s `--minibatch` -- with the learning
+rate re-set to match when that batch changes. It does not size the games
+collected an iteration (`--games-per-iteration`): those set how fresh the data
+is and how many steps an iteration takes, not how noisy one step is.
+
     python -m hexn.benchmarks.noise_scale --checkpoint runs/example/latest.pt
 """
 
@@ -103,7 +109,7 @@ def estimate(mean_small: float, mean_big: float, small: int, big: int) -> dict:
         # error in the estimate itself.
         "b_simple": noise / signal if signal > 0 and noise >= 0 else None,
         # What fraction of a B_big gradient's length is the true gradient.
-        "signal_share_at_b_big": (signal / mean_big) ** 0.5 if mean_big else None,
+        "signal_share_at_b_big": (signal / mean_big) ** 0.5 if mean_big and signal > 0 else None,
     }
 
 
@@ -153,18 +159,22 @@ def _measure(policy, batch, advantage, config, small: int, big: int, repeats: in
     whole batch, each stream by its own moments, matching what an update
     would actually feed the optimiser under either terminal.
     """
-    positions = len(batch)
+    return _sweep(lambda rows: _gradients(policy, batch, rows, advantage, config),
+                  torch.arange(len(batch)), small, big, repeats, seed)
+
+
+def _sweep(gradients, pool: torch.Tensor, small: int, big: int, repeats: int, seed: int) -> dict:
+    """`_measure`'s sweep over `pool`, the units a draw is taken from (a
+    batch's positions): `gradients(units)` is each term's flat gradient over
+    `units`."""
     small_sq: dict[str, list[float]] = {name: [] for name in TERMS}
     big_sq: dict[str, list[float]] = {name: [] for name in TERMS}
     generator = torch.Generator().manual_seed(seed)
     for repeat in range(repeats):
-        order = torch.randperm(positions, generator=generator)
-        for start_row in range(0, positions - big + 1, big):
+        order = pool[torch.randperm(len(pool), generator=generator).to(pool.device)]
+        for start_row in range(0, len(pool) - big + 1, big):
             chunk = order[start_row : start_row + big]
-            draws = [
-                _gradients(policy, batch, chunk[i : i + small], advantage, config)
-                for i in range(0, big, small)
-            ]
+            draws = [gradients(chunk[i : i + small]) for i in range(0, big, small)]
             for name in TERMS:
                 stacked = torch.stack([draw[name] for draw in draws])
                 small_sq[name].append(float(stacked.pow(2).sum(dim=1).mean()))

@@ -13,7 +13,8 @@ tokens. Each round passes, with one set of weights for every seat:
 - vertex <- its building's owner's seat token, and every seat token weighted
   by that seat's reach to it; seat <- the vertices it builds on, the roads it
   owns and the vertices it reaches, the same links the other way;
-- seat <-> seat by one attention over the four;
+- seat <-> seat by one attention over the four, or by each seat reading the
+  others' mean token (`ModelConfig.others`: at two seats, the opponent's);
 - the table token to every token, and back from the means of each kind.
 
 Heads, all shared across seats: the win head reads one logit off each seat's
@@ -42,7 +43,9 @@ from torch import Tensor, nn
 from hexset.actions import Action, ActionSpace, ActionType
 from hexset.board.terrain import NUM_RESOURCES
 from hexset.contract9 import (
-    CONTRACTS, HEX_FEATURES, SEAT_FEATURES, TABLE_FEATURES, VERTEX_FEATURES, Layout9, features, incidences,
+    CONTRACTS, HEX_FEATURES, SEAT_FEATURES, SEAT_FEATURES_9D, TABLE_FEATURES, VERTEX_FEATURES, Layout9, features,
+    hex_features,
+    incidences,
 )
 from hexset.decisions import DecisionKind, double_pairs
 
@@ -79,6 +82,16 @@ class ModelConfig:
     # One attention over the four seat tokens each round. Without it seats meet
     # only through the table and the board, and the seat update loses that input.
     attention: bool = True
+    # The other seats' mean token as an input of each seat's update: what
+    # attention tends to at two seats, where the mean is the opponent's token,
+    # without query, key or value. Checkpoints written before the field had none.
+    others: bool = False
+    # The global head (bank trades, buying a card, the development plays,
+    # ending the turn) reads the perspective's own seat token beside the
+    # table's, where the table alone carries the seats only as their mean.
+    # Checkpoints written before the field had the table alone: loading one
+    # pads the head's weights for the seat token with zeros.
+    global_seat: bool = False
     # A points head beside the win head: one number per seat token (with the
     # table), its near-term points against the others', trained on a cache's
     # zero-sum targets. Checkpoints written before the field had none.
@@ -112,7 +125,8 @@ def config_of(model_config: dict) -> ModelConfig:
                          width=model_config["width"], rounds=model_config["rounds"],
                          heads=model_config.get("heads", "mlp"), discard=model_config.get("discard", "mlp"),
                          norm=model_config.get("norm", False), messages=model_config.get("messages", "separate"),
-                         attention=model_config.get("attention", True), points=model_config.get("points", False),
+                         attention=model_config.get("attention", True), others=model_config.get("others", False),
+                         global_seat=model_config.get("global_seat", False), points=model_config.get("points", False),
                          double_turn=model_config.get("double_turn", "joint"))
 
 
@@ -179,7 +193,8 @@ def _norm(width: int, on: bool) -> nn.Module:
 
 
 class _Round(nn.Module):
-    def __init__(self, width: int, norm: bool = True, pooled: bool = False, attention: bool = True) -> None:
+    def __init__(self, width: int, norm: bool = True, pooled: bool = False, attention: bool = True,
+                 others: bool = False) -> None:
         super().__init__()
         # Pre-norm: each kind of token is normalised before its messages are
         # built and its update read, and the update is added to the token as
@@ -189,6 +204,9 @@ class _Round(nn.Module):
         self.norm_seat = _norm(width, norm)
         self.norm_table = _norm(width, norm)
         self.pooled = pooled
+        # The seat update's inputs beside the seat itself and its board: the
+        # attention read and the others' mean, each where asked for.
+        reads = int(attention) + int(others)
         if pooled:
             # `ModelConfig.messages == "pooled"`: each kind of message pooled
             # into one input (below), and the table projected once per position
@@ -196,7 +214,7 @@ class _Round(nn.Module):
             # each token's input.
             self.hex = _mlp(2 * width, width)
             self.vertex = _mlp(4 * width, width)
-            self.seat = _mlp((3 if attention else 2) * width, width)
+            self.seat = _mlp((2 + reads) * width, width)
             self.hex_table = nn.Linear(width, width, bias=False)
             self.vertex_table = nn.Linear(width, width, bias=False)
             self.seat_table = nn.Linear(width, width, bias=False)
@@ -205,14 +223,22 @@ class _Round(nn.Module):
         else:
             self.hex = _mlp(3 * width, width)
             self.vertex = _mlp(7 * width, width)
-            self.seat = _mlp((6 if attention else 5) * width, width)
+            self.seat = _mlp((5 + reads) * width, width)
         self.table = _mlp(4 * width, width)
         self.attention = attention
+        self.others = others
         if attention:
             self.query = nn.Linear(width, width)
             self.key = nn.Linear(width, width)
             self.value = nn.Linear(width, width)
         self.road = nn.Parameter(torch.zeros(width))
+
+
+def _others(sn: Tensor, dim: int, players: int) -> Tensor:
+    """Each seat's mean of the other seats' tokens, the `players` seats along
+    `dim`: at two seats, the one opponent's token. `players` is the net's
+    own count, a Python number, so a traced graph carries no shape read."""
+    return (sn.sum(dim, keepdim=True) - sn) / max(players - 1, 1)
 
 
 def _pick(x: Tensor, dim: int, index: Tensor) -> Tensor:
@@ -253,10 +279,10 @@ class HexNet(nn.Module):
         seat_features, table_features = features(self.CONTRACT)
         self.embed_seat = nn.Linear(seat_features, width)
         self.embed_table = nn.Linear(table_features, width)
-        self.embed_hex = nn.Linear(HEX_FEATURES + int(self.CONTRACT == "9.1"), width)
+        self.embed_hex = nn.Linear(hex_features(self.CONTRACT), width)
         self.embed_vertex = nn.Linear(VERTEX_FEATURES, width)
         self.rounds = nn.ModuleList(_Round(width, self.config.norm, self.config.messages == "pooled",
-                                           self.config.attention)
+                                           self.config.attention, self.config.others)
                                     for _ in range(self.config.rounds))
         self.out_hex = _norm(width, self.config.norm)
         self.out_vertex = _norm(width, self.config.norm)
@@ -273,7 +299,8 @@ class HexNet(nn.Module):
         self.robber_head = head(2 * width)              # hex with a victim's token
         self.nobody_head = nn.Linear(width, 1)          # hex, robbing nobody
         globals_size = sum(space.sizes[k] for k in _GLOBAL_KINDS)
-        self.global_head = head(width, globals_size)           # off the table, as HexNet's global head
+        self.global_head = head(2 * width if self.config.global_seat else width, globals_size)  # off the table
+        # (and with `global_seat` the perspective's own seat token), as HexNet's global head
         self.setup_head = head(2 * width)               # settlement with its road's far end
         joint = self.config.double_turn == "joint"
         self.first_head = head(2 * width) if joint else None
@@ -336,6 +363,21 @@ class HexNet(nn.Module):
                 target = self.state_dict()[name]
                 if weight is not None and tuple(weight.shape) == (target.shape[0], old_width):
                     state_dict[key] = nn.functional.pad(weight, (0, target.shape[1] - old_width))
+        # A 9d.1 net can start from 9d: the seat token's economy columns are
+        # appended, so their embedding weights start at zero. A `global_seat`
+        # net can start from one without: the global head's weights for the
+        # seat token start at zero. Either way the loaded net plays as before.
+        if self.CONTRACT == "9d.1":
+            key = prefix + "embed_seat.weight"
+            weight = state_dict.get(key)
+            target = self.state_dict()["embed_seat.weight"]
+            if weight is not None and tuple(weight.shape) == (target.shape[0], SEAT_FEATURES_9D):
+                state_dict[key] = nn.functional.pad(weight, (0, target.shape[1] - SEAT_FEATURES_9D))
+        if self.config.global_seat and isinstance(self.global_head, nn.Linear):
+            key = prefix + "global_head.weight"
+            weight = state_dict.get(key)
+            if weight is not None and weight.shape[1] == self.config.width:
+                state_dict[key] = nn.functional.pad(weight, (0, self.config.width))
         super()._load_from_state_dict(state_dict, prefix, *args)
 
     def _initialise(self) -> None:
@@ -361,6 +403,13 @@ class HexNet(nn.Module):
                 vertex_owner: Tensor, road_owner: Tensor, reach: Tensor, *, policy: bool = True) -> Prediction:
         """The win head, and with `policy` the policy's outputs: a value-only
         row (another seat's view of a decision) skips every policy head."""
+        if self.fused:
+            s, t, h, v = self._fused_trunk(seats, table, hexes, vertices, vertex_owner, road_owner, reach)
+            h, v, s, t = self.out_hex(h), self.out_vertex(v), self.out_seat(s), self.out_table(t)
+            value_logits, value, points = self._value(s, t, seats)
+            if not policy:
+                return Prediction(value=value, value_logits=value_logits, points=points)
+            return self._emit(s, t, h, v, value, value_logits, points)
         # Ownership as one comparison each: a pointer of -1 matches no seat.
         rows = torch.arange(self.players, device=seats.device)
         owns_v = (vertex_owner.unsqueeze(-1) == rows).to(seats.dtype)            # (B, V, P)
@@ -370,13 +419,6 @@ class HexNet(nn.Module):
         roads_held = owns_e.sum(1).clamp(min=1.0).unsqueeze(-1)
         reached = reach.sum(-1).clamp(min=1e-3).unsqueeze(-1)
 
-        if self.fused:
-            s, t, h, v = self._fused_trunk(seats, table, hexes, vertices, vertex_owner, road_owner, reach)
-            h, v, s, t = self.out_hex(h), self.out_vertex(v), self.out_seat(s), self.out_table(t)
-            value_logits, value, points = self._value(s, t, seats)
-            if not policy:
-                return Prediction(value=value, value_logits=value_logits, points=points)
-            return self._emit(s, t, h, v, value, value_logits, points)
         s = self.embed_seat(seats)
         t = self.embed_table(table)
         h = self.embed_hex(hexes)
@@ -400,11 +442,12 @@ class HexNet(nn.Module):
             s_from_built = owns_v.transpose(1, 2) @ vn / built
             s_from_roads = owns_e.transpose(1, 2) @ middle / roads_held
             s_from_reach = reach @ vn / reached
+            seats_in = []
             if r.attention:
                 attention = torch.softmax(r.query(sn) @ r.key(sn).transpose(1, 2) / scale, -1)
-                seats_in = [attention @ r.value(sn)]
-            else:
-                seats_in = []
+                seats_in.append(attention @ r.value(sn))
+            if r.others:
+                seats_in.append(_others(sn, 1, self.players))
 
             h = h + r.hex(torch.cat([hn, h_from_v, tb.expand_as(h)], -1))
             v = v + r.vertex(torch.cat([vn, v_from_h, v_from_v, v_from_road, v_from_owner, v_from_reach,
@@ -483,7 +526,9 @@ class HexNet(nn.Module):
             if r.attention:
                 q, k, val = r.query(sn), r.key(sn), r.value(sn)                   # (P, B, W)
                 attention = torch.softmax((q.unsqueeze(1) * k.unsqueeze(0)).sum(-1) / scale, 1)   # (P, P, B)
-                seats_in = [(attention.unsqueeze(-1) * val.unsqueeze(0)).sum(1)]  # (P, B, W)
+                seats_in.append((attention.unsqueeze(-1) * val.unsqueeze(0)).sum(1))  # (P, B, W)
+            if r.others:
+                seats_in.append(_others(sn, 0, players))
             if r.pooled:
                 hw, vw, sw = (x[0].weight.split(width, 1) for x in (r.hex, r.vertex, r.seat))
                 road_seat = pad(sn @ vw[2].T)
@@ -528,7 +573,9 @@ class HexNet(nn.Module):
         seats_in = []
         if r.attention:
             attention = torch.softmax(r.query(sn) @ r.key(sn).transpose(1, 2) / scale, -1)
-            seats_in = [attention @ r.value(sn)]
+            seats_in.append(attention @ r.value(sn))
+        if r.others:
+            seats_in.append(_others(sn, 1, self.players))
 
         def update(mlp: nn.Sequential, table: nn.Linear, x: Tensor) -> Tensor:
             return mlp[2](mlp[1](mlp[0](x) + table(tn).unsqueeze(1)))
@@ -567,7 +614,8 @@ class HexNet(nn.Module):
         logits = logits.index_copy(1, self.slot_settlement, vertex[..., 0])
         logits = logits.index_copy(1, self.slot_city, vertex[..., 1])
         logits = logits.index_copy(1, self.slot_road, road.to(vertex.dtype))
-        logits = logits.index_copy(1, self.slot_global, self.global_head(t).to(vertex.dtype))
+        globals_in = torch.cat([t, me.to(t.dtype)], -1) if self.config.global_seat else t
+        logits = logits.index_copy(1, self.slot_global, self.global_head(globals_in).to(vertex.dtype))
         return Prediction(value=value, value_logits=value_logits, points=points, logits=logits, road=road, me=me,
                           table=t, vertices=v, hexes=h, seats=s)
 

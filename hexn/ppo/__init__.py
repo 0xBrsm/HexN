@@ -84,6 +84,7 @@ from torch import Tensor
 
 from hexset.encoding import global_columns, to_frame
 from hexset.game import Phase
+from hexset.contract9 import CONTRACTS as CONTRACTS9
 from ..model import Packing, pack, unpack
 from ..policy import NetworkPolicy, masked_log_softmax
 
@@ -344,15 +345,15 @@ class PPOConfig:
             )
         if self.prior_kl < 0.0:
             raise ValueError(f"prior_kl cannot be negative, got {self.prior_kl}")
-        if self.contract not in ("8", "9", "9.1"):
+        if self.contract not in ("8", *CONTRACTS9):
             raise ValueError(f"unknown contract {self.contract!r}")
         if self.c9_clip not in C9_CLIPS:
             raise ValueError(f"unknown c9_clip {self.c9_clip!r}: {C9_CLIPS}")
         if not 0.0 < self.zero_sum <= 1.0:
             raise ValueError(f"zero_sum discounts a round by a factor in (0, 1], got {self.zero_sum}")
-        if self.aux_target == "zero_sum" and self.contract not in ("9", "9.1"):
+        if self.aux_target == "zero_sum" and self.contract not in CONTRACTS9:
             raise ValueError("aux_target 'zero_sum' trains contract 9's points head")
-        if self.contract in ("9", "9.1"):
+        if self.contract in CONTRACTS9:
             if self.aux_target != "zero_sum" and self.aux_margin_weight:
                 raise ValueError("a contract-9 net's one auxiliary head is the points head: aux_target 'zero_sum'")
             # What the contract-9 batch is not built for: each is a field of

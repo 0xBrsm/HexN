@@ -966,6 +966,42 @@ def test_rule_conditioned_manifests_collect_update_save_and_resume(tmp_path, par
     assert loaded.policy.net.CONTRACT == "9.1" and loaded.iteration == 3
 
 
+DUEL_LAW = json.dumps({"presets": [{"weight": 1, "players": 2, "winning_points": 15, "discard_limit": 9,
+                                     "friendly_robber": True, "balanced_dice": True, "board_mode": "random"}]})
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+def test_a_two_seat_run_on_contract_9d_collects_updates_saves_and_resumes(tmp_path, parallel):
+    """Contract 9d self-play: every game a two-seat duel-variant game dealt by
+    the rules mix, the net reading its opponent directly, no points head; the
+    checkpoint rebuilds at a two-seat table and is refused at four."""
+    from hexset.arena import deal_game
+    from hexset.rules import DUEL_VARIANT_GAME
+    from hexn import netbot
+
+    torch.set_num_threads(1)
+    flags = ["--contract", "9d", "--players", "2", "--messages", "pooled", "--no-attention", "--others",
+             "--rules-mix", DUEL_LAW, "--action-cap", "48", "--games-per-iteration", "2", "--lanes", "2",
+             "--collect-trunk", "fused"]
+    if parallel:
+        flags += ["--collect-workers", "2", "--async-collect", "--decoupled"]
+    assert run(tmp_path, 2, flags) == 0
+    assert run(tmp_path, 3, flags + ["--resume"]) == 0
+    lines = [json.loads(line) for line in (tmp_path / "log.jsonl").read_text().splitlines()]
+    trained = [line for line in lines if "positions" in line]
+    assert [line["iteration"] for line in trained] == [0, 1, 2] and all(line["positions"] > 0 for line in trained)
+    state = torch.load(tmp_path / "latest.pt", weights_only=False)
+    assert state["model_config"]["contract"] == "9d" and state["model_config"]["others"] is True
+    assert state["model_config"]["points"] is False and state["args"]["players"] == 2
+    topology = deal_game(0, 0, 2, game_type=DUEL_VARIANT_GAME)._state.board.topology
+    loaded = netbot.load(str(tmp_path / "latest.pt"), topology)
+    assert loaded.policy.net.CONTRACT == "9d" and loaded.policy.net.players == 2 and loaded.iteration == 3
+    assert loaded.players == 2 and loaded.policy.layout.width == 828
+    with pytest.raises(SystemExit):
+        run(tmp_path / "four", 1, ["--contract", "9d", "--players", "4", "--messages", "pooled", "--no-attention",
+                                   "--others", "--rules-mix", DUEL_LAW, "--action-cap", "48"])
+
+
 @pytest.mark.parametrize("parallel", [False, True])
 def test_a_board_mode_run_trains_on_its_boards_and_is_refused_beside_a_rules_mix(tmp_path, parallel):
     torch.set_num_threads(1)
@@ -1076,3 +1112,12 @@ def test_a_contract_9_init_without_a_points_head_starts_the_head_fresh(tmp_path)
 def test_a_contract_9_run_refuses_what_it_is_not_built_for(tmp_path, flags):
     with pytest.raises(SystemExit):
         run(tmp_path, 1, C9 + flags)
+
+
+def test_an_unresolved_signal_gives_no_share_and_no_scale():
+    from hexn.benchmarks import noise_scale
+
+    negative = noise_scale.estimate(0.5, 0.1, 4, 16)
+    assert negative["signal_g_squared"] < 0
+    assert negative["signal_share_at_b_big"] is None and negative["b_simple"] is None
+    json.dumps(negative)

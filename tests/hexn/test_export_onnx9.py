@@ -27,7 +27,7 @@ from hexset import decisions as D  # noqa: E402
 from hexset.actions import apply, legal_actions, options_for, space_for  # noqa: E402
 from hexset.arena import deal_game  # noqa: E402
 from hexset.cards import DevCard  # noqa: E402
-from hexset.clients.onnxbot import DecisionPolicy, _load_cached, load  # noqa: E402
+from hexset.clients.onnxbot import DecisionPolicy, _load_cached, load, spawn  # noqa: E402
 from hexset.clients.onnxmeta import read_metadata  # noqa: E402
 from hexset.game import Phase, is_over, to_move  # noqa: E402
 from hexn.export_onnx import main as export_main  # noqa: E402
@@ -45,12 +45,19 @@ def _fresh_sessions():
     _load_cached.cache_clear()
 
 
-def a_checkpoint(path: Path, config: ModelConfig, *, seed: int = 0, iteration: int = 7) -> Path:
+def _deal(seed: int, index: int, players: int = 4):
+    """A table of `players`: the standard game, or the duel variant at two."""
+    from hexset.rules import DUEL_VARIANT_GAME, STANDARD_GAME
+
+    return deal_game(seed, index, players, game_type=DUEL_VARIANT_GAME if players == 2 else STANDARD_GAME)
+
+
+def a_checkpoint(path: Path, config: ModelConfig, *, seed: int = 0, iteration: int = 7, players: int = 4) -> Path:
     """A small contract-9 net saved as a trainer saves one, its option heads
     sharpened past an untrained net's near-ties so a choice tests something."""
-    game = deal_game(0, 0, 4)
+    game = _deal(0, 0, players)
     torch.manual_seed(seed)
-    net = HexNet(space_for(game), game._state.board.topology, 4, config).eval()
+    net = HexNet(space_for(game), game._state.board.topology, players, config).eval()
     with torch.no_grad():
         for head in (net.vertex_head, net.road_head, net.global_head, net.setup_head, net.road_building,
                      net.robber_head, net.first_head, net.second_head):
@@ -58,13 +65,14 @@ def a_checkpoint(path: Path, config: ModelConfig, *, seed: int = 0, iteration: i
                 for p in head.parameters():
                     p.mul_(50)
     torch.save({"net": net.state_dict(), "model_config": asdict(config),
-                "args": {"contract": config.contract, "players": 4, "max_offers": 0}, "iteration": iteration}, path)
+                "args": {"contract": config.contract, "players": players, "max_offers": 0}, "iteration": iteration},
+               path)
     return path
 
 
-def _torch_policy(source: Path, config: ModelConfig) -> Policy9:
-    game = deal_game(0, 0, 4)
-    net = HexNet(space_for(game), game._state.board.topology, 4, config)
+def _torch_policy(source: Path, config: ModelConfig, players: int = 4) -> Policy9:
+    game = _deal(0, 0, players)
+    net = HexNet(space_for(game), game._state.board.topology, players, config)
     net.load_state_dict(torch.load(source, weights_only=False)["net"])
     return Policy9(net.eval(), space_for(game))
 
@@ -73,7 +81,7 @@ def _decider(game) -> int:
     return next(s for s, n in enumerate(game.discard_quota) if n) if game.phase is Phase.DISCARD else to_move(game)
 
 
-def positions(seed: int, count: int):
+def positions(seed: int, count: int, players: int = 4):
     """Seeded positions with every decision kind among them: random playouts
     stopped anywhere (setup turns, the snake seat's double turn, a setup road
     owed, discards, robber moves, ordinary turns), and some ordinary turns
@@ -83,7 +91,7 @@ def positions(seed: int, count: int):
     out = []
     index = 0
     while len(out) < count:
-        game = deal_game(seed, index, 4)
+        game = _deal(seed, index, players)
         index += 1
         # Six moves in, the snake seat places its first settlement: its double turn.
         for _ in range(rng.choice((0, 3, 6, 7, 12, 40, 120, 250))):
@@ -152,6 +160,46 @@ def test_the_graph_chooses_the_decision_the_torch_net_chooses(config, tmp_path):
             [(game, seat, options)])
         np.testing.assert_allclose(p1, p2, atol=1e-4)
         np.testing.assert_allclose(v1, v2, atol=1e-4)
+
+
+@pytest.mark.parametrize("contract,global_seat,width", [("9d", False, 828), ("9d.1", True, 848)])
+def test_a_two_seat_net_on_contract_9d_exports_and_plays_as_its_torch_net(tmp_path, contract, global_seat, width):
+    """A two-seat net (9d, or 9d.1 with the global head reading its own seat)
+    exports a graph that chooses, values and scores as the torch net does at
+    a two-seat table, declares its contract and seat count, and is refused at
+    a four-seat table."""
+    config = replace(PARTS, contract=contract, others=True, points=False, global_seat=global_seat)
+    source = a_checkpoint(tmp_path / "duel.pt", config, players=2)
+    out = export9(str(source), tmp_path / "duel.onnx")
+    meta = read_metadata(out.read_bytes())
+    assert meta["contract"] == contract and meta["players"] == "2" and meta["double_turn"] == "parts"
+    game = _deal(0, 0, 2)
+    topology = game._state.board.topology
+    served = load(str(out), topology).policy
+    reference = _torch_policy(source, config, players=2)
+    assert isinstance(served, DecisionPolicy) and served.players == 2 and "double_rows" not in served.inputs
+    assert served.layout.width == width
+    with pytest.raises(ValueError, match="players"):
+        spawn(str(out), game._state.board, players=4)
+    rows = positions(3, 160, players=2)
+    kinds = _kinds(rows, False, served.space)
+    # A discard is rare under the duel variant's limit of nine; the other kinds are all here.
+    assert {"setup", "road_building", "flat", "inside"} <= kinds
+    decisions = [reference.decision(g, s) for g, s in rows]
+    feed = served._feed(rows, decisions)
+    got = served._run(feed, ["decision", "value", "prior"])
+    arrays = {k: v for k, v in feed.items() if k != "observation"}
+    arrays.setdefault("double_rows", np.zeros(0, dtype=np.int64))
+    want = reference.answers(feed["observation"], arrays, topology)
+    np.testing.assert_array_equal(got["decision"], want["decision"])
+    assert got["value"].shape == (len(rows), 2)
+    for name in ("value", "prior"):
+        np.testing.assert_allclose(got[name], want[name], rtol=1e-3, atol=1e-4, err_msg=name)
+    for game, seat in rows:
+        options = tuple(options_for(game))
+        assert served.act_rows([(game, seat, options)]) == reference.act_rows([(game, seat, options)])
+        np.testing.assert_allclose(served.value_rows([(game, s) for s in range(2)]),
+                                   reference.value_rows([(game, s) for s in range(2)]), atol=1e-4)
 
 
 def _first_moves(option, seat, space) -> dict[int, float]:
@@ -280,3 +328,59 @@ def test_a_real_contract_9_checkpoint_exports_and_plays_as_its_torch_net(path, t
     for game, seat in positions(5, 300):
         options = tuple(options_for(game))
         assert served.act_rows([(game, seat, options)]) == reference.act_rows([(game, seat, options)])
+
+
+def test_a_two_seat_net_plays_a_table_dealt_four_by_its_live_seats(tmp_path):
+    """A contract-9d net at a table dealt four with seats 1 and 3 retired, the
+    table every duel is served at: it reads the two live seats, chooses legal
+    moves, and reports values in board-seat order with the retired seats at
+    zero; its exported graph chooses and values as the torch net does there."""
+    from hexset.rules import DUEL_VARIANT_GAME
+
+    config = replace(PARTS, contract="9d", others=True, points=False)
+    source = a_checkpoint(tmp_path / "duel.pt", config, players=2)
+    out = export9(str(source), tmp_path / "duel.onnx")
+    reference = _torch_policy(source, config, players=2)
+    rng = random.Random(5)
+    rows = []
+    for index in range(12):
+        game = deal_game(3, index, 4, game_type=DUEL_VARIANT_GAME, locked=(1, 3))
+        served = load(str(out), game._state.board.topology).policy
+        for _ in range(rng.choice((0, 6, 40, 120, 240))):
+            if is_over(game):
+                break
+            seat = _decider(game)
+            asking = seat if game.phase is Phase.DISCARD else None
+            apply(game, rng.choice(legal_actions(game, asking)), asking)
+        if not is_over(game):
+            rows.append((game, _decider(game)))
+    assert len(rows) >= 8
+    for game, seat in rows:
+        options = tuple(options_for(game))
+        choice = reference.act_rows([(game, seat, options)])[0]
+        assert choice in options
+        assert served.act_rows([(game, seat, options)]) == [choice]
+        for s in (0, 2):
+            value = reference.value_rows([(game, s)])[0]
+            assert len(value) == 4 and value[1] == 0.0 and value[3] == 0.0
+            assert abs(value[0] + value[2] - 1.0) < 1e-4
+            np.testing.assert_allclose(served.value_rows([(game, s)])[0], value, atol=1e-4)
+
+
+def test_a_two_seat_checkpoint_plays_whole_duels_at_a_table_dealt_four(tmp_path):
+    """`network:<file>` seats a contract-9d checkpoint at the arena's
+    four-dealt duel table, two seats retired, and every game is played out
+    and kept."""
+    import hexn.netbot  # noqa: F401  (registers the `network:` entrant kind)
+    from hexset.arena import compete, lineup_from_names
+    from hexset.game import UNSTRUCTURED_TURN_CAP
+    from hexset.rules import DUEL_VARIANT_GAME
+
+    config = replace(PARTS, contract="9d", others=True, points=False)
+    source = a_checkpoint(tmp_path / "duel.pt", config, players=2)
+    lineup = lineup_from_names([f"network:{source}!notrade", "retired", "random", "retired"])
+    result = compete(lineup, 4, seed=98000, action_cap=1500, turn_cap=UNSTRUCTURED_TURN_CAP,
+                     game_type=DUEL_VARIANT_GAME, journal=tmp_path / "duels.games.jsonl")
+    assert result.games == 4
+    assert sum(s.wins for s in result.standings) + result.unfinished == 4
+    assert len([line for line in (tmp_path / "duels.games.jsonl").read_text().splitlines() if '"kind":"game"' in line]) == 4

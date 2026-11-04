@@ -2,6 +2,69 @@
 
 All notable changes to the `hexn` package are recorded here.
 
+## 0.48.0
+
+### Added
+
+- **Contract 9d.1 and `--global-seat`.** `--contract 9d.1` trains on
+  HexSet's 9d.1 observation (9d with each seat's production and bank rates)
+  under the same two-seat rules as 9d. `ModelConfig.global_seat`
+  (`--global-seat`) has the global head, which scores bank trades, buying a
+  card, development plays and ending the turn, read the perspective's own
+  seat token beside the table token. A 9d checkpoint loads into a 9d.1 net,
+  and a checkpoint without the field into one with it: the new embedding
+  columns and the head's seat weights start at zero, so the loaded net plays
+  as before. A checkpoint or frozen config without the field reads as off;
+  the export stamps `9d.1`.
+
+- **A contract-9d net plays a table dealt four with two seats retired.**
+  `hexn.policy9.Policy9` decodes moves and reports values through the
+  table's seat frame (`hexset.decisions.frame_for`), so a two-seat net seated
+  by `network:<file>` at a four-dealt duel table reads its two live seats and
+  reports values in board-seat order, the retired seats at zero.
+
+- **Two-seat contract `9d` and opponent summaries.** Contract-9 models can
+  use the reduced two-seat observation layout with `--contract 9d --players 2`,
+  and `--others` includes separate opponent summaries in the pooled trunk.
+  Checkpoint loading, export, collection and resume retain these model settings.
+
+- **A frozen config may carry a parameter its mode removed.**
+  `hexn.run.load` drops a removed parameter from a config frozen while it
+  existed only where it had no effect, lists what it dropped in the loaded
+  manifest's `meta["retired"]`, never rewrites the file, and refuses, naming
+  the config, one in which it acted (`hexn.run.manifest.RETIRED`). Games per
+  iteration are the fixed `--games-per-iteration`; a config frozen with
+  `games_ramp` 0 loads without the `games_ramp` and `ramp_*` keys, and one
+  with it on is refused.
+
+### Changed
+
+- **`Policy9` reads positions through HexSet's position helpers.** Its
+  observations, decisions, topology and frames come from
+  `hexset.contract9.observation_row` and `hexset.decisions.decision_at`,
+  `topology_of` and `frame_for`, so a playout copy HexSet holds natively is
+  read exactly as the Python game it stands for; `Policy9.native_contract`
+  names the contract it may be held for (none for a net that chooses the
+  double turn whole).
+
+- **Parallel contract-9 collectors use native lanes where supported.**
+  Trade-free two-seat and four-seat cohorts keep their original dealing,
+  sampling, refill order and durable game format while using the optional
+  compiled engine and observation encoder. Eligible CPU BF16 workers cache
+  weight casts and trace the original forward without changing canonical
+  parameters or the configured precision; normal weight synchronization updates
+  the same buffers. Other model configurations retain their original forward.
+
+- **The fused contract-9 forward skips unused ownership aggregates.** The
+  reference trunk builds its ownership masks and normalizers only when selected;
+  the fused trunk keeps its own calculations and the same outputs and gradients.
+
+### Fixed
+
+- `noise_scale.estimate` reports no signal share where the signal estimate
+  is not positive, rather than a complex number the JSON writer refuses.
+
+
 ## 0.47.1
 
 ### Fixed

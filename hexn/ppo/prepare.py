@@ -28,6 +28,8 @@ from typing import Sequence
 
 import torch
 
+from hexset.contract9 import CONTRACTS as CONTRACTS9
+
 from ..selfplay import Episode
 from . import Batch, PPOConfig, assemble, fast_weight, observation_dtype, stakes_gauges, win_round
 
@@ -144,7 +146,7 @@ def prepare(
     Contract-9 games are assembled from their columns (`prepare_columns9`):
     they are encoded once more here (`hexn.gamefile`, exact), which only a
     collector that hands back objects -- the in-process one -- pays for."""
-    if config.contract in ("9", "9.1"):
+    if config.contract in CONTRACTS9:
         from .. import gamefile
 
         return prepare_columns9(
@@ -351,7 +353,7 @@ def prepare_columns9(columns, config: PPOConfig, players: int):
     from ..rewards import win_loss
     from . import advantages, observation_dtype, zero_sum_targets
 
-    if config.contract not in ("9", "9.1"):
+    if config.contract not in CONTRACTS9:
         raise ValueError("contract-9 columns make a contract-9 batch")
     zero_sum = config.aux_target == "zero_sum"
     chosen, kinds, log_probs, advantage_blocks, targets, margins = [], [], [], [], [], []

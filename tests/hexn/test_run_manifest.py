@@ -115,6 +115,82 @@ def test_a_complete_freeze_fills_nothing(tmp_path):
     assert "filled" not in run.load(tmp_path / "unit").meta
 
 
+def test_two_seat_model_round_trips_without_changing_the_recipe(tmp_path):
+    written = _frozen_ppo(tmp_path, "--contract", "9d", "--players", "2", "--others",
+                          "--messages", "pooled", "--no-attention")
+    read = run.load(tmp_path / "unit")
+    assert read.config == written.config
+    assert read.config["contract"] == "9d"
+    assert read.config["others"] is True
+    assert "filled" not in read.meta
+
+
+def test_older_model_settings_fill_only_their_previous_values(tmp_path):
+    _frozen_ppo(tmp_path)
+    path = _drop(tmp_path, "ppo", "others")
+    frozen = path.read_bytes()
+    read = run.load(tmp_path / "unit")
+    assert read.meta["filled"] == {"others": False}
+    assert path.read_bytes() == frozen
+
+
+RAMP = {"games_ramp": 0.0, "ramp_every": 5, "ramp_repeats": 1, "ramp_units": 0, "ramp_max_games": 0,
+        "ramp_min_games": 0, "ramp_seed": 20260909}
+
+
+def _carry(tmp_path, mode, **keys):
+    path = tmp_path / "unit" / "config" / f"{mode}.json"
+    config = json.loads(path.read_text())
+    config.update(keys)
+    path.write_text(json.dumps(config))
+    return path
+
+
+def test_a_config_frozen_with_the_games_ramp_off_loads_without_it(tmp_path):
+    """The removed ramp did nothing at `games_ramp` 0: its keys are dropped,
+    the run means what it meant, and the load says what it dropped."""
+    written = _frozen_ppo(tmp_path, "--games-per-iteration", "6")
+    path = _carry(tmp_path, "ppo", **RAMP)
+    on_disk = path.read_text()
+    read = run.load(tmp_path / "unit")
+    assert read.config == written.config
+    assert read.meta["retired"] == RAMP
+    assert "filled" not in read.meta
+    assert path.read_text() == on_disk  # the frozen file is never rewritten
+
+
+def test_a_config_frozen_before_the_ramp_existed_loads_as_before(tmp_path):
+    """No ramp key at all: nothing is dropped."""
+    written = _frozen_ppo(tmp_path)
+    read = run.load(tmp_path / "unit")
+    assert read.config == written.config
+    assert "retired" not in read.meta
+
+
+def test_ramp_settings_without_games_ramp_count_as_the_ramp_off(tmp_path):
+    _frozen_ppo(tmp_path)
+    _carry(tmp_path, "ppo", ramp_min_games=3, ramp_max_games=8)
+    assert run.load(tmp_path / "unit").meta["retired"] == {"ramp_min_games": 3, "ramp_max_games": 8}
+
+
+def test_a_config_frozen_with_the_games_ramp_on_is_refused(tmp_path):
+    """No setting of today's parser sizes games from a noise reading, so the
+    run is refused, naming its config, rather than run at fixed games."""
+    _frozen_ppo(tmp_path)
+    path = _carry(tmp_path, "ppo", **{**RAMP, "games_ramp": 2.0})
+    with pytest.raises(SystemExit, match="games_ramp=2.0") as refused:
+        run.load(tmp_path / "unit")
+    assert str(path) in str(refused.value)
+
+
+@pytest.mark.parametrize("mode", sorted(run.manifest.RETIRED))
+def test_no_retired_parameter_is_a_live_one(mode):
+    live = run.parameters(mode)
+    for retired in run.manifest.RETIRED[mode]:
+        assert not set(retired.keys) & live, f"{mode} still defines {set(retired.keys) & live}"
+        assert retired.guard in retired.keys or retired.guard in live
+
+
 def test_a_parameter_without_an_old_behaviour_value_is_still_refused(tmp_path):
     """`init` has no fill: it predates the current warm start."""
     _frozen_ppo(tmp_path)

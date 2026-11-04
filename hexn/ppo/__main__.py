@@ -48,6 +48,7 @@ from typing import Sequence
 import torch
 
 from hexset.board.board import BOARD_MODES, random_base_board
+from hexset.contract9 import CONTRACTS as CONTRACTS9
 from .. import durable, runtime
 from ..collect import (
     ParallelCollector,
@@ -174,7 +175,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--rules-mix", default="",
                         help="JSON specification for hexset.gym.distribution.Distribution; "
-                        "contract 9.1 self-play only, frozen in the run manifest")
+                        "contract 9.1, 9d or 9d.1 self-play only (9d and 9d.1 deal every game to two seats), frozen in the run manifest")
     parser.add_argument("--board-mode", choices=sorted(BOARD_MODES), default="random",
                         help="how every self-play game's board is dealt (hexset.board.board.BOARD_MODES); "
                         "a --rules-mix names its own")
@@ -572,13 +573,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     rules_mix = getattr(args, "rules_mix", "")
     if rules_mix:
-        if args.contract != "9.1" or args.mix:
-            parser.error("--rules-mix requires --contract 9.1 and an empty --mix (self-play)")
+        if args.contract not in ("9.1", "9d", "9d.1") or args.mix:
+            parser.error("--rules-mix requires --contract 9.1, 9d or 9d.1 and an empty --mix (self-play)")
         from hexset.gym.distribution import Distribution
         try:
             Distribution(rules_mix, args.players, args.seed)
         except (ValueError, TypeError, KeyError) as exc:
             parser.error(f"invalid --rules-mix: {exc}")
+    if args.contract in ("9d", "9d.1") and args.players != 2:
+        parser.error(f"--contract {args.contract} is the two-seat observation: it trains with --players 2")
     if getattr(args, "board_mode", "random") != "random" and rules_mix:
         parser.error("--board-mode cannot be combined with --rules-mix, which deals its own boards")
     runtime.load(getattr(args, "runtime", None))
@@ -622,7 +625,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "kill in any other iteration still goes back to latest.pt",
             file=sys.stderr,
         )
-    if args.contract in ("9", "9.1"):
+    if args.contract in CONTRACTS9:
         # What a contract-9 run is not built for: the ladder plays contract-8
         # nets (reads go through `network:<.pt>` instead), and the sharded
         # update, a parent and the network trader read contract 8's rows.
@@ -747,7 +750,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         # the rounds a supervised trunk was trained with, say -- fails here,
         # loudly, rather than training a half-initialised net.
         seed_state = torch.load(args.init, map_location=args.device, weights_only=False)
-        if config.contract in ("9", "9.1") and policy.net.config.double_turn == "parts":
+        if config.contract in CONTRACTS9 and policy.net.config.double_turn == "parts":
             # A contract-9 BC checkpoint carries the joint double-turn heads;
             # this net plays the snake seat a setup turn at a time and has none.
             from ..model9 import without_joint_head
@@ -758,7 +761,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         grafted = config.fast_win and not any(
             key.startswith("fast_win.") for key in seed_state["net"]
         )
-        fresh_points = (config.contract in ("9", "9.1") and policy.net.points_head is not None
+        fresh_points = (config.contract in CONTRACTS9 and policy.net.points_head is not None
                         and not any(key.startswith("points_head.") for key in seed_state["net"]))
         if fresh_points:
             # A contract-9 checkpoint trained without the points head: every
@@ -907,7 +910,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     trunk=args.collect_trunk,
                     precision=args.collect_precision,
                     contract=str(getattr(args, "contract", "8")),
-                    net9=tuple(net9_config(args).items()) if config.contract in ("9", "9.1") else (),
+                    net9=tuple(net9_config(args).items()) if config.contract in CONTRACTS9 else (),
                     discard_order=getattr(args, "discard_order", "seat"),
                     rules_mix=rules_mix,
                     board_mode=getattr(args, "board_mode", "random"),
@@ -1061,7 +1064,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 games.clear()
                 return got
             print(f"helper: {got}; decoding cohort {cohort} here", flush=True)
-        if config.contract in ("9", "9.1"):
+        if config.contract in CONTRACTS9:
             return assembled_here(games, cohort)
         return by_index(collector.decode(games))
 
@@ -1093,7 +1096,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 # The workers act with last iteration's weights until this lands,
                 # so the sync is inside the loop and before the collect, always.
                 collector.sync(policy.net)
-            if config.contract in ("9", "9.1") and isinstance(collector, ParallelCollector):
+            if config.contract in CONTRACTS9 and isinstance(collector, ParallelCollector):
                 collector.start_collect(args.games_per_iteration, partial=durable.partial(collecting, iteration))
                 episodes = assembled_here(collector.receive(), iteration)
             else:

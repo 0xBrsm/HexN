@@ -98,7 +98,7 @@ SAMPLE_STREAMS = ("worker", "game")
 # `contract`): "8" encodes `hexset.encoding` and asks for one atomic action a
 # decision; "9" encodes `hexset.contract9` and asks the learner for whole
 # decisions (`hexset.decisions`, `hexset.gym.lanes.LaneEnv`'s `decisions`).
-CONTRACTS = ("8", "9", "9.1")
+CONTRACTS = ("8", *contract9.CONTRACTS)
 
 _MASK64 = (1 << 64) - 1
 _GOLDEN64 = 0x9E3779B97F4A7C15
@@ -667,7 +667,7 @@ class Collector:
             raise ValueError(f"sample_stream must be one of {SAMPLE_STREAMS}, got {sample_stream!r}")
         if contract not in CONTRACTS:
             raise ValueError(f"contract must be one of {CONTRACTS}, got {contract!r}")
-        if contract in ("9", "9.1"):
+        if contract in contract9.CONTRACTS:
             if any(not isinstance(o, BoardBots) for o in opponents) or tuple(learners) != (0,):
                 raise ValueError("a contract-9 collector seats scripted bots beside its one learner; "
                                  "another network would be asked a move at a time")
@@ -847,7 +847,7 @@ class Collector:
             # cohort this should be switched off for.
             discard_order=self.discard_order,
             board_mode=self.board_mode,
-            decisions=(0,) if self.contract in ("9", "9.1") else (),
+            decisions=(0,) if self.contract in contract9.CONTRACTS else (),
             **extra,
         )
 
@@ -863,7 +863,7 @@ class Collector:
         if not asked:
             # Every seat this tick is played by a bot inside the environment.
             return []
-        if self.contract in ("9", "9.1"):
+        if self.contract in contract9.CONTRACTS:
             return self._requests9(asked)
         observations = self._encode8(asked)
         keyed = self.sample_stream == "game"

@@ -26,6 +26,8 @@ manifest, and a manifest written before that flag existed fails loudly instead
 of picking up a new default. The one exception is `ADDED`: a flag whose
 old-behaviour value is known is filled with *that* value, never today's
 default, and the fill is listed in the loaded manifest's `meta["filled"]`.
+Its mirror is `RETIRED`: a removed flag is dropped from a config where it did
+nothing, listed in `meta["retired"]`, and refused where it acted.
 
 The parameter set is read from the mode's own `build_parser()` rather than
 duplicated here, so this module cannot drift from the trainers it freezes.
@@ -118,6 +120,8 @@ ADDED: dict[str, dict[str, Any]] = {
         "messages": "separate",
         "attention": True,
         "points_head": False,
+        "others": False,
+        "global_seat": False,
         "discard_order": "seat",
         "zero_sum": 0.6,
         "c9_clip": "per-decision",
@@ -143,6 +147,57 @@ ADDED: dict[str, dict[str, Any]] = {
 UNFILLABLE: dict[str, dict[str, tuple[str, Any]]] = {
     "ppo": {"c9_clip": ("contract", "9")},
 }
+
+
+@dataclass(frozen=True)
+class Retired:
+    """Parameters a mode removed together, and when a config carrying them
+    still means what it meant: only where `guard` held `inert` (or the config
+    predates `guard`), so the removed parameters did nothing in that run."""
+
+    keys: tuple[str, ...]
+    guard: str
+    inert: Any
+    why: str
+
+
+# Parameters a mode no longer has. `load` drops them from a config frozen
+# while they existed only where they had no effect (the `Retired` guard),
+# never rewrites the file, and lists what it dropped in
+# `Manifest.meta["retired"]`. A config where they did act is refused: no
+# setting of today's parser reproduces it, and a frozen run must not quietly
+# change meaning.
+RETIRED: dict[str, tuple[Retired, ...]] = {
+    "ppo": (
+        Retired(
+            keys=("games_ramp", "ramp_every", "ramp_repeats", "ramp_units", "ramp_max_games",
+                  "ramp_min_games", "ramp_seed"),
+            guard="games_ramp",
+            inert=0.0,
+            why="the games ramp, which sized each iteration's games from a noise-scale reading, was removed; "
+            "every iteration now plays --games-per-iteration",
+        ),
+    ),
+}
+
+
+def _drop_retired(mode: str, config: dict[str, Any], expected: set[str], path: Path) -> tuple[dict, dict]:
+    """`config` without the parameters `mode` retired, and what was dropped;
+    refuses a config in which they were in effect."""
+    dropped: dict[str, Any] = {}
+    for retired in RETIRED.get(mode, ()):
+        present = [key for key in retired.keys if key in config and key not in expected]
+        if not present:
+            continue
+        value = config.get(retired.guard, retired.inert)
+        if value != retired.inert:
+            raise SystemExit(
+                f"{path} has {retired.guard}={value!r}: {retired.why}. No setting of this build's {mode} "
+                f"parser reproduces what that run meant, so it is refused rather than run as something "
+                f"else. Freeze a new run with `hexn.run.init` to continue its line."
+            )
+        dropped.update({key: config[key] for key in present})
+    return {key: value for key, value in config.items() if key not in dropped}, dropped
 
 
 def _parser_for(mode: str) -> argparse.ArgumentParser:
@@ -402,6 +457,7 @@ def load(directory: str | Path) -> Manifest:
     config = json.loads((directory / relative).read_text())
 
     expected = parameters(mode)
+    config, retired = _drop_retired(mode, config, expected, directory / relative)
     got = set(config)
     filled = {
         key: copy.deepcopy(value)  # a list fill must not be the table's own
@@ -427,6 +483,8 @@ def load(directory: str | Path) -> Manifest:
             f"{directory / relative} carries {sorted(extra)}, which this build's "
             f"{mode} parser does not define. The flags were removed or renamed."
         )
+    if retired:
+        meta = {**meta, "retired": retired}
     if filled:
         config = {**config, **filled}
         meta = {**meta, "filled": filled}

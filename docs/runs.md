@@ -42,6 +42,22 @@ reference trunk for a manifest created before the collect-trunk flag existed.
 Checkpoint decisions batch all positions needing a forward automatically;
 single-position callers use the same implementation with one row.
 
+Parallel contract-9 workers select native game lanes automatically when the
+optional HexSet extension is installed. This covers trade-free self-play
+cohorts with two or four seats, per-game sampling and part-wise double turns.
+The existing collector still deals each game and controls lane counts,
+grouping, refill order, seeds and resume indices. Every completion goes through
+the same durable game sink before its native lane retires. Other configurations
+use the ordinary collector; a started native game never switches engines.
+
+CPU BF16 workers also cache weight casts and lazily trace their original
+forward on its first actual input. The manifest's precision stays in force,
+and regular weight synchronization refreshes the cache without changing
+checkpoint parameters. This runs inside collect worker processes, leaving
+the learner's execution settings alone. See [inference.md](inference.md) for
+the inference lifecycle. HexSet documents extension installation and state
+ownership in its native lane API guide.
+
 ```bash
 python -m hexn.run.init --mode ppo --name my-run \
     --description "what this run is for" \

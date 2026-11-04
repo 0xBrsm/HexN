@@ -50,6 +50,7 @@ from hexset.clients.netbot import (
     searcher_for,
 )
 from hexset.encoding import static_graph
+from hexset.contract9 import CONTRACTS as CONTRACTS9
 from .model import HexNet, config_from_args, packing
 from .policy import NetworkPolicy
 from .trade import recorded_budget, trade_params as _trade_params
@@ -109,7 +110,7 @@ def load(
     state = torch.load(path, map_location=device, weights_only=False)
     args = state.get("args", {})
     players = int(args.get("players", 4))
-    if str(args.get("contract", "")) in ("9", "9.1"):
+    if str(args.get("contract", "")) in CONTRACTS9:
         return _load9(state, args, topology, players, device)
     # The head shapes read the same way width and rounds do, and default to the
     # shape every checkpoint written before they existed was trained with. A

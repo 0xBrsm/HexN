@@ -70,6 +70,7 @@ from hexset.encoding import Observation, static_graph
 from hexset.casting import alternating  # noqa: F401
 from hexset.casting import league_rotation, paired
 from hexset.gym.lanes import BoardBots
+from hexset.contract9 import CONTRACTS as CONTRACTS9
 from . import runtime
 from . import gamefile
 from .durable import Partial, write_atomic
@@ -1105,7 +1106,7 @@ def _build(spec: WorkerSpec) -> tuple[list[NetworkPolicy], Collector]:
     runtime.load(spec.runtime)
     if spec.trunk not in TRUNKS:
         raise ValueError(f"trunk must be one of {TRUNKS}, got {spec.trunk!r}")
-    if spec.contract in ("9", "9.1"):
+    if spec.contract in CONTRACTS9:
         return _build9(spec)
 
     board = random_base_board(random.Random(spec.seed))
@@ -1326,9 +1327,17 @@ def _serve(spec: WorkerSpec, connection, beat=None) -> None:
     def stamp() -> None:
         beat.value = time.time()
 
+    acceleration = None
     try:
         policies, collector = _build(spec)
         policy = policies[0]
+        if spec.contract in CONTRACTS9:
+            from .inference9 import WorkerInference
+            from .native_collect import NativeWorkerCollector, supported
+
+            acceleration = WorkerInference(policy)
+            if spec.cohort and supported(collector):
+                collector = NativeWorkerCollector(collector)
         if beat is not None:
             collector.beat = stamp
         while True:
@@ -1386,6 +1395,9 @@ def _serve(spec: WorkerSpec, connection, beat=None) -> None:
             connection.send(("error", traceback.format_exc()))
         except Exception:
             pass
+    finally:
+        if acceleration is not None:
+            acceleration.close()
 
 
 class ParallelCollector:

@@ -219,13 +219,16 @@ def test_pooled_messages_read_every_seat_with_the_same_weights_and_train():
     assert losses[-1] < 0.75 * losses[0]
 
 
-@pytest.mark.parametrize("messages,attention", [("separate", True), ("pooled", True), ("separate", False), ("pooled", False)])
-def test_the_fused_trunk_computes_the_reference(messages, attention):
+@pytest.mark.parametrize("messages,attention,others", [
+    ("separate", True, False), ("pooled", True, False), ("separate", False, False), ("pooled", False, False),
+    ("pooled", False, True), ("separate", False, True), ("pooled", True, True),
+])
+def test_the_fused_trunk_computes_the_reference(messages, attention, others):
     from hexn.model9 import ModelConfig
 
     rows, game = _positions(count=24, seed=5)
     torch.manual_seed(6)
-    config = ModelConfig(heads="linear", messages=messages, attention=attention)
+    config = ModelConfig(heads="linear", messages=messages, attention=attention, others=others)
     net = HexNet(space_for(game), game._state.board.topology, 4, config).eval()
     for p in net.parameters():                       # off its zero start, so every path carries signal
         p.data.add_(0.05 * torch.randn_like(p))
@@ -248,6 +251,94 @@ def test_dropping_attention_removes_its_parameters():
                                              ModelConfig(heads="linear", messages="pooled", **kw)).parameters())
     assert size() - size(attention=False) == 3 * (3 * 64 * 64 + 3 * 64 + 64 * 64)   # query, key, value; one seat input
     assert config_of({"width": 64, "rounds": 3}).attention is True
+    # The others read is one more seat input a round and nothing else; off unless a checkpoint says so.
+    assert size(attention=False, others=True) - size(attention=False) == 3 * 64 * 64
+    assert config_of({"width": 64, "rounds": 3}).others is False
+
+
+def _duel_positions(count=40, seed=0, contract="9d"):
+    """Positions from random play at a two-seat duel-variant table, encoded in a two-seat contract."""
+    from hexset.rules import DUEL_VARIANT_GAME
+
+    rng = random.Random(seed)
+    game = start(random_base_board(random.Random(seed)), 2, random.Random(seed), game_type=DUEL_VARIANT_GAME)
+    out = []
+    while not is_over(game) and len(out) < count:
+        seat = players_owing_discards(game)[0] if game.phase is Phase.DISCARD else to_move(game)
+        choice = rng.choice(D.options(game, seat))
+        out.append(contract9.flatten(contract9.encode9(game, seat, contract)))
+        D.apply_option(game, choice, seat if game.phase is Phase.DISCARD else None)
+    return out, game
+
+
+def test_a_two_seat_net_reads_its_opponents_token_directly():
+    """On contract 9d at two seats the others read is the one opponent's
+    normalised token, and both trunks compute it alike."""
+    from hexset.rules import DUEL_VARIANT_GAME
+    from hexn.model9 import ModelConfig, _others
+
+    rows, game = _duel_positions()
+    torch.manual_seed(2)
+    config = ModelConfig(heads="linear", messages="pooled", attention=False, others=True, contract="9d")
+    net = HexNet(space_for(game), game._state.board.topology, 2, config).eval()
+    for p in net.parameters():
+        p.data.add_(0.05 * torch.randn_like(p))
+    assert net.embed_hex.in_features == 8 and net.embed_seat.in_features == 22 and net.embed_table.in_features == 20
+    inputs = unpack9(contract9.layout(2, 19, 54, 72, "9d"), torch.from_numpy(np.stack(rows)))
+    with torch.no_grad():
+        sn = net.rounds[0].norm_seat(net.embed_seat(inputs["seats"]))
+        read = _others(sn, 1, 2)
+        torch.testing.assert_close(read[:, 0], sn[:, 1], atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(read[:, 1], sn[:, 0], atol=1e-5, rtol=1e-5)
+        net.fused = False
+        reference = net(**inputs)
+        net.fused = True
+        fused = net(**inputs)
+    for name in ("value_logits", "logits", "road", "vertices", "seats", "hexes", "table"):
+        torch.testing.assert_close(getattr(fused, name), getattr(reference, name), atol=2e-4, rtol=2e-4, msg=name)
+    assert fused.value.shape == (len(rows), 2) and torch.allclose(fused.value.sum(-1), torch.ones(len(rows)))
+
+
+def test_a_9d_net_loads_into_9d1_with_the_seat_read_global_head_and_plays_as_before():
+    """A 9d checkpoint loads into a 9d.1 net whose global head also reads the
+    perspective's own seat token: the economy columns' embedding and the
+    global head's seat weights start at zero, so on the same positions every
+    output is the 9d net's, fused and reference alike. Once those weights
+    move, the global logits read the seat token and the economy columns."""
+    from dataclasses import replace
+
+    from hexn.model9 import ModelConfig, config_of
+
+    rows9d, game = _duel_positions(contract="9d")
+    rows, _ = _duel_positions(contract="9d.1")
+    torch.manual_seed(3)
+    old = ModelConfig(heads="linear", messages="pooled", attention=False, others=True, contract="9d")
+    source = HexNet(space_for(game), game._state.board.topology, 2, old).eval()
+    for p in source.parameters():
+        p.data.add_(0.05 * torch.randn_like(p))
+    config = replace(old, contract="9d.1", global_seat=True)
+    net = HexNet(space_for(game), game._state.board.topology, 2, config).eval()
+    net.load_state_dict(source.state_dict())
+    width = config.width
+    assert net.embed_seat.in_features == 32 and net.global_head.in_features == 2 * width
+    assert config_of({"width": 64, "rounds": 3}).global_seat is False
+    before = unpack9(contract9.layout(2, 19, 54, 72, "9d"), torch.from_numpy(np.stack(rows9d)))
+    inputs = unpack9(contract9.layout(2, 19, 54, 72, "9d.1"), torch.from_numpy(np.stack(rows)))
+    assert (inputs["seats"][..., 22:] != 0).any()
+    with torch.no_grad():
+        want = source(**before)
+        for fused in (False, True):
+            net.fused = fused
+            got = net(**inputs)
+            for name in ("value_logits", "logits", "road", "vertices", "seats", "hexes", "table"):
+                torch.testing.assert_close(getattr(got, name), getattr(want, name), atol=2e-4, rtol=2e-4,
+                                           msg=f"{name} fused={fused}")
+        slots = net.slot_global
+        net.global_head.weight[:, width:].normal_(0, 0.5)
+        moved = net(**inputs).logits[:, slots]
+        assert not torch.allclose(moved, want.logits[:, slots], atol=1e-3)
+        net.embed_seat.weight[:, 22:].normal_(0, 0.5)
+        assert not torch.allclose(net(**inputs).logits[:, slots], moved, atol=1e-3)
 
 
 def test_the_board_heads_read_the_trunk_with_nothing_added():

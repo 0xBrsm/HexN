@@ -40,6 +40,7 @@ from hexset.encoding import static_graph
 from hexset.game import start
 from hexset.gym.lanes import BoardBots
 from hexset.trading import UNLIMITED, TradeParams
+from hexset.contract9 import CONTRACTS as CONTRACTS9
 from .model import POLICY_HEADS, VALUE_HEADS, HexNet, ModelConfig, packing
 from .policy import NetworkPolicy
 from .optim import adam
@@ -469,10 +470,11 @@ def add_net9_flags(parser: argparse.ArgumentParser) -> None:
     `net9_config` reads them by. Inert under contract 8."""
     parser.add_argument(
         "--contract",
-        choices=("8", "9", "9.1"),
+        choices=("8", "9", "9.1", "9d", "9d.1"),
         default="8",
         help="the network contract: 8, hexn.model.HexNet on hexset.encoding and one action a decision; 9, "
-        "hexn.model9.HexNet on hexset.contract9, asked for whole decisions (hexset.decisions)",
+        "hexn.model9.HexNet on hexset.contract9, asked for whole decisions (hexset.decisions); 9.1 observes "
+        "the table's rules; 9d is the two-seat observation (--players 2), 9d.1 adds each seat's production and bank rates",
     )
     parser.add_argument("--heads", choices=("linear", "mlp"), default="linear",
                         help="contract 9: every head one linear layer, or each with a hidden layer")
@@ -487,6 +489,12 @@ def add_net9_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--points-head", action=argparse.BooleanOptionalAction, default=False,
                         help="contract 9: the points head beside the win head (trained under "
                         "--aux-target zero_sum at --aux-margin-weight)")
+    parser.add_argument("--others", action=argparse.BooleanOptionalAction, default=False,
+                        help="contract 9: the seat update reads the other seats' mean token directly "
+                        "(at two seats, the opponent's), beside or instead of --attention")
+    parser.add_argument("--global-seat", action=argparse.BooleanOptionalAction, default=False,
+                        help="contract 9: the global head (bank trades, buying a card, development plays, "
+                        "ending the turn) reads the perspective's own seat token beside the table's")
 
 
 def net9_config(args) -> dict:
@@ -496,15 +504,16 @@ def net9_config(args) -> dict:
     the same way by `hexn.netbot.load`."""
     return {"contract": str(getattr(args, "contract", "9")), "heads": args.heads,
             "discard": args.discard_head, "norm": bool(args.norm),
-            "messages": args.messages, "attention": bool(args.attention), "points": bool(args.points_head),
-            "double_turn": "parts"}
+            "messages": args.messages, "attention": bool(args.attention), "others": bool(getattr(args, "others", False)),
+            "global_seat": bool(getattr(args, "global_seat", False)),
+            "points": bool(args.points_head), "double_turn": "parts"}
 
 
 def model_record(policy) -> dict:
     """What a checkpoint carries beside `args` for `hexn.netbot.load` to
     rebuild its net: a contract-9 net's `model_config`, nothing for contract 8
     (whose shape `args` records)."""
-    if getattr(policy.net, "CONTRACT", "8") not in ("9", "9.1"):
+    if getattr(policy.net, "CONTRACT", "8") not in CONTRACTS9:
         return {}
     from dataclasses import asdict
 
@@ -529,7 +538,7 @@ def build(args) -> tuple[NetworkPolicy, torch.optim.Optimizer, object]:
     game = start(board, args.players, rng)
     space = space_for(game)
     graph = static_graph(board.topology)
-    if str(getattr(args, "contract", "8")) in ("9", "9.1"):
+    if str(getattr(args, "contract", "8")) in CONTRACTS9:
         from .model9 import HexNet as HexNet9, ModelConfig as ModelConfig9
         from .policy9 import NetworkPolicy9
 
