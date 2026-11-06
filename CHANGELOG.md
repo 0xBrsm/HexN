@@ -2,6 +2,15 @@
 
 All notable changes to the `hexn` package are recorded here.
 
+## 0.49.4
+
+### Fixed
+
+- **`hexn.benchmarks.expert_scale` runs.** It called `expert_cost.measure`
+  without the `keep` argument, so it raised a `TypeError` before measuring.
+  It now takes `--games-dir` like the other benchmarks and keeps each
+  worker's games in `workers-<count>/worker-<index>`.
+
 ## 0.49.3
 
 ### Fixed

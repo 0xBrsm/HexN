@@ -5,6 +5,9 @@ Each worker owns its network and collector, warms compilation independently,
 then waits at one barrier. The reported wall rate therefore measures steady
 collection under real CPU/cache contention without billing staggered compiler
 startup to whichever worker happened to become ready first.
+
+Every game a worker finishes is kept under `--games-dir`, in
+`workers-<count>/worker-<index>`.
 """
 
 from __future__ import annotations
@@ -14,6 +17,8 @@ import json
 import multiprocessing as mp
 import sys
 
+from ..durable import Partial
+from . import add_games_dir, games_kept
 from .expert_cost import measure
 from hexset import seeds
 from hexset.bench.throughput import environment
@@ -38,10 +43,13 @@ def main() -> int:
     parser.add_argument("--compile", dest="compile_mode", default="default")
     parser.add_argument("--actions-per-game", type=int, default=950)
     parser.add_argument("--json", action="store_true")
+    add_games_dir(parser)
     args = parser.parse_args()
     # The seed policy (it plays games the way training does): hexset.seeds.
     seeds.hold(args, args.players, use="rl")
 
+    # One directory for the run, resolved here so every worker writes under it.
+    kept = games_kept(args.games_dir, "expert_scale", "")
     context = mp.get_context("spawn")
     points = []
     for workers in args.workers:
@@ -62,6 +70,7 @@ def main() -> int:
                 inference_batch=None,
                 max_offers=None,
                 actions_per_game=args.actions_per_game,
+                keep=Partial(kept.directory / f"workers-{workers}" / f"worker-{worker}"),
             )
             process = context.Process(target=_measure, args=(queue, barrier, kwargs))
             process.start()
