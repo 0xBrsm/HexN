@@ -286,7 +286,7 @@ def mix_opponents(
     """The `--mix` names as lane opponents, in caster id order.
 
     Id `k + 1` is `mix[k]` — the contract `mixed_caster` casts against and
-    `Collector._answers` dispatches on — so this list's order is load-bearing.
+    the driver dispatches on (`Collector._seats`) — so this list's order is load-bearing.
 
     Reserved names resolve as they always have (see `RESERVED_MIX`). A bare
     `network:<path>` (no `@trades` override) is an RL-only pool member with
@@ -1333,11 +1333,10 @@ def _serve(spec: WorkerSpec, connection, beat=None) -> None:
         policy = policies[0]
         if spec.contract in CONTRACTS9:
             from .inference9 import WorkerInference
-            from .native_collect import NativeWorkerCollector, supported
 
+            # The collector plays its cohorts on native lanes where it can
+            # (`hexn.selfplay.Collector._native_ready`).
             acceleration = WorkerInference(policy)
-            if spec.cohort and supported(collector):
-                collector = NativeWorkerCollector(collector)
         if beat is not None:
             collector.beat = stamp
         while True:

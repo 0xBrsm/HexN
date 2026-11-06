@@ -756,6 +756,10 @@ def test_without_a_store_a_resumed_iteration_plays_only_its_missing_games(
     rows = [row for row in durable.read_lines(run / "log.jsonl") if "kl_to_start" in row]
     assert [row["iteration"] for row in rows] == [0, 1, 2]
     assert rows[1]["positions"] > 0 and "agreement_end" in rows[1]
+    # Iteration 1's held games count once, in its resumed row, and the total
+    # carries over the restart.
+    assert [row["games"] for row in rows] == [2, 2, 2]
+    assert [row["games_total"] for row in rows] == [2, 4, 6]
     assert not durable.partials(run / "partial"), "every checkpointed iteration's games pruned"
 
 

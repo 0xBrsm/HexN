@@ -1,4 +1,6 @@
-"""Native worker selection, complete bytes, refill and listed resume."""
+"""Native lane selection, complete bytes, refill and listed resume.
+
+The reference is the same collector on Python lanes (`_native_ready` off)."""
 from dataclasses import replace
 
 import pytest
@@ -9,7 +11,20 @@ from hexset.gym.native import available
 from hexn.collect import WorkerSpec, _Keep, _build, _serve
 from hexn.durable import Partial
 from hexn.inference9 import WorkerInference
-from hexn.native_collect import NativeWorkerCollector, supported
+from hexn.selfplay import Collector
+
+
+def supported(collector):
+    return collector._native_ready()
+
+
+def python_lanes(collector):
+    collector._native_ready = lambda: False
+    return collector
+
+
+def lanes_of(collector):
+    return collector._driver.lanes
 
 
 def specification(players=4, precision="fp32"):
@@ -32,12 +47,12 @@ def game_bytes(directory):
 
 
 def test_native_selection_preserves_unsupported_worker_modes(monkeypatch):
-    import hexn.native_collect as module
+    import hexset.gym.native as gym
 
     _, collector = _build(specification())
-    monkeypatch.setattr(module, "available", lambda: False)
+    monkeypatch.setattr(gym, "available", lambda: False)
     assert not supported(collector)
-    monkeypatch.setattr(module, "available", lambda: True)
+    monkeypatch.setattr(gym, "available", lambda: True)
     assert supported(collector)
     for name, value in (("sample_stream", "worker"), ("max_offers", 1), ("marks", True),
                         ("outlook", True), ("trader", "a trader"), ("caster", lambda i: (0,) * 4)):
@@ -62,8 +77,8 @@ def test_native_selection_requires_the_complete_batch_extension(monkeypatch):
 def test_native_complete_cohorts_refill_refresh_and_keep_exact_files(tmp_path, players, precision):
     spec = replace(specification(players, precision), first_game=5, stride=3)
     original_policies, original = _build(spec)
-    native_policies, factory = _build(spec)
-    native = NativeWorkerCollector(factory)
+    python_lanes(original)
+    native_policies, native = _build(spec)
     inference = WorkerInference(native_policies[0])
     try:
         compare_cohorts(tmp_path, original_policies, original, native_policies, native)
@@ -87,6 +102,7 @@ def compare_cohorts(tmp_path, original_policies, original, native_policies, nati
         prepare(native, b, plan)
         original.cohort(count)
         native.cohort(count)
+        assert lanes_of(original) == "python" and lanes_of(native) == "native"
         assert game_bytes(a) == game_bytes(b)
         assert set(game_bytes(a)) == set(plan)
         assert native.games_started() == original.games_started()
@@ -103,10 +119,10 @@ def test_native_listed_resume_keeps_prefix_and_original_group_shapes(tmp_path, p
     prefix.cohort(1)
     first = game_bytes(prefix_dir)[5]
     _, original = _build(spec)
-    _, factory = _build(spec)
-    native = NativeWorkerCollector(factory)
+    python_lanes(original)
+    _, native = _build(spec)
     a, b = tmp_path/"original", tmp_path/"native"
-    inference = WorkerInference(factory._batched[0])
+    inference = WorkerInference(native._batched[0])
     try:
         for collector, directory in ((original, a), (native, b)):
             partial = prepare(collector, directory, [5, 8, 17, 29])
@@ -121,27 +137,27 @@ def test_native_listed_resume_keeps_prefix_and_original_group_shapes(tmp_path, p
 
 
 @pytest.mark.skipif(not available(), reason="optional native extension")
-def test_native_refuses_play_without_a_durable_parent_plan(tmp_path):
-    _, factory = _build(specification())
-    native = NativeWorkerCollector(factory)
-    with pytest.raises(ValueError, match="durable"):
+def test_native_lanes_check_games_against_the_parent_plan(tmp_path):
+    _, native = _build(specification())
+    with pytest.raises(RuntimeError, match="keeps every game"):
         native.cohort(1)
-    native.sink = _Keep(Partial(tmp_path/"no-plan"))
+    partial = prepare(native, tmp_path/"other-plan", [7])
     with pytest.raises(ValueError, match="plan"):
         native.cohort(1)
+    assert partial.finished() == []
 
 
 @pytest.mark.skipif(not available(), reason="optional native extension")
 def test_worker_exits_after_a_sink_fails_following_its_durable_write(tmp_path, monkeypatch):
     import hexn.collect as collect
-    import hexn.native_collect as module
 
     selected = []
 
-    class SelectedNative(NativeWorkerCollector):
-        def __init__(self, original):
-            super().__init__(original)
-            selected.append(self)
+    class SelectedNative(Collector):
+        def _drive(self, env, **kwargs):
+            driver = super()._drive(env, **kwargs)
+            selected.append(driver.lanes)
+            return driver
 
     class FailedRetention(_Keep):
         def __call__(self, episode):
@@ -159,13 +175,13 @@ def test_worker_exits_after_a_sink_fails_following_its_durable_write(tmp_path, m
         def send(self, answer):
             self.sent.append(answer)
 
-    monkeypatch.setattr(module, "NativeWorkerCollector", SelectedNative)
+    monkeypatch.setattr(collect, "Collector", SelectedNative)
     monkeypatch.setattr(collect, "_Keep", FailedRetention)
     partial = Partial(tmp_path / "kept")
     partial.write_plan([5])
     connection = Connection(partial)
     _serve(replace(specification(), first_game=5, lanes=1), connection)
-    assert len(selected) == 1
+    assert selected == ["native"]
     assert connection.commands == [("counter", None)]
     assert len(connection.sent) == 1 and connection.sent[0][0] == "error"
     assert "failure after durable retention" in connection.sent[0][1]

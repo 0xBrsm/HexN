@@ -66,6 +66,7 @@ from ..collect import (
     rung_opponent,
 )
 from ..loop import (
+    GameCount,
     add_head_flags,
     add_net9_flags,
     model_record,
@@ -720,6 +721,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     collecting = directory / "partial"
 
     start_iteration = 0
+    counted = GameCount()
     first_game = 0
     if args.resume and not latest.exists() and not args.init:
         # `--resume` with nothing to resume used to fall through and start from
@@ -799,6 +801,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             {
                 "iteration": 0,
                 "games_started": 0,
+                "games_played": 0,
                 "net": policy.net.state_dict(),
                 "optimiser": optimiser.state_dict(),
                 "torch_rng": torch.get_rng_state(),
@@ -830,6 +833,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             group["eps"] = args.adam_eps
         start_iteration = state["iteration"]
         first_game = state["games_started"]
+        counted = GameCount(total=state.get("games_played"))
         # `map_location` moved everything in the checkpoint to the training
         # device, but the RNG state must be a *CPU* ByteTensor — on a cuda
         # resume this line is the difference between restoring and crashing.
@@ -1105,7 +1109,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                     partial=durable.partial(collecting, iteration),
                 ))
             collected = time.perf_counter() - started
-        played = collector.games
 
         started = time.perf_counter()
         if isinstance(episodes, Prepared):
@@ -1195,6 +1198,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             prefetched = None
 
+        played = len(episodes)
+        played_total = counted.add(played)
         progress = summarise(
             episodes,
             iteration,
@@ -1203,6 +1208,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             updated,
             played,
             assemble_seconds=assembled,
+            games_total=played_total,
         )
         record = {
             **asdict(progress),
@@ -1271,6 +1277,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     if next_collect_started is not None
                     else collector.games_started()
                 ),
+                "games_played": played_total,
                 "net": policy.net.state_dict(),
                 "optimiser": optimiser.state_dict(),
                 "torch_rng": torch.get_rng_state(),

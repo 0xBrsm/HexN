@@ -41,6 +41,15 @@ with), and `prior`.
   alone reads the softmax of its flat scores), zeros where nothing has a
   first move, so a file can score search leaves, a robber tip and robber
   deals;
+  every whole option's probability in its row's decision, one output per
+  block (`hexset.decisions.OPTION_OUTPUTS`, `hexn.model9.option_probs`):
+  `option_flat` `(B, space.size)`, `option_setup` `(B, incidences)`, for a
+  "joint" net `option_double` `(D, incidences, incidences)` (each double-turn
+  row's ordered pairs, first by second, in `double_rows` order), and
+  `option_road_building` `(Kr,)` and `option_discard` `(Kd,)` beside the
+  candidates, the softmax over every legal option of the row, zeros where
+  illegal, so a search can be made over whole decisions
+  (`hexset.clients.onnxbot.DecisionPolicy.option_rows`);
   and, for a net that has one, `points` `(B, players)`, the points head in
   the same frame, which HexSet does not read. A setup road is scored as the
   road head scores its edge (`hexn.model9.HexNet.flat_scores`), which is how
@@ -62,8 +71,9 @@ with), and `prior`.
 A parity check runs after every export and raises: on seeded positions of
 every kind of decision the graph and `hexn.policy9.Policy9` on the torch net
 answer the same `decision` for every row, `value` and `prior` within
-`rtol=1e-3, atol=1e-4`, and the file played through `hexset.clients.onnxbot`
-makes the moves the torch policy makes.
+`rtol=1e-3, atol=1e-4`, the file played through `hexset.clients.onnxbot`
+makes the moves the torch policy makes, and lists the same whole options as
+`Policy9.option_rows`, their probabilities within the same tolerance.
 
     python -m hexn.export_onnx --checkpoint latest.pt --out net.onnx
     python -m hexn.export_onnx --checkpoint latest.pt --out served.onnx --runtime <module> \\
@@ -87,7 +97,7 @@ from hexset import contract9, decisions as D
 from hexset.actions import ActionSpace, build_space
 from hexset.board.topology import Topology
 
-from .model9 import HexNet, config_of, first_move_prior, unpack9
+from .model9 import HexNet, config_of, first_move_prior, option_probs, unpack9
 
 __all__ = ["CONTRACT", "input_names", "output_names", "serving_props", "is_contract9", "export9"]
 
@@ -104,9 +114,11 @@ def input_names(joint: bool) -> tuple[str, ...]:
     return ("observation",) + tuple(n for n in D.ARRAYS if joint or n != "double_rows")
 
 
-def output_names(points: bool) -> tuple[str, ...]:
-    """The graph's outputs, in order (the module docstring)."""
-    return ("decision", "value", "prior") + (("points",) if points else ())
+def output_names(points: bool, joint: bool = False) -> tuple[str, ...]:
+    """The graph's outputs, in order (the module docstring): `option_double`
+    for a "joint" net alone, `points` for a net that has one."""
+    options = tuple(n for n in D.OPTION_OUTPUTS if joint or n != "option_double")
+    return ("decision", "value", "prior") + options + (("points",) if points else ())
 
 
 def _first_max(scores: Tensor, row: Tensor, rows: Tensor) -> tuple[Tensor, Tensor]:
@@ -184,7 +196,13 @@ class _Export9(nn.Module):
         decision = torch.cat([kind.unsqueeze(1), index], 1)
         prior = first_move_prior(net, flat_scores, setup_scores, road_scores, road_building_row, discard_scores,
                                  discard_row, discard, pairs, double_rows)
-        answers = [decision, out.value.float(), prior]
+        # Every whole option's probability, block by block (`hexset.decisions.OPTION_OUTPUTS` order).
+        whole = option_probs(flat_scores, setup_scores, road_scores, road_building_row, discard_scores, discard_row,
+                             pairs, double_rows)
+        answers = [decision, out.value.float(), prior, whole[0], whole[1]]
+        if self.joint:
+            answers.append(whole[4])
+        answers += [whole[2], whole[3]]
         if self.points:
             answers.append(out.points.float())
         return tuple(answers)
@@ -313,12 +331,14 @@ def _shapes(topology: Topology, layout: contract9.Layout9, space: ActionSpace) -
         "road_building": ("road_building", 2), "road_building_row": ("road_building",),
         "discard": ("discards", 10), "discard_row": ("discards",), "double_rows": ("doubles",),
         "decision": ("batch", 2), "value": ("batch", layout.players), "prior": ("batch", space.size),
-        "points": ("batch", layout.players),
+        "option_flat": ("batch", space.size), "option_setup": ("batch", incidences),
+        "option_double": ("doubles", incidences, incidences), "option_road_building": ("road_building",),
+        "option_discard": ("discards",), "points": ("batch", layout.players),
     }
 
 
 _TYPES = {"observation": "FLOAT", "flat": "BOOL", "setup": "BOOL", "decision": "INT64", "value": "FLOAT",
-          "prior": "FLOAT", "points": "FLOAT"}
+          "prior": "FLOAT", "points": "FLOAT", **{name: "FLOAT" for name in D.OPTION_OUTPUTS}}
 
 
 def _embed(path: Path, props: dict[str, str], shapes: dict[str, tuple]) -> None:
@@ -346,7 +366,7 @@ def _verify_contract(path: Path, shapes: dict[str, tuple], joint: bool, points: 
 
     model = onnx.load(str(path))
     found = ([t.name for t in model.graph.input], [t.name for t in model.graph.output])
-    expected = (list(input_names(joint)), list(output_names(points)))
+    expected = (list(input_names(joint)), list(output_names(points, joint)))
     if found != expected:
         raise ValueError(f"graph signature {found} is not hexset's {expected}")
     for tensor in [*model.graph.input, *model.graph.output]:
@@ -365,9 +385,11 @@ def _verify_parity(path: Path, net: HexNet, space: ActionSpace, topology: Topolo
     of every kind of decision (`_sample_rows`), each asked its decision as
     HexSet asks it: the same `decision` on every row, `value` and
     `prior` within `rtol=1e-3, atol=1e-4`; then the file through
-    `hexset.clients.onnxbot` makes the move the torch policy makes at each.
-    Raises on a difference; returns the largest absolute difference of
-    `value` and `prior`."""
+    `hexset.clients.onnxbot` makes the move the torch policy makes at each,
+    and lists each row's whole options as `Policy9.option_rows` does, their
+    probabilities within the same tolerance. Raises on a difference; returns
+    the largest absolute difference of `value`, `prior` and the whole
+    options' probabilities (`options`)."""
     import onnxruntime as ort
 
     from hexset.clients.onnxbot import load
@@ -379,8 +401,8 @@ def _verify_parity(path: Path, net: HexNet, space: ActionSpace, topology: Topolo
     rows = _sample_rows(space.num_players, samples, seed)
     feed = _feed(rows, space, topology, joint, torch_policy)
     session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
-    got = dict(zip(output_names(net.points_head is not None),
-                   session.run(list(output_names(net.points_head is not None)), feed)))
+    names = output_names(net.points_head is not None, joint)
+    got = dict(zip(names, session.run(list(names), feed)))
     want = torch_policy.answers(feed["observation"], {k: v for k, v in feed.items() if k != "observation"}
                                 | ({} if joint else {"double_rows": np.zeros(0, dtype=np.int64)}), topology)
     np.testing.assert_array_equal(got["decision"], want["decision"], err_msg="decision")
@@ -394,6 +416,12 @@ def _verify_parity(path: Path, net: HexNet, space: ActionSpace, topology: Topolo
         mine, theirs = served._choose(game, seat), torch_policy._choose(game, seat)
         if mine != theirs:
             raise ValueError(f"parity: the file chose {mine}, torch {theirs}")
+    worst["options"] = 0.0
+    for ((listed, probs), (want_listed, want_probs)) in zip(served.option_rows(rows), torch_policy.option_rows(rows)):
+        if listed != want_listed:
+            raise ValueError("parity: the file lists other whole options than torch")
+        np.testing.assert_allclose(probs, want_probs, rtol=1e-3, atol=1e-4, err_msg="options")
+        worst["options"] = max(worst["options"], float(np.abs(probs - want_probs).max(initial=0.0)))
     return worst
 
 
@@ -424,7 +452,7 @@ def export9(
 
         entrant_from_name(serving["trader"])  # refuse a name HexSet cannot seat, here
     wrapper = _Export9(net, layout, topology).eval()
-    names_in, names_out = input_names(joint), output_names(points)
+    names_in, names_out = input_names(joint), output_names(points, joint)
     shapes = _shapes(topology, layout, space)
     out = Path(out)
     handle, temporary = tempfile.mkstemp(dir=out.parent, prefix=f".{out.name}.", suffix=".onnx")

@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import math
 import random
-from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Iterator, Protocol, Sequence
 
@@ -47,17 +46,17 @@ from hexset import decisions as D
 from hexset.actions import Action, ActionSpace, mask_of, space_for
 from hexset.arena import MAX_ACTIONS, deal_board, deal_game
 from hexset.board.board import BOARD_MODES, Board
-from hexset.encoding import Observation, encode_batch
+from hexset.encoding import Observation
 from hexset.game import MAX_TURNS, Game, Phase
+from hexset.gym.driver import Driver, draw_key, observations, seat_points
+from hexset.gym.driver import Request as DriverRequest
 # `_Lane` is internal to HexSet (an underscore name, outside `__all__`), used
-# knowingly: `RuledLaneEnv` and `_Listed` deal their own games through
-# `LaneEnv`'s `_fresh`, `_next`, `_stop`, `_cast` and `_seat_gates`, which a
-# HexSet release may change without notice. Check them at every repin.
+# knowingly: `RuledLaneEnv` hangs each game's coalition plan through
+# `LaneEnv`'s `_fresh`, which a HexSet release may change without notice.
 from hexset.gym.lanes import BoardBots, LaneEnv, Outcome, _Lane
 from hexset.gym.lanes import Episode as LaneEpisode
 from hexset.outlook import outlook_of
 from hexset.victory import victory_points
-from hexset.gym.lanes import Request as LaneRequest
 from hexset.record import Record, advance, moves, open_record, shown_by_step
 from hexset.rules import STANDARD_GAME, GameType
 
@@ -100,38 +99,8 @@ SAMPLE_STREAMS = ("worker", "game")
 # decisions (`hexset.decisions`, `hexset.gym.lanes.LaneEnv`'s `decisions`).
 CONTRACTS = ("8", *contract9.CONTRACTS)
 
-_MASK64 = (1 << 64) - 1
-_GOLDEN64 = 0x9E3779B97F4A7C15
-
-
-def _mix64(x: int) -> int:
-    """splitmix64's finaliser: a bijection on 64-bit integers that spreads
-    every input bit over the output."""
-    x &= _MASK64
-    x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & _MASK64
-    x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & _MASK64
-    return x ^ (x >> 31)
-
-
-def draw_key(seed: int, index: int, seat: int, step: int) -> int:
-    """The 64-bit key of one decision's sampling draw under per-game streams.
-
-    `step` indexes the game's whole action stream, so `(index, step)` alone
-    names a decision; `seat` is folded in as well so a key can never be
-    shared by two seats. Pure Python integers: the same on every platform and
-    every numpy or torch version.
-    """
-    key = _mix64(seed + _GOLDEN64)
-    for part in (index, seat, step):
-        key = _mix64((key ^ (part & _MASK64)) + _GOLDEN64)
-    return key
-
-
-
-def _seat_points(game: Game) -> tuple[int, ...]:
-    """Every seat's true victory points, board order (`Request.seat_points`)."""
-    state = game.state(0, hidden=False)
-    return tuple(victory_points(state, seat) for seat in range(state.num_players))
+# Every seat's true victory points, board order (`Request.seat_points`).
+_seat_points = seat_points
 
 
 # The phases of the turn under way an outlook label is read in: before the
@@ -515,33 +484,22 @@ def standard_law(index: int) -> tuple[GameType, frozenset[int]]:
     return STANDARD_GAME, frozenset()
 
 
-class _Listed(LaneEnv):
-    """A `LaneEnv` that deals exactly `indices`, in order, and nothing else.
+class _Seat:
+    """One policy id of a `Collector` as HexSet's driver seats it
+    (`hexset.gym.driver.Seat`): the collector builds the policy's requests,
+    asks it once a tick and holds its learner rows."""
 
-    What a resumed cohort needs: the games a crash interrupted, by index. The
-    pinned engine's `LaneEnv` deals a strided range only, so this points its
-    counter at each listed index in turn and lets `LaneEnv._fresh` deal it --
-    the game, its cast, board, gates and record all come from the engine's
-    own dealing, not a copy of it. `_fresh`, `_next` and `_stop` are the
-    engine's private names; an index list on `LaneEnv` itself retires this.
-    """
+    def __init__(self, collector: "Collector", pid: int) -> None:
+        self.collector, self.pid = collector, pid
 
-    def __init__(self, *args, indices: Sequence[int], **kwargs) -> None:
-        self._listed = deque(indices)
-        kwargs["deal"] = len(self._listed)
-        super().__init__(*args, **kwargs)
+    @property
+    def native_contract(self) -> str | None:
+        """The collector's contract where its policy reads only a native
+        lane's buffers (`Collector._native_ready`), else None."""
+        return self.collector.contract if self.collector._native_ready() else None
 
-    def _fresh(self):
-        if not self._listed:
-            return None
-        self._next = self._listed.popleft()
-        self._stop = self._next + 1
-        return super()._fresh()
-
-
-class _RuledListed(_Listed, RuledLaneEnv):
-    """A resumed cohort of a ruled run: `_Listed` picks the indices,
-    `RuledLaneEnv` deals each one by its law."""
+    def choose_many(self, requests: Sequence[DriverRequest]) -> list[Choice]:
+        return self.collector._answer(self.pid, requests)
 
 
 class Collector:
@@ -752,7 +710,15 @@ class Collector:
             if pid + 1 not in self._benches
         )
 
-        self._pending: dict[int, dict[tuple[int, int], tuple[Request, Choice]]] = {}
+        # A learner's decision between its answer and its apply, keyed
+        # `(index, seat, step)`, and each game's rows so far, per seat.
+        self._pending: dict[tuple[int, int, int], tuple[Request, Choice]] = {}
+        self._rows: dict[int, list[list[Transition | Transition9]]] = {}
+        # Who answers each policy id at HexSet's driver (`hexset.gym.driver`).
+        self._seats = {pid: _Seat(self, pid) for pid in self._batched}
+        self._driver: Driver | None = None
+        # The partial a `cohort` call named, while it plays.
+        self._keeping: "Partial | None" = None
         self._env: LaneEnv | None = (
             self._new_env(deal=deal, first_game=first_game) if fill else None
         )
@@ -816,7 +782,6 @@ class Collector:
                 "game_law": self.game_law or standard_law, "coalition": self.coalition,
             }
         if indices:
-            env = _RuledListed if ruled else _Listed
             extra = {**extra, "indices": indices}
         return env(
             self.players,
@@ -852,9 +817,16 @@ class Collector:
         )
 
     # --- the tick ----------------------------------------------------------
+    #
+    # HexSet's driver (`hexset.gym.driver.Driver`) runs the loop: it deals,
+    # asks each policy id's `_Seat` once a tick for its rows, applies the
+    # answers on Python or native lanes and hands back each finished game.
+    # What is left here is the trainer's half: the requests a `BatchPolicy`
+    # reads, a row per recorded decision, and the episode they make.
 
-    def _requests(self, asked: Sequence[LaneRequest]) -> list[Request]:
-        """One tick's observations, through the vectorized encoder.
+    def _requests(self, asked: Sequence[DriverRequest]) -> list[Request]:
+        """The policies' requests for the driver's rows, observations through
+        the vectorized encoder (or a native lane's own buffer).
 
         Only the seats a `BatchPolicy` answers are encoded: a bot-played seat is
         the environment's to answer and never sees an observation, so encoding
@@ -865,7 +837,8 @@ class Collector:
             return []
         if self.contract in contract9.CONTRACTS:
             return self._requests9(asked)
-        observations = self._encode8(asked)
+        encoded = self._encode8(asked)
+        targets = self._driver.targets()
         keyed = self.sample_stream == "game"
         return [
             Request(
@@ -876,7 +849,7 @@ class Collector:
                 options=request.options,
                 game=request.game,
                 points=victory_points(request.game.state(request.seat, hidden=False), request.seat),
-                seat_points=_seat_points(request.game),
+                seat_points=targets.points[request.row],
                 outlook=(
                     _outlook(request.game, request.seat)
                     if self.outlook and _outlook_kept(self.seed, request.index, request.seat, request.step)
@@ -887,138 +860,125 @@ class Collector:
                     if self.temperatures is None
                     else float(self.temperatures(request.index)[request.seat])
                 ),
-                draw=(
-                    draw_key(self.seed, request.index, request.seat, request.step)
-                    if keyed
-                    else None
-                ),
+                draw=request.draw if keyed else None,
             )
-            for request, observation in zip(asked, observations, strict=True)
+            for request, observation in zip(asked, encoded, strict=True)
         ]
 
-    def _encode8(self, asked: Sequence[LaneRequest]) -> list:
+    def _encode8(self, asked: Sequence[DriverRequest]) -> list:
         """A contract-8 tick's observations, each under the observation
         contract its seat's policy reads (`NetworkPolicy.observation_contract`:
         "8", or "8.1" for a net trained across rule sets), one batch a contract."""
         contracts = [getattr(self._batched.get(r.policy, self.policy), "observation_contract", "8") for r in asked]
-        observations: list = [None] * len(asked)
+        encoded: list = [None] * len(asked)
         for contract in sorted(set(contracts)):
             rows = [i for i, c in enumerate(contracts) if c == contract]
-            encoded = encode_batch([asked[i].game for i in rows], [asked[i].seat for i in rows], contract)
-            for i, observation in zip(rows, encoded):
-                observations[i] = observation
-        return observations
+            for i, observation in zip(rows, observations([asked[i] for i in rows], contract)):
+                encoded[i] = observation
+        return encoded
 
-    def _requests9(self, asked: Sequence[LaneRequest]) -> list[Request]:
+    def _requests9(self, asked: Sequence[DriverRequest]) -> list[Request]:
         """Contract 9's tick: every learner decision as `hexset.contract9`
         encodes it, with the decision's tensors the environment stated."""
         keyed = self.sample_stream == "game"
+        targets = self._driver.targets()
+        encoded = observations(asked, self.contract)
         out = []
-        for request in asked:
+        for request, observation in zip(asked, encoded):
             # The true state's points, every seat's and so the mover's own.
-            seat_points = _seat_points(request.game)
+            seat_points = targets.points[request.row]
             out.append(Request(
                 lane=request.lane,
                 seat=request.seat,
-                observation=contract9.flatten(contract9.encode9(request.game, request.seat, self.contract)),
+                observation=observation,
                 mask=request.decision.flat,
                 options=(),
                 game=request.game,
                 points=seat_points[request.seat],
                 seat_points=seat_points,
-                draw=draw_key(self.seed, request.index, request.seat, request.step) if keyed else None,
+                draw=request.draw if keyed else None,
                 decision=request.decision,
-                turns=request.game.turns,
+                turns=targets.turns[request.row],
                 decision_id=request.decision_id,
                 part=request.part,
             ))
         return out
 
-    def _answers(
-        self, asked: Sequence[LaneRequest], requests: Sequence[Request]
-    ) -> list[Choice]:
-        """One `act` call per policy, reassembled in request order."""
-        if len(self._batched) == 1:
-            choices = list(self.policy.act(requests))
-            if len(choices) != len(requests):
-                raise ValueError(
-                    f"policy answered {len(choices)} of {len(requests)} requests"
-                )
-            return choices
-        shares: dict[int, list[int]] = {pid: [] for pid in self._batched}
-        for i, request in enumerate(asked):
-            shares[request.policy].append(i)
-        out: list[Choice | None] = [None] * len(requests)
-        for pid, share in shares.items():
-            if not share:
-                continue
-            answers = self._batched[pid].act([requests[i] for i in share])
-            if len(answers) != len(share):
-                raise ValueError(
-                    f"policy answered {len(answers)} of {len(share)} requests"
-                )
-            for i, choice in zip(share, answers):
-                out[i] = choice
-        return out  # type: ignore[return-value]
+    def _answer(self, pid: int, asked: Sequence[DriverRequest]) -> list[Choice]:
+        """Policy `pid`'s answers to its rows of a tick, each learner
+        decision held until the driver applies it (`_decided`)."""
+        requests = self._requests(asked)
+        choices = list(self._batched[pid].act(requests))
+        if len(choices) != len(requests):
+            raise ValueError(f"policy answered {len(choices)} of {len(requests)} requests")
+        if pid in self._learners:
+            for row, request, choice in zip(asked, requests, choices):
+                self._pending[(row.index, row.seat, row.step)] = (request, choice)
+        return choices
+
+    def _decided(self, asked: DriverRequest, choice: Choice) -> None:
+        """A decision the driver applied: a learner's becomes its seat's row."""
+        held = self._pending.pop((asked.index, asked.seat, asked.step), None)
+        if held is None:
+            return
+        request, choice = held
+        rows = self._rows.get(asked.index)
+        if rows is None:
+            rows = self._rows[asked.index] = [[] for _ in range(self.players)]
+        if request.decision is not None:
+            kind, index = choice.decision
+            rows[asked.seat].append(Transition9(
+                seat=asked.seat,
+                step=asked.step,
+                observation=request.observation,
+                decision=request.decision,
+                kind=int(kind),
+                index=int(index),
+                log_prob=choice.log_prob,
+                value=tuple(choice.value),
+                points=tuple(choice.points),
+                seat_points=request.seat_points,
+                turns=request.turns,
+                decision_id=request.decision_id,
+                part=request.part,
+            ))
+            return
+        rows[asked.seat].append(Transition(
+            seat=asked.seat,
+            step=asked.step,
+            observation=request.observation,
+            mask=request.mask,
+            action=choice.action,
+            index=self.space.index(choice.action),
+            log_prob=choice.log_prob,
+            value=tuple(choice.value),
+            aux=choice.aux,
+            points=request.points,
+            seat_points=request.seat_points,
+            outlook=request.outlook,
+        ))
+
+    def _kept(self, played: LaneEpisode) -> object:
+        """A finished game made the trainer's `Episode` and handed to the
+        sink, which keeps it before the lane is dealt again."""
+        episode = self._episode(played)
+        # What the sink hands back, when it hands anything back, is what this
+        # collector holds and returns in the episode's place: a collector
+        # worker keeps each game encoded, not as objects.
+        kept = self.sink(episode)
+        return episode if kept is None else kept
 
     def _episode(self, played: LaneEpisode) -> Episode:
-        """The engine's episode with the trainer's rows joined onto it.
-
-        The join key is `(seat, step)`, which is `Decision`'s own identity, so a
-        decision the collector did not record — an opponent's — simply has no
-        row and its seat stays empty.
-        """
-        kept = self._pending.pop(played.index, {})
-        trajectories = []
-        for decisions in played.decisions:
-            row = []
-            for decision in decisions:
-                held = kept.get((decision.seat, decision.step))
-                if held is None:
-                    continue
-                request, choice = held
-                if request.decision is not None:
-                    kind, index = choice.decision
-                    row.append(
-                        Transition9(
-                            seat=decision.seat,
-                            step=decision.step,
-                            observation=request.observation,
-                            decision=request.decision,
-                            kind=int(kind),
-                            index=int(index),
-                            log_prob=choice.log_prob,
-                            value=tuple(choice.value),
-                            points=tuple(choice.points),
-                            seat_points=request.seat_points,
-                            turns=request.turns,
-                            decision_id=request.decision_id,
-                            part=request.part,
-                        )
-                    )
-                    continue
-                row.append(
-                    Transition(
-                        seat=decision.seat,
-                        step=decision.step,
-                        observation=request.observation,
-                        mask=request.mask,
-                        action=decision.action,
-                        index=self.space.index(decision.action),
-                        log_prob=choice.log_prob,
-                        value=tuple(choice.value),
-                        aux=choice.aux,
-                        points=request.points,
-                        seat_points=request.seat_points,
-                        outlook=request.outlook,
-                    )
-                )
-            trajectories.append(tuple(row))
+        """The engine's episode with the trainer's rows joined onto it: each
+        seat's rows in the order its decisions were taken. A seat the
+        collector did not record -- an opponent's -- stays empty."""
+        rows = self._rows.pop(played.index, None)
+        trajectories = tuple(() for _ in range(played.players)) if rows is None else tuple(map(tuple, rows))
         return Episode(
             index=played.index,
             seed=played.seed,
             players=played.players,
-            trajectories=tuple(trajectories),
+            trajectories=trajectories,
             # An uncast collector reports no cast, the convention every reader
             # already has ("empty means everyone was the learner"); `LaneEnv`
             # always stamps one because it has no such convention.
@@ -1038,65 +998,108 @@ class Collector:
             raise ValueError(f"game {played.index} has no record to read its unrecorded moves' points off")
         return unrecorded_points(played.record, steps) if steps else ()
 
-    def _mine(self, outstanding: Sequence[LaneRequest]) -> list[LaneRequest]:
-        """The decisions a `BatchPolicy` answers: everything not played by a bot
-        inside the environment."""
-        return [r for r in outstanding if r.policy not in self._benches]
+    def _native_ready(self) -> bool:
+        """Whether this collector's games play on native lanes: the native
+        extension, a whole-decision learner on every seat (a contract-9 net
+        that asks the double turn in parts) and nothing a Python game is
+        needed for -- no other policy, caster, coalition, temperature, outlook
+        or marks, no trades, and per-game sample streams."""
+        from hexset.gym.native import available
+
+        from .policy9 import NetworkPolicy9
+
+        return bool(
+            available()
+            and self.contract in contract9.CONTRACTS
+            and self.players in (2, 4)
+            and self.caster is None
+            and not self.opponents
+            and self.coalition is None
+            and self.temperatures is None
+            and not self.outlook
+            and not self.marks
+            and self.sample_stream == "game"
+            and self.max_offers == 0
+            and self.trader is None
+            and all(type(policy) is NetworkPolicy9 and policy.net.config.double_turn == "parts"
+                    for policy in self._batched.values())
+        )
+
+    def _drive(self, env: LaneEnv, *, keeping: "Partial | None" = None) -> Driver:
+        """HexSet's driver over `env`: native lanes where `_native_ready`, each
+        game checked against `keeping`'s cohort plan when there is one."""
+        if keeping is None:
+            keeping = getattr(self.sink, "partial", None)
+        native = env._stop is not None and self._native_ready()
+        plan = None if keeping is None or not native else keeping.plan()
+        finished = () if keeping is None or not native else keeping.finished()
+        self._driver = Driver(env, self._seats, keep=self._kept, on_decision=self._decided,
+                              lanes="native" if native else "python", planned=plan, finished=finished,
+                              beat=self.beat)
+        if native and getattr(self._driver, "space", None) is not None:
+            self._native_topology(self._driver.space, self._driver.pairs)
+        return self._driver
+
+    def _native_topology(self, space: ActionSpace, pairs) -> None:
+        """Prime each policy's setup incidences for native requests, which
+        carry no game to read them off, checked against the net's own."""
+        pair_array = np.asarray(pairs)
+        for policy in self._batched.values():
+            if policy.space != space or policy.net.CONTRACT != self.contract:
+                raise ValueError("native policy action space or contract differs")
+            ends = policy.net.ends.detach().cpu().numpy()
+            vertices = policy.net.inc_vertex.detach().cpu().numpy()
+            if (pair_array.shape != (len(vertices), 2) or pair_array.dtype.kind not in "iu"
+                    or np.any(pair_array[:, 1] < 0) or np.any(pair_array[:, 1] >= len(ends))):
+                raise ValueError("native setup incidence shape or edge differs")
+            selected = ends[pair_array[:, 1]]
+            far = np.where(selected[:, 0] == pair_array[:, 0], selected[:, 1], selected[:, 0])
+            if (not np.array_equal(vertices, pair_array[:, 0])
+                    or not np.array_equal(policy.net.inc_far.detach().cpu().numpy(), far)):
+                raise ValueError("native setup incidences differ from the model topology")
+            if policy._pairs is not None and not np.array_equal(policy._pairs, pairs):
+                raise ValueError("the policy already holds another setup topology")
+            policy._pairs = pairs
 
     def requests(self) -> list[Request]:
         """This tick's decisions for the policies this collector drives.
 
-        The trainer-side view of `LaneEnv.requests()`, in lane order, with the
+        The trainer-side view of the driver's requests, in lane order, with the
         bot-played seats left out because the environment answers those itself.
-        Same decisions until the tick is stepped -- `LaneEnv.requests()` is
-        idempotent within a tick -- though the encoding is redone each call, so
-        this is for inspecting a batch, not a way to avoid `tick`.
+        Same decisions until the tick is stepped, though the encoding is redone
+        each call, so this is for inspecting a batch, not a way to avoid `tick`.
         """
         if self._env is None:
             return []
-        return self._requests(self._mine(self._env.requests()))
+        driver = self._driver if self._driver is not None and self._driver.env is self._env else self._drive(self._env)
+        return self._requests(driver.requests())
 
-    def tick(self) -> list[Episode]:
-        """Step every live lane once. Returns the games that ended on this tick,
-        each already written where this collector keeps its games."""
+    def _keeps(self) -> None:
         if self.sink is None:
             raise RuntimeError(
                 "a collector keeps every game it plays: build it with keep=<hexn.durable.Partial> "
                 "or name a partial for the call"
             )
-        if self._env is None:
-            return []
-        outstanding = self._env.requests()
-        if not outstanding:
-            return []
-        asked = self._mine(outstanding)
-        requests = self._requests(asked)
-        choices = self._answers(asked, requests)
 
-        answered: dict[int, Action] = {}
-        for lane_request, request, choice in zip(asked, requests, choices):
-            answered[lane_request.lane] = choice.action
-            if lane_request.policy in self._learners:
-                self._pending.setdefault(lane_request.index, {})[
-                    (lane_request.seat, lane_request.step)
-                ] = (request, choice)
-        # A lane left out is played by its seat's own bot (`LaneEnv.step`).
-        finished = self._env.step(answered)
-
+    def tick(self) -> list[Episode]:
+        """Step every live lane once. Returns the games that ended on this tick,
+        each already written where this collector keeps its games."""
+        self._keeps()
+        driver = self._driver
+        if driver is None or driver.env is not self._env:
+            if self._env is None:
+                return []
+            driver = self._drive(self._env)
+        steps = driver.steps
+        # The sink and the beat as they stand this tick: a call may name its
+        # own partial (`collect`, `cohort`).
+        driver.beat = self.beat
+        episodes = driver.tick()
+        if self._pending:
+            raise RuntimeError("the driver applied answers without their pending training rows")
         self.ticks += 1
-        self.steps += len(outstanding)
-        self.games += len(finished)
-        episodes = [self._episode(played) for played in finished]
-        if self.sink is not None:
-            # What the sink hands back, when it hands anything back, is what
-            # this collector holds and returns in the episode's place: a
-            # collector worker keeps each game encoded, not as objects.
-            episodes = [
-                episode if (kept := self.sink(episode)) is None else kept
-                for episode in episodes
-            ]
-        if self.beat is not None:
-            self.beat()
+        self.steps += driver.steps - steps
+        self.games += len(episodes)
         return episodes
 
     # --- driving -----------------------------------------------------------
@@ -1104,6 +1107,8 @@ class Collector:
     @property
     def running(self) -> bool:
         """False once a bounded collector has played out everything it dealt."""
+        if self._driver is not None and self._driver.env is self._env and self._driver.lanes == "native":
+            return self._driver.running
         return self._env is not None and self._env.running
 
     def _play_out(self) -> list[Episode]:
@@ -1205,7 +1210,7 @@ class Collector:
         plan = partial.plan()
         if plan is None and kept:
             raise ValueError(f"{partial.directory} holds games but no plan")
-        held, self.sink = self.sink, partial.keep
+        held, self.sink, self._keeping = self.sink, partial.keep, partial
         try:
             if plan is None:
                 partial.write_plan(self.upcoming(games))
@@ -1213,9 +1218,10 @@ class Collector:
             finished = {episode.index for episode in kept}
             return kept + self.listed([i for i in plan if i not in finished])
         finally:
-            self.sink = held
+            self.sink, self._keeping = held, None
 
     def _cohort(self, games: int) -> list[Episode]:
+        self._keeps()
         if self._env is None:
             # Built on the first cohort rather than at construction, because a
             # `fill=False` collector holds nothing until one is asked for; every
@@ -1225,6 +1231,7 @@ class Collector:
         else:
             self._env.cohort(games)
         try:
+            self._drive(self._env, keeping=self._keeping)
             return self._play_out()
         finally:
             self._next_game = self._env.games_started()
@@ -1245,14 +1252,16 @@ class Collector:
         """
         if not indices:
             return []
-        held = self._env
+        self._keeps()
+        held, driver = self._env, self._driver
         self._env = self._new_env(
             deal=len(indices), first_game=indices[0], indices=indices
         )
         try:
+            self._drive(self._env, keeping=self._keeping)
             return self._play_out()
         finally:
-            self._env = held
+            self._env, self._driver = held, driver
 
     def in_flight(self) -> Iterator[Game]:
         return iter(()) if self._env is None else self._env.in_flight()

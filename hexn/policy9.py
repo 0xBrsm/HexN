@@ -24,7 +24,9 @@ at once with the double turn's heads. `score_rows` reads the decision's
 probability marginalised onto its first atomic move, as a file's `prior`
 does (`hexn.model9.first_move_prior`), so a search a move at a time sees
 every whole option; `option_rows` lists every whole option of a decision with its
-probability, for a caller that searches over whole decisions.
+probability, for a caller that searches over whole decisions
+(`hexset.rollout.PairedRollouts`), and `plans` holds the rest of each decision
+it chose, which such a caller drops where it plays something else.
 
 `NetworkPolicy9` is the same net behind `hexn.selfplay.BatchPolicy` for
 self-play: one forward per tick over every learner decision the lanes ask for
@@ -188,6 +190,15 @@ class Policy9:
         self.layout = contract9.layout(net.players, net.num_hexes, net.num_vertices, net.num_edges, net.CONTRACT)
         self.joint = net.config.double_turn == "joint"
         self._plans = D.Plans()
+
+    #: It lists a decision's whole options (`option_rows`).
+    has_options = True
+
+    @property
+    def plans(self) -> D.Plans:
+        """The rest of each decision this policy chose whole, played a move
+        at a time (`hexset.decisions.Plans`)."""
+        return self._plans
 
     @property
     def native_contract(self) -> str | None:

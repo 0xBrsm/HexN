@@ -53,6 +53,7 @@ from .trade import trade_params, trader_gate
 @dataclass
 class Progress:
     iteration: int
+    # The games collected for this iteration, so a log's column sums.
     games: int
     positions: int
     collect_seconds: float
@@ -69,6 +70,29 @@ class Progress:
     # miscalibrated value head shows up here rather than being silently
     # clipped; the shipped heuristic lineup reads a mean of 0.151.
     trades_per_turn: float = 0.0
+    # Every game the run has trained on through this iteration, resumes
+    # included; None when the run resumed from a checkpoint that predates the
+    # count (`GameCount`).
+    games_total: int | None = None
+
+
+@dataclass
+class GameCount:
+    """A run's game total across resumes, for the log's `games_total`.
+
+    The collector's own counter (`Collector.games`) cannot give it: it starts
+    at zero in each process and never sees games a resumed iteration reloads
+    from disk. So each iteration adds the games it collected, and the total
+    comes from the checkpoint the run resumed from (`"games_played"`) and goes
+    back into the next one; a checkpoint without it leaves the total unknown
+    rather than wrong."""
+
+    total: int | None = 0
+
+    def add(self, games: int) -> int | None:
+        if self.total is not None:
+            self.total += games
+        return self.total
 
 
 @dataclass(frozen=True)
@@ -349,6 +373,7 @@ def summarise(
     # Last and defaulted, so `hexn.exit`'s older positional call still
     # binds: (episodes, iteration, positions, collect, update, games).
     assemble_seconds: float = 0.0,
+    games_total: int | None = None,
 ) -> Progress:
     trades = sum(e.outcome.trades for e in episodes)
     turns = sum(e.outcome.turns for e in episodes)
@@ -364,6 +389,7 @@ def summarise(
         mean_actions=sum(e.outcome.actions for e in episodes) / len(episodes),
         mean_turns=sum(e.outcome.turns for e in episodes) / len(episodes),
         trades_per_turn=trades / turns if turns else 0.0,
+        games_total=games_total,
     )
 
 

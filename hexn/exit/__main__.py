@@ -91,7 +91,7 @@ from ..ppo import attach_prior
 from ..reanalyse import reanalyse
 from ..selfplay import Collector
 from ..store import EpisodeStore
-from ..loop import add_head_flags, build, duel, eval_journal, prune_recent, save, summarise
+from ..loop import GameCount, add_head_flags, build, duel, eval_journal, prune_recent, save, summarise
 from ..steps import Steps, by_index, fingerprint, remove as remove_steps
 
 
@@ -416,6 +416,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     collecting = directory / "partial"
 
     start_iteration = 0
+    counted = GameCount()
     first_game = 0
     if args.resume and not latest.exists() and not args.init:
         # It used to fall through and start fresh, silently: the same refusal
@@ -443,6 +444,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             group["lr"] = args.learning_rate
         start_iteration = state["iteration"]
         first_game = state["games_started"]
+        counted = GameCount(total=state.get("games_played"))
         # A CPU ByteTensor is required whatever `map_location` moved it to.
         torch.set_rng_state(state["torch_rng"].cpu())
         print(f"resumed at iteration {start_iteration}, game {first_game}", file=sys.stderr)
@@ -497,6 +499,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             {
                 "iteration": 0,
                 "games_started": 0,
+                "games_played": 0,
                 "net": policy.net.state_dict(),
                 "optimiser": optimiser.state_dict(),
                 "torch_rng": torch.get_rng_state(),
@@ -682,14 +685,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         moved = measure(policy, batch)
         measured = time.perf_counter() - started
 
+        # A fixed corpus is not collected by any iteration.
+        played = len(episodes) if corpus is None else 0
+        played_total = counted.add(played)
         progress = summarise(
             episodes,
             iteration,
             len(batch),
             collected,
             updated,
-            collector.games,
+            played,
             assemble_seconds=assembled,
+            games_total=played_total,
         )
         record = {
             **asdict(progress),
@@ -714,6 +721,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             state = {
                 "iteration": iteration + 1,
                 "games_started": collector.games_started(),
+                "games_played": played_total,
                 "net": policy.net.state_dict(),
                 "optimiser": optimiser.state_dict(),
                 "torch_rng": torch.get_rng_state(),

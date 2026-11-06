@@ -254,7 +254,7 @@ def test_the_graph_declares_the_inputs_it_reads_and_answers_in_the_action_contra
         out = export9(str(a_checkpoint(tmp_path / f"{joint}.pt", config)), tmp_path / f"{joint}.onnx")
         model = onnx.load(str(out))
         assert [t.name for t in model.graph.input] == list(input_names(joint))
-        assert [t.name for t in model.graph.output] == list(output_names(config.points))
+        assert [t.name for t in model.graph.output] == list(output_names(config.points, joint))
         assert ("double_rows" in [t.name for t in model.graph.input]) == joint
         assert ("points" in [t.name for t in model.graph.output]) == config.points
 

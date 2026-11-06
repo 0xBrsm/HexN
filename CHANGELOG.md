@@ -2,6 +2,45 @@
 
 All notable changes to the `hexn` package are recorded here.
 
+## 0.49.0
+
+### Breaking
+
+- **A training log's `games` is the iteration's own count.** The PPO and
+  ExIt trainers' `games` column (`hexn.loop.Progress.games`) was the
+  collector's running count since its process started, which a resume set
+  back to zero; it is now the games collected for that iteration, so the
+  column sums. The new `games_total` counts every game through the
+  iteration across resumes, carried in the checkpoint as `games_played`
+  (`hexn.loop.GameCount`); a run resumed from a checkpoint without it logs
+  `None` there rather than a wrong total.
+
+- **The collector plays on HexSet's batched game loop.**
+  `hexn.selfplay.Collector` hands its games to `hexset.gym.driver.Driver`
+  and keeps only the trainer's half: the policies' requests, a training row
+  per recorded decision and the episode. Its cohorts and listed resumes play
+  on native lanes wherever the old native worker did (a contract-9 net asked
+  for the double turn in parts on every seat, per-game sample streams, no
+  other policy, outlook, marks or trades) and on Python lanes otherwise,
+  with the same game files and training rows on either. `hexn.native_collect`
+  (`NativeWorkerCollector`, `supported`) is removed; collection workers need
+  no wrapper. `draw_key` is HexSet's and still importable from
+  `hexn.selfplay`.
+
+### Added
+
+- **A contract-9 file answers every whole option's probability.**
+  `export9` writes `hexset.decisions.OPTION_OUTPUTS` (`option_flat`,
+  `option_setup`, `option_double` for a "joint" net, `option_road_building`,
+  `option_discard`), computed by `hexn.model9.option_probs`: the softmax over
+  every legal option of a decision, the distribution `prior` marginalises.
+  The parity check holds the file's whole options
+  (`DecisionPolicy.option_rows`) to `Policy9.option_rows` on positions of
+  every kind of decision. `output_names` takes `joint`. `Policy9` exposes
+  its `plans` and declares `has_options`, so paired rollouts search its
+  whole decisions.
+
+
 ## 0.48.0
 
 ### Added

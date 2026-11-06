@@ -267,6 +267,7 @@ def widen_checkpoint(
     out = {
         "iteration": state["iteration"],
         "games_started": state["games_started"],
+        **({"games_played": state["games_played"]} if "games_played" in state else {}),
         "net": wide.state_dict(),
         "optimiser": optimiser.state_dict(),
         "torch_rng": state["torch_rng"],

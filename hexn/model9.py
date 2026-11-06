@@ -50,7 +50,7 @@ from hexset.contract9 import (
 from hexset.decisions import DecisionKind, double_pairs
 
 __all__ = ["DOUBLE_TURNS", "ModelConfig", "config_of", "HexNet", "Prediction", "Scores", "unpack9", "collate", "decision_scores",
-           "chosen_scores", "decision_entropy", "decision_log_prob", "first_move_prior"]
+           "chosen_scores", "decision_entropy", "decision_log_prob", "first_move_prior", "option_probs"]
 
 
 # `ModelConfig.double_turn`'s choices.
@@ -918,6 +918,42 @@ def first_move_prior(net: HexNet, flat: Tensor, setup: Tensor, rb: Tensor, rb_ro
     out = out.reshape(batch, size)
     total = out.sum(1, keepdim=True)
     return torch.where(total > 0, out / total.clamp(min=1e-30), torch.zeros_like(out))
+
+
+def option_probs(flat: Tensor, setup: Tensor, rb: Tensor, rb_row: Tensor, disc: Tensor, disc_row: Tensor,
+                 double: Tensor | None = None, double_rows: Tensor | None = None) -> tuple[Tensor, ...]:
+    """Every whole option's probability in its row's decision, block by
+    block, as `hexset.decisions.OPTION_OUTPUTS` states them: the softmax over
+    every legal option of the row, ordinary and compound together, the same
+    distribution `first_move_prior` marginalises. The scores are as
+    `first_move_prior` takes them, `-inf` where illegal. Returns `(flat (B,
+    space.size), setup (B, incidences), rb (Kr,), disc (Kd,))`, and `double
+    (D, incidences, incidences)` after them where `double` is given; zero where
+    illegal, and on a row with nothing legal. Traceable: an exported file
+    answers it (`hexn.export_onnx9`)."""
+    batch = flat.shape[0]
+    neg = flat.new_full((batch,), float("-inf"))
+    tops = [flat.amax(1), setup.amax(1), neg.scatter_reduce(0, rb_row, rb, reduce="amax", include_self=True),
+            neg.scatter_reduce(0, disc_row, disc, reduce="amax", include_self=True)]
+    if double is not None:
+        tops.append(neg.index_put((double_rows,), double.flatten(1).amax(1)))
+    top = torch.stack(tops, 1).amax(1)
+    top = torch.where(torch.isfinite(top), top, torch.zeros_like(top))
+    e_flat = torch.exp(flat - top[:, None])
+    e_setup = torch.exp(setup - top[:, None])
+    e_rb = torch.exp(rb - top[rb_row])
+    e_disc = torch.exp(disc - top[disc_row])
+    zero = flat.new_zeros(batch)
+    total = e_flat.sum(1) + e_setup.sum(1) + zero.scatter_add(0, rb_row, e_rb) + zero.scatter_add(0, disc_row, e_disc)
+    e_double = None
+    if double is not None:
+        e_double = torch.exp(double - top[double_rows][:, None, None])
+        total = total + zero.scatter_add(0, double_rows, e_double.flatten(1).sum(1))
+    scale = torch.where(total > 0, 1.0 / total.clamp(min=1e-30), torch.zeros_like(total))
+    out = (e_flat * scale[:, None], e_setup * scale[:, None], e_rb * scale[rb_row], e_disc * scale[disc_row])
+    if e_double is not None:
+        out += (e_double * scale[double_rows][:, None, None],)
+    return out
 
 
 def _best(scores: Scores) -> Tensor:

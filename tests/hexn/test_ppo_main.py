@@ -108,6 +108,25 @@ def test_a_resumed_run_carries_on_from_the_iteration_it_reached(tmp_path):
     lines = [json.loads(l) for l in (tmp_path / "log.jsonl").read_text().splitlines()]
     assert lines[1] == {"resumed_from": 1}
     assert [record["iteration"] for record in lines if "iteration" in record] == [0, 1, 2]
+    # Each row counts its own iteration's games, and the total carries over
+    # the restart that set the collector's counter back to zero.
+    rows = [record for record in lines if "iteration" in record]
+    totals = [record["games_total"] for record in rows]
+    assert all(record["games"] > 0 for record in rows)
+    assert totals == [sum(record["games"] for record in rows[: k + 1]) for k in range(len(rows))]
+    assert second["games_played"] == totals[-1] and first["games_played"] == totals[0]
+
+
+def test_a_run_resumed_from_a_checkpoint_without_a_game_total_logs_none_not_a_wrong_one(tmp_path):
+    run(tmp_path, 1, ["--checkpoint-every", "1"])
+    state = torch.load(tmp_path / "latest.pt", weights_only=False)
+    del state["games_played"]
+    torch.save(state, tmp_path / "latest.pt")
+
+    run(tmp_path, 2, ["--checkpoint-every", "1", "--resume"])
+    rows = [json.loads(l) for l in (tmp_path / "log.jsonl").read_text().splitlines()]
+    last = [record for record in rows if "iteration" in record][-1]
+    assert last["iteration"] == 1 and last["games"] > 0 and last["games_total"] is None
 
 
 def test_resuming_with_nothing_to_resume_is_an_error_rather_than_a_fresh_start(tmp_path):
@@ -176,6 +195,10 @@ def test_a_run_killed_mid_collection_resumes_without_losing_or_repeating_a_game(
     assert not durable.partials(tmp_path / "partial")
     lines = [json.loads(l) for l in (tmp_path / "log.jsonl").read_text().splitlines()]
     assert [line.get("iteration", "marker") for line in lines] == [0, "marker", 1, 2]
+    # The resumed iteration counts the games it reloaded as well as the new.
+    rows = [line for line in lines if "iteration" in line]
+    assert [row["games"] for row in rows] == [4, 4, 4]
+    assert [row["games_total"] for row in rows] == [4, 8, 12]
 
 
 def test_a_run_killed_in_its_evaluation_keeps_the_iteration_it_finished(
@@ -308,7 +331,8 @@ def test_async_collection_prefetches_each_batch_once(tmp_path):
     ]
     assert [line["iteration"] for line in lines] == [0, 1]
     # One game per iteration, with no unused final prefetch.
-    assert lines[-1]["games"] == 2
+    assert [line["games"] for line in lines] == [1, 1]
+    assert lines[-1]["games_total"] == 2
     assert all(line["positions"] > 0 for line in lines)
 
 
@@ -327,7 +351,8 @@ def test_a_prefetched_cohort_is_whole_and_exactly_one_update_stale(tmp_path):
         ]
     for lines in logs.values():
         assert [line["iteration"] for line in lines] == [0, 1]
-        assert [line["games"] for line in lines] == [2, 4]
+        assert [line["games"] for line in lines] == [2, 2]
+        assert [line["games_total"] for line in lines] == [2, 4]
     assert logs["sync"][1]["approx_kl_first_minibatch"] < 1e-9
     assert logs["async"][1]["approx_kl_first_minibatch"] > 1e-7
 
@@ -344,7 +369,8 @@ def test_an_async_checkpoint_records_the_counters_from_before_the_cohort_in_flig
     first = torch.load(tmp_path / "iter-00001.pt", weights_only=False)
     assert first["games_started"] == 5
     lines = [json.loads(line) for line in (tmp_path / "log.jsonl").read_text().splitlines()]
-    assert [line["games"] for line in lines] == [2, 4, 6]
+    assert [line["games"] for line in lines] == [2, 2, 2]
+    assert [line["games_total"] for line in lines] == [2, 4, 6]
 
 
 class Streamless:
@@ -1082,7 +1108,8 @@ def test_a_contract_9_run_collects_in_workers_ahead_of_its_update(tmp_path):
                   "--decoupled", "--collect-trunk", "fused"]
     assert run(tmp_path, 2, flags) == 0
     lines = [json.loads(line) for line in (tmp_path / "log.jsonl").read_text().splitlines()]
-    assert [line["games"] for line in lines] == [2, 4]
+    assert [line["games"] for line in lines] == [2, 2]
+    assert [line["games_total"] for line in lines] == [2, 4]
     assert lines[0]["staleness_kl"] < 1e-9 < lines[1]["staleness_kl"]
 
 
