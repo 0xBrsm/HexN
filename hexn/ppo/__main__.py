@@ -176,7 +176,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--rules-mix", default="",
                         help="JSON specification for hexset.gym.distribution.Distribution; "
-                        "contract 9.1, 9d or 9d.1 self-play only (9d and 9d.1 deal every game to two seats), frozen in the run manifest")
+                        "contract 9.1, 9d, 9d.1 or 11d self-play only (9d, 9d.1 and 11d deal every game to two "
+                        "seats), frozen in the run manifest")
     parser.add_argument("--board-mode", choices=sorted(BOARD_MODES), default="random",
                         help="how every self-play game's board is dealt (hexset.board.board.BOARD_MODES); "
                         "a --rules-mix names its own")
@@ -574,15 +575,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     rules_mix = getattr(args, "rules_mix", "")
     if rules_mix:
-        if args.contract not in ("9.1", "9d", "9d.1") or args.mix:
-            parser.error("--rules-mix requires --contract 9.1, 9d or 9d.1 and an empty --mix (self-play)")
+        if args.contract not in ("9.1", "9d", "9d.1", "11d") or args.mix:
+            parser.error("--rules-mix requires --contract 9.1, 9d, 9d.1 or 11d and an empty --mix (self-play)")
         from hexset.gym.distribution import Distribution
         try:
             Distribution(rules_mix, args.players, args.seed)
         except (ValueError, TypeError, KeyError) as exc:
             parser.error(f"invalid --rules-mix: {exc}")
-    if args.contract in ("9d", "9d.1") and args.players != 2:
+    if args.contract in ("9d", "9d.1", "11d") and args.players != 2:
         parser.error(f"--contract {args.contract} is the two-seat observation: it trains with --players 2")
+    if getattr(args, "double_turn", "parts") == "joint" and args.contract != "11d":
+        parser.error("--double-turn joint is contract 11d's (its pair term); other contracts train in parts")
+    if args.contract == "11d" and (getattr(args, "global_seat", False) or getattr(args, "points_head", False)):
+        parser.error("--contract 11d's net has no global head and no points head: "
+                     "neither --global-seat nor --points-head")
     if getattr(args, "board_mode", "random") != "random" and rules_mix:
         parser.error("--board-mode cannot be combined with --rules-mix, which deals its own boards")
     runtime.load(getattr(args, "runtime", None))

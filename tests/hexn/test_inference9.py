@@ -59,8 +59,8 @@ def position(players, phase):
                 gates=(None,) * players)
 
 
-def built(players=2, *, points=True, precision="bf16", others=None):
-    contract = "9d" if players == 2 else "9"
+def built(players=2, *, points=True, precision="bf16", others=None, contract=None):
+    contract = contract or ("9d" if players == 2 else "9")
     game = position(players, Phase.MAIN)
     space = space_for(game)
     config = ModelConfig(width=16, rounds=2, points=points, double_turn="parts", contract=contract,
@@ -143,6 +143,22 @@ def test_original_complete_outputs_typed_choices_and_actual_first_group_and_tail
         assert candidate.precision == "bf16"
         assert len(observed) == 1
     assert "forward" not in candidate.net.__dict__
+
+
+@pytest.mark.parametrize("others", (False, True))
+def test_an_11d_net_traces_every_head_read_and_answers_as_the_original(monkeypatch, others):
+    """A contract-11d (architecture a10) net: the trace returns every field its
+    forward fills, the heads' reads (`types`, `hands`, the keys) among them,
+    and the policy's scores and choices are the original forward's bit for
+    bit."""
+    reference, candidate, rows = built(2, points=False, others=others, contract="11d")
+    with WorkerInference(candidate) as owner:
+        assert owner.eligible and not owner.traced
+        assert observe(monkeypatch, reference, rows) == observe(monkeypatch, candidate, rows)
+        assert owner.traced and owner.valid
+        assert {"types", "hands", "hand_context", "vertex_keys", "edge_keys"} <= set(candidate.net.forward.fields)
+        for count in (1, 3, 2, 5):
+            assert observe(monkeypatch, reference, rows[:count]) == observe(monkeypatch, candidate, rows[:count])
 
 
 def test_normal_bias_and_all_parameter_refresh_preserve_state_keys_fp32_and_cast_aliases(monkeypatch):

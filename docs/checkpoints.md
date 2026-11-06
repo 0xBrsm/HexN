@@ -10,10 +10,10 @@ the source of truth for them. This package trains two networks:
 | Contract | Network | Reads | Answers |
 | --- | --- | --- | --- |
 | `8`, `8.1` | `hexn.model.HexNet` | `hexset.encoding`'s hex, vertex, edge and global inputs | One flat action a decision |
-| `9`, `9.1`, `9d`, `9d.1` | `hexn.model9.HexNet` | `hexset.contract9`'s seat, table, hex and vertex tokens | A whole decision (`hexset.decisions`) |
+| `9`, `9.1`, `9d`, `9d.1`, `11d` | `hexn.model9.HexNet` | `hexset.contract9`'s seat, table, hex and vertex tokens | A whole decision (`hexset.decisions`) |
 
-A trainer's `--contract` picks one (`8`, `9`, `9.1`, `9d` or `9d.1`; `9d`
-and `9d.1` with `--players 2`). A contract-8 net becomes an 8.1 net by
+A trainer's `--contract` picks one (`8`, `9`, `9.1`, `9d`, `9d.1` or `11d`;
+the two-seat `9d`, `9d.1` and `11d` with `--players 2`). A contract-8 net becomes an 8.1 net by
 loading 8.1 weights ([loading across contracts](#loading-across-contracts)).
 Module docstrings cite older numbers as shorthand for "before/after that
 shape changed":
@@ -50,7 +50,12 @@ shape changed":
   table's rules and next-roll odds to the table token.
 - **Contract 9d** is the two-seat observation: each hand exact, only the
   development deck hidden. **Contract 9d.1** appends each seat's production
-  and bank rates to its token.
+  and bank rates to its token. **Contract 11d** is two-seat too: my token and
+  the opponent's of their own widths, a board block in the table's place and
+  the hex number one-hot. Its net is architecture a10: a score per move type
+  and a query per targeted role read against keys of each vertex, edge and
+  robber target, and a hand value for the resource moves (the changelog
+  entry "Contract 11d and its net" gives every part).
 
 ## The contract-8 network (`hexn.model`)
 
@@ -129,7 +134,7 @@ option, compound and ordinary together.
 | `global_seat` | `False` | the global head (bank trades, buying a card, development plays, ending the turn) reads the perspective's own seat token beside the table's |
 | `points` | `False` | a points head beside the win head: one number per seat, the perspective first (`Prediction.points`) |
 | `double_turn` | `"joint"` | how the double turn is chosen: `"joint"`, one decision over every ordered pair of setup turns, or `"parts"`, the setup head twice, the second on the board after the first |
-| `contract` | `"9"` | `"9"`, `"9.1"`, `"9d"` or `"9d.1"` |
+| `contract` | `"9"` | `"9"`, `"9.1"`, `"9d"`, `"9d.1"` or `"11d"` |
 
 A checkpoint carries its `model_config`; `config_of` reads it, a field the
 checkpoint predates at the value it was trained without. The trainers'
@@ -308,7 +313,7 @@ contract-9 one a decision graph (`hexn.export_onnx9`).
   `hexn.model9.option_probs`), so paired rollouts can search whole
   decisions; and, for a net with a points head, `points`, which HexSet does
   not read.
-- `contract` is the net's own (`9`, `9.1`, `9d` or `9d.1`), `double_turn`
+- `contract` is the net's own (`9`, `9.1`, `9d`, `9d.1` or `11d`), `double_turn`
   describes the net, and `max_offers` is `"0"` unless asked for: a contract-9
   net reads no trading inputs and makes no offers of its own.
 

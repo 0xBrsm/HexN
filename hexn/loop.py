@@ -496,11 +496,13 @@ def add_net9_flags(parser: argparse.ArgumentParser) -> None:
     `net9_config` reads them by. Inert under contract 8."""
     parser.add_argument(
         "--contract",
-        choices=("8", "9", "9.1", "9d", "9d.1"),
+        choices=("8", "9", "9.1", "9d", "9d.1", "11d"),
         default="8",
         help="the network contract: 8, hexn.model.HexNet on hexset.encoding and one action a decision; 9, "
         "hexn.model9.HexNet on hexset.contract9, asked for whole decisions (hexset.decisions); 9.1 observes "
-        "the table's rules; 9d is the two-seat observation (--players 2), 9d.1 adds each seat's production and bank rates",
+        "the table's rules; 9d is the two-seat observation (--players 2), 9d.1 adds each seat's production and bank "
+        "rates; 11d is the two-seat observation with two seat tokens of their own widths, no table token and the "
+        "hex number one-hot, read by the contract-11d query heads",
     )
     parser.add_argument("--heads", choices=("linear", "mlp"), default="linear",
                         help="contract 9: every head one linear layer, or each with a hidden layer")
@@ -518,21 +520,28 @@ def add_net9_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--others", action=argparse.BooleanOptionalAction, default=False,
                         help="contract 9: the seat update reads the other seats' mean token directly "
                         "(at two seats, the opponent's), beside or instead of --attention")
+    parser.add_argument("--double-turn", choices=("parts", "joint"), default="parts",
+                        help="contract 11d: the net's double-turn heads. parts, none; joint, the snake seat's two "
+                        "setup turns scored together (the pair term), for a reader that asks the double turn "
+                        "whole. Self-play asks it in parts either way")
     parser.add_argument("--global-seat", action=argparse.BooleanOptionalAction, default=False,
                         help="contract 9: the global head (bank trades, buying a card, development plays, "
-                        "ending the turn) reads the perspective's own seat token beside the table's")
+                        "ending the turn) reads the perspective's own seat token beside the table's (not 11d, "
+                        "which has no global head)")
 
 
 def net9_config(args) -> dict:
     """`hexn.model9.ModelConfig`'s fields bar width and rounds, from the flags
     `add_net9_flags` adds. Self-play chooses the snake seat's double turn as
-    two setup turns (`double_turn="parts"`), so a checkpoint it saves is read
-    the same way by `hexn.netbot.load`."""
+    two setup turns, and a net is built with no joint double-turn heads
+    (`double_turn="parts"`) unless `--double-turn joint` (contract 11d) asks
+    for them, so a checkpoint it saves is read the same way by
+    `hexn.netbot.load`."""
     return {"contract": str(getattr(args, "contract", "9")), "heads": args.heads,
             "discard": args.discard_head, "norm": bool(args.norm),
             "messages": args.messages, "attention": bool(args.attention), "others": bool(getattr(args, "others", False)),
             "global_seat": bool(getattr(args, "global_seat", False)),
-            "points": bool(args.points_head), "double_turn": "parts"}
+            "points": bool(args.points_head), "double_turn": str(getattr(args, "double_turn", "parts"))}
 
 
 def model_record(policy) -> dict:

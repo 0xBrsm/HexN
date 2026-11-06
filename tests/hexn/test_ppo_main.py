@@ -996,19 +996,23 @@ DUEL_LAW = json.dumps({"presets": [{"weight": 1, "players": 2, "winning_points":
                                      "friendly_robber": True, "balanced_dice": True, "board_mode": "random"}]})
 
 
+@pytest.mark.parametrize("contract,width,double_turn", [("9d", 828, "parts"), ("11d", 1000, "parts"),
+                                                        ("11d", 1000, "joint")])
 @pytest.mark.parametrize("parallel", [False, True])
-def test_a_two_seat_run_on_contract_9d_collects_updates_saves_and_resumes(tmp_path, parallel):
-    """Contract 9d self-play: every game a two-seat duel-variant game dealt by
-    the rules mix, the net reading its opponent directly, no points head; the
-    checkpoint rebuilds at a two-seat table and is refused at four."""
+def test_a_two_seat_run_on_contract_9d_collects_updates_saves_and_resumes(tmp_path, parallel, contract, width,
+                                                                         double_turn):
+    """Two-seat self-play (9d, or 11d with no table token): every game a
+    two-seat duel-variant game dealt by the rules mix, the net reading its
+    opponent directly, no points head; the checkpoint rebuilds at a two-seat
+    table and is refused at four."""
     from hexset.arena import deal_game
     from hexset.rules import DUEL_VARIANT_GAME
     from hexn import netbot
 
     torch.set_num_threads(1)
-    flags = ["--contract", "9d", "--players", "2", "--messages", "pooled", "--no-attention", "--others",
+    flags = ["--contract", contract, "--players", "2", "--messages", "pooled", "--no-attention", "--others",
              "--rules-mix", DUEL_LAW, "--action-cap", "48", "--games-per-iteration", "2", "--lanes", "2",
-             "--collect-trunk", "fused"]
+             "--collect-trunk", "fused", "--double-turn", double_turn]
     if parallel:
         flags += ["--collect-workers", "2", "--async-collect", "--decoupled"]
     assert run(tmp_path, 2, flags) == 0
@@ -1017,15 +1021,25 @@ def test_a_two_seat_run_on_contract_9d_collects_updates_saves_and_resumes(tmp_pa
     trained = [line for line in lines if "positions" in line]
     assert [line["iteration"] for line in trained] == [0, 1, 2] and all(line["positions"] > 0 for line in trained)
     state = torch.load(tmp_path / "latest.pt", weights_only=False)
-    assert state["model_config"]["contract"] == "9d" and state["model_config"]["others"] is True
+    assert state["model_config"]["contract"] == contract and state["model_config"]["others"] is True
+    assert state["model_config"]["double_turn"] == double_turn
+    assert (any(key.startswith("pair_matrix") for key in state["net"])) == (double_turn == "joint")
     assert state["model_config"]["points"] is False and state["args"]["players"] == 2
     topology = deal_game(0, 0, 2, game_type=DUEL_VARIANT_GAME)._state.board.topology
     loaded = netbot.load(str(tmp_path / "latest.pt"), topology)
-    assert loaded.policy.net.CONTRACT == "9d" and loaded.policy.net.players == 2 and loaded.iteration == 3
-    assert loaded.players == 2 and loaded.policy.layout.width == 828
+    assert loaded.policy.net.CONTRACT == contract and loaded.policy.net.players == 2 and loaded.iteration == 3
+    assert loaded.players == 2 and loaded.policy.layout.width == width
     with pytest.raises(SystemExit):
-        run(tmp_path / "four", 1, ["--contract", "9d", "--players", "4", "--messages", "pooled", "--no-attention",
+        run(tmp_path / "four", 1, ["--contract", contract, "--players", "4", "--messages", "pooled", "--no-attention",
                                    "--others", "--rules-mix", DUEL_LAW, "--action-cap", "48"])
+    if contract == "9d":
+        with pytest.raises(SystemExit):
+            run(tmp_path / "joint", 1, flags + ["--double-turn", "joint"])
+    if contract == "11d":
+        with pytest.raises(SystemExit):
+            run(tmp_path / "global", 1, flags + ["--global-seat"])
+        with pytest.raises(SystemExit):
+            run(tmp_path / "points", 1, flags + ["--points-head"])
 
 
 @pytest.mark.parametrize("parallel", [False, True])

@@ -17,6 +17,21 @@ tokens. Each round passes, with one set of weights for every seat:
   others' mean token (`ModelConfig.others`: at two seats, the opponent's);
 - the table token to every token, and back from the means of each kind.
 
+Under contract 11d my token (seat row 0) and the opponent's are embedded by
+layers of their own, since they hold different columns, and the table token
+is a board token, embedded from the board block: each round it is broadcast
+as the table is, and its update reads the hexes' and vertices' means, my
+seat token and one attention read over every hex and vertex
+(`_board_step`). Its heads are query heads (`_emit_queries`): from my
+token, the opponent's and the board token, a score per
+move type and a query per targeted role; a board move scored as its type's
+score plus its roles' queries against the keys of what it names (vertices,
+edges, a robber's hex with its victim), a resource move as its type's score
+plus the value of the two hands it leaves. Each seat's win logit
+reads its own token with mine. The decisions are asked as for every other
+contract-9 net (`flat_scores`, `setup_scores`, `road_building_scores`,
+`discard_scores`, `robber_logits`).
+
 Heads, all shared across seats: the win head reads one logit off each seat's
 token (with the table), softmaxed over the four, the perspective first; the
 policy acts for the perspective, whose view every token the trunk built is
@@ -36,18 +51,22 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import math
+
 import numpy as np
 import torch
 from torch import Tensor, nn
 
-from hexset.actions import Action, ActionSpace, ActionType
+from hexset.actions import YEAR_OF_PLENTY_PAIRS, Action, ActionSpace, ActionType
 from hexset.board.terrain import NUM_RESOURCES
 from hexset.contract9 import (
-    CONTRACTS, HEX_FEATURES, SEAT_FEATURES, SEAT_FEATURES_9D, TABLE_FEATURES, VERTEX_FEATURES, Layout9, features,
-    hex_features,
+    CARD_SCALE, CONTRACTS, HEX_FEATURES, MY_COLUMNS_11D, MY_FEATURES_11D, OTHER_COLUMNS_11D, OTHER_FEATURES_11D,
+    PIECE_SCALE, SEAT_FEATURES, SEAT_FEATURES_9D, TABLE_FEATURES, VERTEX_FEATURES, Layout9, features, hex_features,
     incidences,
 )
 from hexset.decisions import DecisionKind, double_pairs
+from hexset.board.ports import BASE_TRADE_RATIO
+from hexset.state import MAX_SETTLEMENTS
 
 __all__ = ["DOUBLE_TURNS", "ModelConfig", "config_of", "HexNet", "Prediction", "Scores", "unpack9", "collate", "decision_scores",
            "chosen_scores", "decision_entropy", "decision_log_prob", "first_move_prior", "option_probs"]
@@ -55,6 +74,47 @@ __all__ = ["DOUBLE_TURNS", "ModelConfig", "config_of", "HexNet", "Prediction", "
 
 # `ModelConfig.double_turn`'s choices.
 DOUBLE_TURNS = ("joint", "parts")
+
+# The contract-11d heads: a score per move type, one per `ActionType` in its
+# order; a query per targeted role, each `KEY_WIDTH` wide, read against keys
+# of vertices, edges and robber targets; and a hand value, the worth of the
+# two hands a resource move leaves (`HexNet._emit_queries`).
+MOVE_TYPES = tuple(ActionType)
+# A setup settlement reads `setup_settlement` for a seat's first and
+# `setup_settlement_paying` for its second, the one that pays the starting
+# hand (`HexNet._emit_queries`).
+QUERY_ROLES = ("settlement", "city", "setup_settlement", "setup_settlement_paying", "road", "setup_road",
+               "road_building", "robber")
+KEY_WIDTH = 16
+# Contract 11d's board token reads the hexes and vertices through one
+# attention, this wide (`HexNet._board_step`).
+BOARD_READ = 16
+# Every query and key is layer-normalised (with a gain) and their product
+# divided by sqrt(KEY_WIDTH), so a score's size is the role's learned scale,
+# exp(t), times a bounded product; the scale starts at QUERY_SCALE, about
+# the spread an unnormalised query . key score starts at, and is soft-capped
+# at ROLE_SCALE_MAX (`HexNet.role_scales`): with the gains at one a score is
+# then within 4 ROLE_SCALE_MAX of its type's, which still separates the
+# clearest choice from the rest, and the scale cannot run away as training
+# sharpens.
+QUERY_SCALE = 0.04
+ROLE_SCALE_MAX = 4.0
+# The keys' gains: a vertex's, an edge's, a robber target's.
+KEY_KINDS = ("vertex", "edge", "robber")
+# The hand value reads, beside the context, the two hands it values.
+HAND_READS = NUM_RESOURCES
+_ROLE = {name: i for i, name in enumerate(QUERY_ROLES)}
+# The roles read against the vertex keys and against the edge keys, each a
+# contiguous run of `QUERY_ROLES`, so each kind is read in one product.
+VERTEX_ROLES = ("settlement", "city", "setup_settlement", "setup_settlement_paying")
+EDGE_ROLES = ("road", "setup_road", "road_building")
+assert QUERY_ROLES[:len(VERTEX_ROLES) + len(EDGE_ROLES)] == VERTEX_ROLES + EDGE_ROLES
+
+
+def _as(x: Tensor, dtype: torch.dtype) -> Tensor:
+    """`x` in `dtype`, without a cast where it already is (a cast is a call
+    each, and a forward at batch 1 is mostly calls)."""
+    return x if x.dtype == dtype else x.to(dtype)
 
 
 @dataclass(frozen=True)
@@ -90,7 +150,8 @@ class ModelConfig:
     # ending the turn) reads the perspective's own seat token beside the
     # table's, where the table alone carries the seats only as their mean.
     # Checkpoints written before the field had the table alone: loading one
-    # pads the head's weights for the seat token with zeros.
+    # pads the head's weights for the seat token with zeros. Contract 11d has
+    # no table, and its global head always reads both seat tokens.
     global_seat: bool = False
     # A points head beside the win head: one number per seat token (with the
     # table), its near-term points against the others', trained on a cache's
@@ -116,6 +177,13 @@ class ModelConfig:
             raise ValueError(f"unknown message layout {self.messages!r}")
         if self.double_turn not in DOUBLE_TURNS:
             raise ValueError(f"unknown double turn {self.double_turn!r}: {DOUBLE_TURNS}")
+        if self.contract == "11d":
+            # The contract-11d heads (`HexNet._query_heads`): no global head
+            # and no points head.
+            if self.global_seat:
+                raise ValueError("contract 11d has no table and no global head: global_seat does not apply")
+            if self.points:
+                raise ValueError("a contract-11d net has no points head")
 
 
 def config_of(model_config: dict) -> ModelConfig:
@@ -130,7 +198,7 @@ def config_of(model_config: dict) -> ModelConfig:
                          double_turn=model_config.get("double_turn", "joint"))
 
 
-JOINT_HEADS = ("first_head.", "second_head.", "pair_head.")
+JOINT_HEADS = ("first_head.", "second_head.", "pair_head.", "pair_matrix")
 
 
 def without_joint_head(state: dict) -> tuple[dict, int]:
@@ -163,6 +231,21 @@ class Prediction:
     vertices: Tensor | None = None
     hexes: Tensor | None = None
     seats: Tensor | None = None
+    # The contract-11d heads (`HexNet._emit_queries`): each move type's score, the
+    # robber's query, each edge's Road Building read, the hand value's context
+    # term `(B, hidden)` and the two hands `(B, 2, resources)`, mine first.
+    types: Tensor | None = None
+    robber_query: Tensor | None = None
+    rb_road: Tensor | None = None
+    hand_context: Tensor | None = None
+    hands: Tensor | None = None
+    # ... and for the double turn asked whole: each vertex's key, each
+    # vertex's first and paying setup-settlement reads `(B, 2, V)`, and each
+    # edge's setup-road read.
+    vertex_keys: Tensor | None = None
+    edge_keys: Tensor | None = None
+    setup_reads: Tensor | None = None
+    setup_road_read: Tensor | None = None
 
 
 def _mlp(in_dim: int, width: int, out_dim: int | None = None) -> nn.Sequential:
@@ -194,11 +277,14 @@ def _norm(width: int, on: bool) -> nn.Module:
 
 class _Round(nn.Module):
     def __init__(self, width: int, norm: bool = True, pooled: bool = False, attention: bool = True,
-                 others: bool = False) -> None:
+                 others: bool = False, board: bool = False) -> None:
         super().__init__()
         # Pre-norm: each kind of token is normalised before its messages are
         # built and its update read, and the update is added to the token as
         # it stood. Identity where the net is built without (`ModelConfig.norm`).
+        # The table token is contract 11d's board token (`board`): its update
+        # also reads my seat token and an attention read over the hexes and
+        # vertices (`HexNet._board_step`).
         self.norm_hex = _norm(width, norm)
         self.norm_vertex = _norm(width, norm)
         self.norm_seat = _norm(width, norm)
@@ -224,7 +310,17 @@ class _Round(nn.Module):
             self.hex = _mlp(3 * width, width)
             self.vertex = _mlp(7 * width, width)
             self.seat = _mlp((5 + reads) * width, width)
-        self.table = _mlp(4 * width, width)
+        self.board = board
+        if board:
+            self.table = _mlp(4 * width + BOARD_READ, width)
+            # The board token's read of the hexes and vertices: one query, and
+            # each kind of node its own key and value, one layer emitting both
+            # ([key, value], `BOARD_READ` each).
+            self.board_query = nn.Linear(width, BOARD_READ)
+            self.board_hex = nn.Linear(width, 2 * BOARD_READ)
+            self.board_vertex = nn.Linear(width, 2 * BOARD_READ)
+        else:
+            self.table = _mlp(4 * width, width)
         self.attention = attention
         self.others = others
         if attention:
@@ -232,6 +328,17 @@ class _Round(nn.Module):
             self.key = nn.Linear(width, width)
             self.value = nn.Linear(width, width)
         self.road = nn.Parameter(torch.zeros(width))
+
+    def _load_from_state_dict(self, state_dict, prefix, *args):
+        # A board token written with a key layer and a value layer per kind of
+        # node loads into the one layer emitting both: the same numbers.
+        for kind in ("hex", "vertex"):
+            for part in ("weight", "bias"):
+                key, value = (f"{prefix}board_{kind}_{x}.{part}" for x in ("key", "value"))
+                if key in state_dict and value in state_dict:
+                    state_dict[f"{prefix}board_{kind}.{part}"] = torch.cat([state_dict.pop(key),
+                                                                            state_dict.pop(value)])
+        super()._load_from_state_dict(state_dict, prefix, *args)
 
 
 def _others(sn: Tensor, dim: int, players: int) -> Tensor:
@@ -252,6 +359,13 @@ def _pick(x: Tensor, dim: int, index: Tensor) -> Tensor:
     return x.index_select(dim, index.reshape(-1)).reshape(*x.shape[:dim], *index.shape, *x.shape[dim + 1:])
 
 
+def _unit(x: Tensor, gain: Tensor) -> Tensor:
+    """`x` `(..., KEY_WIDTH)` layer-normalised over its last axis (no bias),
+    times `gain`: a query or key whose length is bounded by the gain alone."""
+    # A constant normalised shape, not `x.shape[-1:]`, which an ONNX trace reads as dynamic.
+    return nn.functional.layer_norm(x, (KEY_WIDTH,)) * gain.to(x.dtype)
+
+
 def unpack9(layout: Layout9, x: Tensor) -> dict[str, Tensor]:
     """A `(B, layout.width)` batch of `contract9.flatten`ed rows as the
     tensors `HexNet.forward` reads."""
@@ -270,6 +384,10 @@ class HexNet(nn.Module):
         super().__init__()
         self.config = config or ModelConfig()
         self.CONTRACT = self.config.contract
+        # Contract 11d: two seat tokens of their own widths and a board token.
+        self.two = self.CONTRACT == "11d"
+        if self.two and players != 2:
+            raise ValueError(f"contract 11d is the two-seat observation, not {players} seats")
         self.players = players
         self.space = space
         width = self.config.width
@@ -277,12 +395,17 @@ class HexNet(nn.Module):
         self.num_hexes, self.num_vertices, self.num_edges = hexes, vertices, edges
 
         seat_features, table_features = features(self.CONTRACT)
-        self.embed_seat = nn.Linear(seat_features, width)
-        self.embed_table = nn.Linear(table_features, width)
+        if self.two:
+            self.embed_me = nn.Linear(MY_FEATURES_11D, width)
+            self.embed_other = nn.Linear(OTHER_FEATURES_11D, width)
+            self.embed_board = nn.Linear(table_features, width)
+        else:
+            self.embed_seat = nn.Linear(seat_features, width)
+            self.embed_table = nn.Linear(table_features, width)
         self.embed_hex = nn.Linear(hex_features(self.CONTRACT), width)
         self.embed_vertex = nn.Linear(VERTEX_FEATURES, width)
         self.rounds = nn.ModuleList(_Round(width, self.config.norm, self.config.messages == "pooled",
-                                           self.config.attention, self.config.others)
+                                           self.config.attention, self.config.others, board=self.two)
                                     for _ in range(self.config.rounds))
         self.out_hex = _norm(width, self.config.norm)
         self.out_vertex = _norm(width, self.config.norm)
@@ -294,25 +417,28 @@ class HexNet(nn.Module):
             return nn.Linear(in_dim, out_dim) if self.config.heads == "linear" else _mlp(in_dim, width, out_dim)
         self.value_head = head(2 * width)
         self.points_head = head(2 * width) if self.config.points else None   # the value head's shape
-        self.vertex_head = nn.Linear(width, 2)          # settlement, city
-        self.road_head = head(2 * width)                # one ordered end pair
-        self.robber_head = head(2 * width)              # hex with a victim's token
-        self.nobody_head = nn.Linear(width, 1)          # hex, robbing nobody
-        globals_size = sum(space.sizes[k] for k in _GLOBAL_KINDS)
-        self.global_head = head(2 * width if self.config.global_seat else width, globals_size)  # off the table
-        # (and with `global_seat` the perspective's own seat token), as HexNet's global head
-        self.setup_head = head(2 * width)               # settlement with its road's far end
         joint = self.config.double_turn == "joint"
-        self.first_head = head(2 * width) if joint else None
-        self.second_head = head(2 * width) if joint else None
-        self.pair_head = nn.Linear(width, width, bias=False) if joint else None
-        # Linear: my token and the table give a weight per resource kept and per
-        # resource given, and a candidate scores their sum over its counts (a
-        # linear layer over all three would add the same context term to every
-        # candidate, and the choice would not read the position at all).
-        self.discard_head = (nn.Linear(2 * width, 10) if self.config.discard == "linear"
-                             else _mlp(2 * width + 10, width, 1))
-        self.road_building = nn.Linear(2 * width, 1)    # playing the card at all
+        if self.two:
+            self._query_heads(head, width)
+        else:
+            self.vertex_head = nn.Linear(width, 2)          # settlement, city
+            self.road_head = head(2 * width)                # one ordered end pair
+            self.robber_head = head(2 * width)              # hex with a victim's token
+            self.nobody_head = nn.Linear(width, 1)          # hex, robbing nobody
+            globals_size = sum(space.sizes[k] for k in _GLOBAL_KINDS)
+            self.global_head = head(2 * width if self.config.global_seat else width, globals_size)  # off the table
+            # (and with `global_seat` the perspective's own seat token), as HexNet's global head
+            self.setup_head = head(2 * width)               # settlement with its road's far end
+            self.first_head = head(2 * width) if joint else None
+            self.second_head = head(2 * width) if joint else None
+            self.pair_head = nn.Linear(width, width, bias=False) if joint else None
+            # Linear: my token and the table give a weight per resource kept and per
+            # resource given, and a candidate scores their sum over its counts (a
+            # linear layer over all three would add the same context term to every
+            # candidate, and the choice would not read the position at all).
+            self.discard_head = (nn.Linear(2 * width, 10) if self.config.discard == "linear"
+                                 else _mlp(2 * width + 10, width, 1))
+            self.road_building = nn.Linear(2 * width, 1)    # playing the card at all
         self._initialise()
 
         hex_vertex = np.asarray([(h, v) for h, vs in enumerate(topology.hex_vertices) for v in vs]).T
@@ -351,6 +477,87 @@ class HexNet(nn.Module):
         self.slot_robber_host = block(ActionType.MOVE_ROBBER)
         self.register_buffer("slot_setup_road", block(ActionType.SETUP_ROAD), persistent=False)
         self.register_buffer("slot_global", torch.cat([block(k) for k in _GLOBAL_KINDS]), persistent=False)
+        if self.two:
+            # 11d: a setup turn's two moves in the flat row, per incidence; the
+            # hands a resource move leaves (`_resource_values`).
+            inc_edge = torch.from_numpy(pairs[:, 1])
+            self.register_buffer("inc_setup_settlement", space.offsets[ActionType.SETUP_SETTLEMENT]
+                                 + torch.from_numpy(pairs[:, 0]), persistent=False)
+            self.register_buffer("inc_setup_road", space.offsets[ActionType.SETUP_ROAD] + inc_edge, persistent=False)
+            self.register_buffer("yop_pairs", torch.tensor(YEAR_OF_PLENTY_PAIRS, dtype=torch.long), persistent=False)
+            self.register_buffer("inc_edge", inc_edge, persistent=False)
+            # My token's settlements left: whether a setup settlement is the paying one.
+            self.settlements_left = MY_COLUMNS_11D["pieces"].start
+            # One card of each resource, as a hand column reads it (a count over
+            # `CARD_SCALE`), and each Year of Plenty slot's two cards.
+            card = torch.eye(NUM_RESOURCES) / CARD_SCALE
+            self.register_buffer("card", card, persistent=False)
+            self.register_buffer("plenty_cards", card[self.yop_pairs[:, 0]] + card[self.yop_pairs[:, 1]],
+                                 persistent=False)
+            self.my_hand = MY_COLUMNS_11D["hand"]
+            self.my_rates = MY_COLUMNS_11D["rates"]
+            self.their_hand = slice(MY_FEATURES_11D + OTHER_COLUMNS_11D["hand"].start,
+                                    MY_FEATURES_11D + OTHER_COLUMNS_11D["hand"].stop)
+            # The flat row is gathered, not concatenated block by block: each
+            # slot's type score (the robber block a zero column: `robber_logits`
+            # scores it on demand), plus each slot's term in `_emit_queries`'
+            # vector of query reads and hand values (`ADDED`, in that order),
+            # or a zero column where a move adds nothing to its type.
+            T = ActionType
+            sizes = {T.SETUP_SETTLEMENT: vertices, T.SETUP_ROAD: edges, T.BUILD_SETTLEMENT: vertices,
+                     T.BUILD_CITY: vertices, T.BUILD_ROAD: edges, T.PLAY_MONOPOLY: NUM_RESOURCES,
+                     T.PLAY_YEAR_OF_PLENTY: len(YEAR_OF_PLENTY_PAIRS), T.BANK_TRADE: NUM_RESOURCES ** 2,
+                     T.DISCARD: NUM_RESOURCES}
+            if any(space.sizes[t] != n for t, n in sizes.items()):
+                raise ValueError(f"contract 11d's flat blocks do not match the space: {space.sizes}")
+            added = sum(sizes.values())
+            slot_type = torch.full((space.size,), len(MOVE_TYPES), dtype=torch.long)
+            slot_added = torch.full((space.size,), added, dtype=torch.long)
+            for t in MOVE_TYPES:
+                if t is not T.MOVE_ROBBER:
+                    slot_type[block(t)] = int(t)
+            at = 0
+            for t, n in sizes.items():
+                slot_added[block(t)] = torch.arange(at, at + n)
+                at += n
+            self.register_buffer("slot_type", slot_type, persistent=False)
+            self.register_buffer("slot_added", slot_added, persistent=False)
+
+    def _query_heads(self, head, width: int) -> None:
+        """The contract-11d heads: every move is scored as its type's score
+        (a hidden layer, so a move with no target still weighs the position)
+        plus, for a board move, a query per role against the keys of what it
+        names, and for a resource move the value of the hands it leaves
+        (`_emit_queries`). They read a context of my token, the opponent's,
+        and the board token."""
+        context = 3 * width
+        self.move_head = _mlp(context, width, len(MOVE_TYPES))               # a score per move type
+        self.query_head = head(context, len(QUERY_ROLES) * KEY_WIDTH)          # a query per role
+        self.vertex_key = nn.Linear(width, KEY_WIDTH)
+        self.edge_key = nn.Linear(2 * width, KEY_WIDTH)                      # f(a, b) + f(b, a)
+        self.robber_key = nn.Linear(2 * width, KEY_WIDTH)                    # a hex with a victim's token
+        self.nobody_key = nn.Linear(width, KEY_WIDTH)                        # a hex, robbing nobody
+        # The normalised query . key (`QUERY_SCALE`): each query's and each
+        # kind of key's gain, and each role's log scale.
+        self.query_gain = nn.Parameter(torch.ones(len(QUERY_ROLES), KEY_WIDTH))
+        self.key_gain = nn.Parameter(torch.ones(len(KEY_KINDS), KEY_WIDTH))
+        # t such that `role_scales` starts at exactly QUERY_SCALE.
+        cap = math.log(ROLE_SCALE_MAX)
+        start = cap - math.log(math.expm1(cap - math.log(QUERY_SCALE)))
+        self.role_scale = nn.Parameter(torch.full((len(QUERY_ROLES),), start))
+        # The hands a move leaves, mine and the opponent's (each a count over
+        # `CARD_SCALE` by resource), valued in the context: the discard MLP's shape.
+        self.hand_value = _mlp(context + 2 * HAND_READS, width, 1)
+        # Road Building's two roads read together, k_first' R k_second on the
+        # normalised edge keys, and a "joint" net's double turn its two
+        # settlements, k_first' P k_second on the vertex keys. Neither is
+        # symmetric: the order (which road first, which settlement pays) matters.
+        self.road_pair = nn.Parameter(torch.zeros(KEY_WIDTH, KEY_WIDTH))
+        joint = self.config.double_turn == "joint"
+        self.pair_matrix = nn.Parameter(torch.zeros(KEY_WIDTH, KEY_WIDTH)) if joint else None
+        for name in ("vertex_head", "road_head", "robber_head", "nobody_head", "global_head", "setup_head",
+                     "first_head", "second_head", "pair_head", "discard_head", "road_building"):
+            setattr(self, name, None)
 
     def _load_from_state_dict(self, state_dict, prefix, *args):
         # A 9.1 net can start from 9: only the appended input blocks are
@@ -395,6 +602,13 @@ class HexNet(nn.Module):
                      self.road_building):
             if head is not None:
                 nn.init.orthogonal_(output(head).weight, gain=0.01)
+        if self.two:                                  # 11d: the type scores and the queries make every logit
+            # The queries are normalised: their scale is `role_scales`'.
+            for head in (self.move_head, self.hand_value):
+                nn.init.orthogonal_(output(head).weight, gain=0.01)
+            for pair in (self.road_pair, self.pair_matrix):
+                if pair is not None:
+                    nn.init.orthogonal_(pair, gain=0.01)
         nn.init.orthogonal_(output(self.value_head).weight, gain=1.0)
         if self.points_head is not None:
             nn.init.orthogonal_(output(self.points_head).weight, gain=1.0)
@@ -405,11 +619,11 @@ class HexNet(nn.Module):
         row (another seat's view of a decision) skips every policy head."""
         if self.fused:
             s, t, h, v = self._fused_trunk(seats, table, hexes, vertices, vertex_owner, road_owner, reach)
-            h, v, s, t = self.out_hex(h), self.out_vertex(v), self.out_seat(s), self.out_table(t)
+            h, v, s, t = self.out_hex(h), self.out_vertex(v), self.out_seat(s), self._out_table(t)
             value_logits, value, points = self._value(s, t, seats)
             if not policy:
                 return Prediction(value=value, value_logits=value_logits, points=points)
-            return self._emit(s, t, h, v, value, value_logits, points)
+            return self._emit(s, t, h, v, value, value_logits, points, seats)
         # Ownership as one comparison each: a pointer of -1 matches no seat.
         rows = torch.arange(self.players, device=seats.device)
         owns_v = (vertex_owner.unsqueeze(-1) == rows).to(seats.dtype)            # (B, V, P)
@@ -419,8 +633,7 @@ class HexNet(nn.Module):
         roads_held = owns_e.sum(1).clamp(min=1.0).unsqueeze(-1)
         reached = reach.sum(-1).clamp(min=1e-3).unsqueeze(-1)
 
-        s = self.embed_seat(seats)
-        t = self.embed_table(table)
+        s, t = self._embed_seats(seats, table, 1)
         h = self.embed_hex(hexes)
         v = self.embed_vertex(vertices)
         scale = s.shape[-1] ** 0.5
@@ -429,7 +642,8 @@ class HexNet(nn.Module):
                 h, v, s, t = self._pooled_round(r, h, v, s, t, owns_v, owns_e, road, built, roads_held, reach,
                                                 reached, scale)
                 continue
-            hn, vn, sn, tn = r.norm_hex(h), r.norm_vertex(v), r.norm_seat(s), r.norm_table(t)
+            hn, vn, sn = r.norm_hex(h), r.norm_vertex(v), r.norm_seat(s)
+            tn = r.norm_table(t)
             tb = tn.unsqueeze(1)
             v_from_h = self.A_vh @ hn
             h_from_v = self.A_hv @ vn
@@ -456,13 +670,46 @@ class HexNet(nn.Module):
                                       tb.expand_as(s)], -1))
             # The table reads each kind's mean token, normalised: the norm of
             # the mean, one row per kind, rather than every token normalised again.
-            t = t + r.table(torch.cat([tn, r.norm_seat(s.mean(1)), r.norm_hex(h.mean(1)),
-                                       r.norm_vertex(v.mean(1))], -1))
-        h, v, s, t = self.out_hex(h), self.out_vertex(v), self.out_seat(s), self.out_table(t)
+            if r.board:
+                t = t + self._board_step(r, tn, hn, vn, h.mean(1), v.mean(1), s[:, 0])
+            else:
+                t = t + r.table(torch.cat([tn, r.norm_seat(s.mean(1)), r.norm_hex(h.mean(1)),
+                                           r.norm_vertex(v.mean(1))], -1))
+        h, v, s, t = self.out_hex(h), self.out_vertex(v), self.out_seat(s), self._out_table(t)
         value_logits, value, points = self._value(s, t, seats)
         if not policy:
             return Prediction(value=value, value_logits=value_logits, points=points)
-        return self._emit(s, t, h, v, value, value_logits, points)
+        return self._emit(s, t, h, v, value, value_logits, points, seats)
+
+    def _embed_seats(self, seats: Tensor, table: Tensor, dim: int) -> tuple[Tensor, Tensor | None]:
+        """The seat tokens, stacked along `dim` (1 batch-first, 0 seat-major),
+        and the table token: under 11d my token and the opponent's, each by
+        its own layer from its own columns, and the board token from the
+        board block."""
+        if self.two:
+            return (torch.stack([self.embed_me(seats[..., :MY_FEATURES_11D]),
+                                 self.embed_other(seats[..., MY_FEATURES_11D:])], dim), self.embed_board(table))
+        s = self.embed_seat(seats)
+        return (s if dim == 1 else s.transpose(0, 1)), self.embed_table(table)
+
+    def _board_step(self, r: _Round, bn: Tensor, hn: Tensor, vn: Tensor, h_mean: Tensor, v_mean: Tensor,
+                    me: Tensor) -> Tensor:
+        """Contract 11d's board token's update in round `r`, from its own
+        normalised token `bn` `(B, W)`: one attention read of the round's
+        normalised hexes `hn` and vertices `vn` (batch-first), its query from
+        `bn` and each kind of node's own keys and values, `BOARD_READ` wide;
+        then an MLP over [bn, the hexes' and vertices' means and my seat
+        token, each normalised, and the read], the table update's shape."""
+        query = r.board_query(bn)                                                  # (B, K)
+        pairs = torch.cat([r.board_hex(hn), r.board_vertex(vn)], 1)               # (B, H + V, 2K)
+        keys, values = pairs.split(BOARD_READ, -1)
+        weights = torch.softmax((keys @ _as(query, keys.dtype).unsqueeze(-1)).squeeze(-1) / BOARD_READ ** 0.5, -1)
+        read = (_as(weights, values.dtype).unsqueeze(1) @ values).squeeze(1)
+        return r.table(torch.cat([bn, r.norm_hex(h_mean), r.norm_vertex(v_mean), r.norm_seat(me),
+                                  _as(read, bn.dtype)], -1))
+
+    def _out_table(self, t: Tensor | None) -> Tensor | None:
+        return None if t is None else self.out_table(t)
 
     def _fused_trunk(self, seats, table, hexes, vertices, vertex_owner, road_owner, reach):
         """The rounds node-major, as `hexn.model.HexNet._fused_round` runs
@@ -509,13 +756,13 @@ class HexNet(nn.Module):
         def by_reach(projected: Tensor) -> Tensor:                                # (P, B, W) -> (V, B, W)
             return (reach.transpose(1, 2).to(projected.dtype) @ projected.transpose(0, 1)).transpose(0, 1)
 
-        s = self.embed_seat(seats).transpose(0, 1)                                # (P, B, W)
-        t = self.embed_table(table)                                               # (B, W)
+        s, t = self._embed_seats(seats, table, 0)                                 # (P, B, W), (B, W)
         h = self.embed_hex(hexes).transpose(0, 1)                                 # (H, B, W)
         v = self.embed_vertex(vertices).transpose(0, 1)                           # (V, B, W)
         scale = width ** 0.5
         for r in self.rounds:
-            hn, vn, sn, tn = r.norm_hex(h), r.norm_vertex(v), r.norm_seat(s), r.norm_table(t)
+            hn, vn, sn = r.norm_hex(h), r.norm_vertex(v), r.norm_seat(s)
+            tn = r.norm_table(t)                                                  # what every token reads
             dtype = vn.dtype
             # Seat <- board: buildings and reach over vertices, roads over edge midpoints.
             vb = vn.transpose(0, 1)                                               # (B, V, W) view
@@ -553,12 +800,17 @@ class HexNet(nn.Module):
             h = h + r.hex[2](r.hex[1](pre_h))
             v = v + r.vertex[2](r.vertex[1](pre_v))
             s = s + r.seat[2](r.seat[1](pre_s))
-            t = t + r.table(torch.cat([tn, r.norm_seat(s.mean(0)), r.norm_hex(h.mean(0)), r.norm_vertex(v.mean(0))], -1))
+            if r.board:
+                t = t + self._board_step(r, tn, hn.transpose(0, 1), vn.transpose(0, 1), h.mean(0), v.mean(0), s[0])
+            else:
+                t = t + r.table(torch.cat([tn, r.norm_seat(s.mean(0)), r.norm_hex(h.mean(0)), r.norm_vertex(v.mean(0))],
+                                          -1))
         return (s.transpose(0, 1).contiguous(), t, h.transpose(0, 1).contiguous(), v.transpose(0, 1).contiguous())
 
     def _pooled_round(self, r: _Round, h, v, s, t, owns_v, owns_e, road, built, roads_held, reach, reached, scale):
         """One round with each kind of message pooled into one input."""
-        hn, vn, sn, tn = r.norm_hex(h), r.norm_vertex(v), r.norm_seat(s), r.norm_table(t)
+        hn, vn, sn = r.norm_hex(h), r.norm_vertex(v), r.norm_seat(s)
+        tn = r.norm_table(t)
         h_from_v = self.A_hv @ vn
         v_from_h = self.A_vh @ hn
         # Per incident edge, the neighbour's token and the road's owner's (a
@@ -583,13 +835,18 @@ class HexNet(nn.Module):
         h = h + update(r.hex, r.hex_table, torch.cat([hn, h_from_v], -1))
         v = v + update(r.vertex, r.vertex_table, torch.cat([vn, v_from_h, v_edges, v_seats], -1))
         s = s + update(r.seat, r.seat_table, torch.cat([sn, *seats_in, s_board], -1))
-        t = t + r.table(torch.cat([tn, r.norm_seat(s.mean(1)), r.norm_hex(h.mean(1)), r.norm_vertex(v.mean(1))], -1))
+        if r.board:
+            t = t + self._board_step(r, tn, hn, vn, h.mean(1), v.mean(1), s[:, 0])
+        else:
+            t = t + r.table(torch.cat([tn, r.norm_seat(s.mean(1)), r.norm_hex(h.mean(1)), r.norm_vertex(v.mean(1))], -1))
         return h, v, s, t
 
-    def _value(self, s: Tensor, t: Tensor, seats: Tensor) -> tuple[Tensor, Tensor, Tensor | None]:
+    def _value(self, s: Tensor, t: Tensor | None, seats: Tensor) -> tuple[Tensor, Tensor, Tensor | None]:
         """The win head's logits and softmax over seats, and the points head's
-        number per seat where the net has one: each seat token read with the table."""
-        read = torch.cat([s, t.unsqueeze(1).expand_as(s)], -1)
+        number per seat where the net has one: each seat token read with the
+        table, or under 11d with my token."""
+        context = s[:, :1] if self.two else t.unsqueeze(1)
+        read = torch.cat([s, context.expand_as(s)], -1)
         value_logits = self.value_head(read).squeeze(-1)
         points = None if self.points_head is None else self.points_head(read).squeeze(-1).float()
         if self.CONTRACT == "9.1":
@@ -602,7 +859,9 @@ class HexNet(nn.Module):
         return value_logits, torch.softmax(value_logits, -1), points
 
     def _emit(self, s: Tensor, t: Tensor, h: Tensor, v: Tensor, value: Tensor, value_logits: Tensor,
-              points: Tensor | None = None) -> Prediction:
+              points: Tensor | None = None, seats: Tensor | None = None) -> Prediction:
+        if self.two:
+            return self._emit_queries(s, t, h, v, value, value_logits, seats)
         batch = s.shape[0]
         me = s[:, 0]
         a, b = _pick(v, 1, self.ends[:, 0]), _pick(v, 1, self.ends[:, 1])
@@ -619,11 +878,142 @@ class HexNet(nn.Module):
         return Prediction(value=value, value_logits=value_logits, points=points, logits=logits, road=road, me=me,
                           table=t, vertices=v, hexes=h, seats=s)
 
+    def _emit_queries(self, s: Tensor, t: Tensor, h: Tensor, v: Tensor, value: Tensor, value_logits: Tensor,
+                      seats: Tensor) -> Prediction:
+        """The contract-11d flat row: each move its type's score plus its
+        roles' queries against the keys of what it names, block by block in
+        the flat space's `ActionType` order:
+
+        - roll, end turn, buy a card, play a knight, play Road Building (the
+          card alone, as a table asks it a move at a time): the type alone;
+        Each query . key is normalised (`QUERY_SCALE`): both layer-normalised
+        with a gain, their product over sqrt(KEY_WIDTH), times the role's
+        learned scale.
+
+        - a settlement, a city, a setup settlement at v: + q . k_v, a setup
+          settlement's query the paying one where my token's settlements left
+          say one is already placed (the snake's second, which pays);
+        - a road, a setup road at e: + q . k_e (a free road owed is a road);
+        - a resource move: + V(the two hands it leaves), the hand value
+          (`_resource_values`): Year of Plenty (a, b) my hand + a + b; Monopoly r
+          my hand + the opponent's r, its r none; a bank trade giving g for t
+          my hand less my rate of g, plus a t; a discard of one card of r my
+          hand less it;
+        - the robber block is `robber_logits`', scored on demand.
+
+        `road` is each edge's road score; the setup turn, Road Building and
+        discard candidates read `types`, `rb_road`, `edge_keys`,
+        `hand_context` and `hands`."""
+        batch = s.shape[0]
+        me, other = s[:, 0], s[:, 1]
+        context = torch.cat([me, other, t], -1)
+        types = self.move_head(context)                                           # (B, types)
+        # Each role's normalised query with its scale and 1/sqrt(KEY_WIDTH) folded in.
+        queries = _unit(self.query_head(context).reshape(batch, len(QUERY_ROLES), KEY_WIDTH), self.query_gain)
+        queries = queries * _as(self.role_scales() / KEY_WIDTH ** 0.5, queries.dtype).unsqueeze(-1)
+        a, b = _pick(v, 1, self.ends[:, 0]), _pick(v, 1, self.ends[:, 1])
+        k_vertex = _unit(self.vertex_key(v), self.key_gain[0])                   # (B, V, K)
+        k_edge = _unit(self.edge_key(torch.cat([a, b], -1)) + self.edge_key(torch.cat([b, a], -1)), self.key_gain[1])
+        # Every role's read of its kind's keys, one product a kind: (B, V, 4), (B, E, 3).
+        roles = len(VERTEX_ROLES)
+        on_vertex = k_vertex @ _as(queries[:, :roles], k_vertex.dtype).transpose(1, 2)
+        on_edge = k_edge @ _as(queries[:, roles:roles + len(EDGE_ROLES)], k_edge.dtype).transpose(1, 2)
+        settle, city, setup, paying_read = on_vertex.unbind(-1)
+        road_read, setup_road, rb_road = on_edge.unbind(-1)
+        mine, theirs = seats[:, self.my_hand], seats[:, self.their_hand]          # (B, resources)
+        # A setup settlement pays the starting hand when it is the seat's
+        # second: with a settlement already placed, fewer than all are left.
+        paying = seats[:, self.settlements_left] * PIECE_SCALE < MAX_SETTLEMENTS - 0.5
+        setup_settlement = torch.where(paying.unsqueeze(1), paying_read, setup)
+        hand_context = self._hand_context(context)
+        worth = self._resource_values(hand_context, mine, theirs, seats[:, self.my_rates])
+        # Each slot its type's score plus its read or hand value (`slot_type`, `slot_added`).
+        added = torch.cat([setup_settlement, setup_road, settle, city, road_read, _as(worth, on_vertex.dtype),
+                           on_vertex.new_zeros(batch, 1)], 1)
+        logits = (torch.cat([types, types.new_zeros(batch, 1)], 1).index_select(1, self.slot_type)
+                  + _as(added, types.dtype).index_select(1, self.slot_added))
+        return Prediction(value=value, value_logits=value_logits, logits=logits, road=logits[:, self.slot_road],
+                          me=me, table=t, vertices=v, hexes=h, seats=s, types=types,
+                          robber_query=queries[:, _ROLE["robber"]], rb_road=rb_road, hand_context=hand_context,
+                          hands=torch.stack([mine, theirs], 1), vertex_keys=k_vertex, edge_keys=k_edge,
+                          setup_reads=on_vertex[..., 2:4].transpose(1, 2), setup_road_read=setup_road)
+
+    def direct_weights(self) -> tuple[nn.Linear, ...]:
+        """The linear layers whose weight the forward reads outside the layer's
+        own call: 11d's hand value's first layer, applied block by block and
+        mixed with its hands in elementwise products. A cache of their weights
+        cast to another precision (`hexn.inference9`) would change the forward,
+        so such a cache leaves them out."""
+        return (self.hand_value[0],) if self.two else ()
+
+    def role_scales(self) -> Tensor:
+        """Each role's scale on its normalised query . key: exp of the learned
+        `role_scale` t, soft-capped at ROLE_SCALE_MAX, exp(c - softplus(c - t))
+        with c = log(ROLE_SCALE_MAX): exp(t) while t is well below c, and never
+        above the cap however far t grows."""
+        cap = math.log(ROLE_SCALE_MAX)
+        return (cap - nn.functional.softplus(cap - self.role_scale)).exp()
+
+    def _hand_context(self, context: Tensor) -> Tensor:
+        """The hand value's first layer on the context alone, once per row. Its
+        input reads [context, my hand, the opponent's hand]."""
+        first = self.hand_value[0]
+        return nn.functional.linear(context, first.weight[:, :context.shape[-1]], first.bias)
+
+    def _hand_values(self, hand_context: Tensor, mine: Tensor, theirs: Tensor) -> Tensor:
+        """V over hands `(..., resources)` mine and the opponent's, beside the
+        row's first-layer term (`_hand_context`, broadcast over them): the
+        hand value MLP, its first layer applied block by block."""
+        weight = self.hand_value[0].weight
+        at = weight.shape[1] - 2 * HAND_READS
+        hidden = hand_context
+        for hand in (mine, theirs):
+            hidden = hidden + nn.functional.linear(hand, weight[:, at:at + HAND_READS])
+            at += HAND_READS
+        return self.hand_value[2](self.hand_value[1](hidden)).squeeze(-1)
+
+    def _resource_values(self, hand_context: Tensor, mine: Tensor, theirs: Tensor, rates: Tensor) -> Tensor:
+        """`(B, 50)`: V of the two hands each resource move leaves, in the flat
+        space's slot order, Monopoly (5), Year of Plenty (15), bank trade
+        (`give * 5 + take`, 25), discard (5): Year of Plenty (a, b) adds a and
+        b to mine; Monopoly r adds the opponent's r to mine and leaves it none;
+        a bank trade giving g for t takes my rate of g (`rates` the column, the
+        rate over 4) and adds a t; a discard of r takes one r.
+
+        V's first layer is linear in the hands, so each move's is the row's
+        (the context, my hand and the opponent's, once) plus the layer applied
+        to what the move changes: a term per slot, not a hand per slot."""
+        weight = self.hand_value[0].weight
+        at = weight.shape[1] - 2 * HAND_READS
+        first_mine, first_theirs = weight[:, at:at + HAND_READS], weight[:, at + HAND_READS:]  # (hidden, resources)
+        row = (hand_context + nn.functional.linear(mine, first_mine)
+               + nn.functional.linear(theirs, first_theirs)).unsqueeze(1)                # (B, 1, hidden)
+        w_mine, w_theirs = first_mine.T, first_theirs.T                                   # (resources, hidden)
+        card = _as(self.card, w_mine.dtype) @ w_mine                                      # one card of r
+        rate = rates * (BASE_TRADE_RATIO / CARD_SCALE)                                    # (B, give)
+        batch, hidden = mine.shape[0], w_mine.shape[1]
+        change = torch.cat([
+            theirs.unsqueeze(-1) * (w_mine - w_theirs),                                   # Monopoly r
+            (_as(self.plenty_cards, w_mine.dtype) @ w_mine).expand(batch, -1, -1),        # Year of Plenty
+            (card.unsqueeze(0) - (rate.unsqueeze(-1) * w_mine).unsqueeze(2)).reshape(batch, -1, hidden),  # trade
+            (-card).expand(batch, -1, -1),                                                # discard r
+        ], 1)
+        return self.hand_value[2](self.hand_value[1](row + _as(change, row.dtype))).squeeze(-1)
+
     def robber_logits(self, out: Prediction, rows: Tensor) -> Tensor:
         """`(len(rows), hexes * (players + 1))`: the robber block of `rows`'
         flat logits, each hex with each victim's seat token, then nobody."""
         uh = out.hexes[rows]
         s = out.seats[rows]
+        if self.two:                                  # 11d: type + q_robber . k_(hex, victim), nobody from the hex
+            keys = _unit(torch.cat([self.robber_key(torch.cat([
+                uh.unsqueeze(2).expand(-1, -1, self.players, -1),
+                s.unsqueeze(1).expand(-1, uh.shape[1], -1, -1)], -1)), self.nobody_key(uh).unsqueeze(2)], 2),
+                self.key_gain[2])
+            query = out.robber_query[rows].to(keys.dtype)
+            scores = (keys @ query[:, None, :, None]).squeeze(-1)                 # (R, H, P + 1)
+            kind = out.types[rows, int(ActionType.MOVE_ROBBER)].to(scores.dtype)
+            return (scores + kind[:, None, None]).reshape(rows.shape[0], -1)
         victims = self.robber_head(torch.cat([
             uh.unsqueeze(2).expand(-1, -1, self.players, -1),
             s.unsqueeze(1).expand(-1, uh.shape[1], -1, -1)], -1)).squeeze(-1)     # (R, H, P)
@@ -639,7 +1029,23 @@ class HexNet(nn.Module):
     def setup_heads(self, out: Prediction, rows: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """For `rows`, per (settlement, road) incidence the setup turn's score,
         the double turn's first and second (paying) turn's, and per settlement
-        pair `(V, V)` the double turn's pair term. A "parts" net has none of the three."""
+        pair `(V, V)` the double turn's pair term. A "parts" net has none of the three.
+
+        A contract-11d "joint" net: the first turn is the setup type plus
+        q_setup_settlement . k_v + q_setup_road . k_e (it does not pay), the
+        second q_setup_settlement_paying . k_v + q_setup_road . k_e, and the
+        pair k_first' P k_second over sqrt(KEY_WIDTH), on the normalised vertex keys."""
+        if self.two:
+            if self.pair_matrix is None:
+                raise ValueError(f"a {self.config.double_turn!r} net has no joint double-turn head")
+            kind = (out.types[rows, int(ActionType.SETUP_SETTLEMENT)]
+                    + out.types[rows, int(ActionType.SETUP_ROAD)]).unsqueeze(1)
+            reads, road = out.setup_reads[rows], out.setup_road_read[rows][:, self.inc_edge]
+            first = kind + reads[:, 0][:, self.inc_vertex] + road
+            second = reads[:, 1][:, self.inc_vertex] + road
+            keys = out.vertex_keys[rows]
+            pair = keys @ self.pair_matrix.to(keys.dtype) @ keys.transpose(1, 2) / KEY_WIDTH ** 0.5
+            return self.setup_scores(out, rows), first, second, pair
         if self.first_head is None:
             raise ValueError(f"a {self.config.double_turn!r} net has no joint double-turn head")
         u = out.vertices[rows]
@@ -652,8 +1058,11 @@ class HexNet(nn.Module):
         """Every flat action's score for every row: `full_logits`, with a
         setup road scored as the road head scores its edge, so a position
         inside a setup turn, asked a move at a time, reads the road head. A
-        setup turn asked whole is scored by `setup_scores`."""
+        setup turn asked whole is scored by `setup_scores`. A contract-11d net's flat
+        row already scores each setup road by its own query (`_emit_queries`)."""
         logits = self.full_logits(out)
+        if self.two:
+            return logits
         return logits.index_copy(1, self.slot_setup_road, out.road.to(logits.dtype))
 
     def double_scores(self, out: Prediction, rows: Tensor) -> Tensor:
@@ -668,13 +1077,25 @@ class HexNet(nn.Module):
 
     def setup_scores(self, out: Prediction, rows: Tensor) -> Tensor:
         """For `rows`, per (settlement, road) incidence the setup turn's score
-        alone: `setup_heads`' first output, without the double turn's heads."""
+        alone: `setup_heads`' first output, without the double turn's heads.
+        A contract-11d net scores the turn as its two moves' flat scores summed: each
+        type, q_setup_settlement . k_v and q_setup_road . k_e."""
+        if self.two:
+            logits = out.logits[rows]
+            return logits[:, self.inc_setup_settlement] + logits[:, self.inc_setup_road]
         u = out.vertices[rows]
         return self.setup_head(torch.cat([u[:, self.inc_vertex], u[:, self.inc_far]], -1)).squeeze(-1)
 
     def discard_scores(self, out: Prediction, rows: Tensor, candidates: Tensor) -> Tensor:
         """One score per discard candidate: `candidates` `(K, 10)` (kept, then
-        given, card counts), `rows` `(K,)` the batch row each belongs to."""
+        given, card counts), `rows` `(K,)` the batch row each belongs to. A
+        contract-11d net scores the discard type plus the value of the hand it
+        keeps, beside the opponent's (`_hand_values`)."""
+        if self.two:
+            hands = out.hands[rows]
+            kept = candidates[:, :NUM_RESOURCES].to(hands.dtype) / CARD_SCALE
+            kind = out.types[:, int(ActionType.DISCARD)]
+            return kind[rows] + self._hand_values(out.hand_context[rows], kept, hands[:, 1]).to(kind.dtype)
         counts = candidates.to(out.me.dtype) / 10.0
         if self.config.discard == "linear":
             weights = self.discard_head(torch.cat([out.me, out.table], -1))[rows]       # (K, 10)
@@ -683,9 +1104,25 @@ class HexNet(nn.Module):
 
     def road_building_scores(self, out: Prediction, rows: Tensor, candidates: Tensor) -> Tensor:
         """One score per Road Building candidate: `candidates` `(K, 2)` edges,
-        `-1` for a road not placed; the card's own term plus each road's."""
-        played = self.road_building(torch.cat([out.me, out.table], -1)).squeeze(-1)[rows]
-        road = out.road[rows]
+        `-1` for a road not placed; the card's own term plus each road's. A
+        contract-11d net's card term is the Road Building type, each road's
+        is q_road_building . k_e, and two roads add k_first' R k_second over
+        sqrt(KEY_WIDTH) on the normalised edge keys (`road_pair`)."""
+        if self.two:
+            played = out.types[:, int(ActionType.PLAY_ROAD_BUILDING)][rows]
+            road = out.rb_road[rows].to(played.dtype)
+            keys = out.edge_keys[rows]
+            first, second = candidates[:, 0].long(), candidates[:, 1].long()
+
+            def key(edge: Tensor) -> Tensor:                                        # (K, KEY_WIDTH)
+                return keys.gather(1, edge.clamp(min=0)[:, None, None].expand(-1, 1, keys.shape[-1])).squeeze(1)
+            # A batched product, not a sum over the key: no ReduceSum over no candidates.
+            both = ((key(first) @ self.road_pair.to(keys.dtype)).unsqueeze(1) @ key(second).unsqueeze(2)).reshape(-1)
+            played = played + torch.where((first >= 0) & (second >= 0), both.to(played.dtype) / KEY_WIDTH ** 0.5,
+                                          torch.zeros_like(played))
+        else:
+            played = self.road_building(torch.cat([out.me, out.table], -1)).squeeze(-1)[rows]
+            road = out.road[rows]
         total = played
         for column in range(2):
             edge = candidates[:, column].long()

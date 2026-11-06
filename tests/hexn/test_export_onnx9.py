@@ -64,6 +64,8 @@ def a_checkpoint(path: Path, config: ModelConfig, *, seed: int = 0, iteration: i
             if head is not None:
                 for p in head.parameters():
                     p.mul_(50)
+        if getattr(net, "pair_matrix", None) is not None:
+            net.pair_matrix.normal_(0, 1)
     torch.save({"net": net.state_dict(), "model_config": asdict(config),
                 "args": {"contract": config.contract, "players": players, "max_offers": 0}, "iteration": iteration},
                path)
@@ -162,10 +164,11 @@ def test_the_graph_chooses_the_decision_the_torch_net_chooses(config, tmp_path):
         np.testing.assert_allclose(v1, v2, atol=1e-4)
 
 
-@pytest.mark.parametrize("contract,global_seat,width", [("9d", False, 828), ("9d.1", True, 848)])
+@pytest.mark.parametrize("contract,global_seat,width", [("9d", False, 828), ("9d.1", True, 848),
+                                                      ("11d", False, 1000)])
 def test_a_two_seat_net_on_contract_9d_exports_and_plays_as_its_torch_net(tmp_path, contract, global_seat, width):
-    """A two-seat net (9d, or 9d.1 with the global head reading its own seat)
-    exports a graph that chooses, values and scores as the torch net does at
+    """A two-seat net (9d, 9d.1 with the global head reading its own seat, or
+    11d with no table token) exports a graph that chooses, values and scores as the torch net does at
     a two-seat table, declares its contract and seat count, and is refused at
     a four-seat table."""
     config = replace(PARTS, contract=contract, others=True, points=False, global_seat=global_seat)
@@ -330,16 +333,18 @@ def test_a_real_contract_9_checkpoint_exports_and_plays_as_its_torch_net(path, t
         assert served.act_rows([(game, seat, options)]) == reference.act_rows([(game, seat, options)])
 
 
-def test_a_two_seat_net_plays_a_table_dealt_four_by_its_live_seats(tmp_path):
-    """A contract-9d net at a table dealt four with seats 1 and 3 retired, the
+@pytest.mark.parametrize("contract", ["9d", "11d"])
+def test_a_two_seat_net_plays_a_table_dealt_four_by_its_live_seats(tmp_path, contract):
+    """A two-seat net (9d or 11d) at a table dealt four with seats 1 and 3 retired, the
     table every duel is served at: it reads the two live seats, chooses legal
     moves, and reports values in board-seat order with the retired seats at
     zero; its exported graph chooses and values as the torch net does there."""
     from hexset.rules import DUEL_VARIANT_GAME
 
-    config = replace(PARTS, contract="9d", others=True, points=False)
+    config = replace(PARTS, contract=contract, others=True, points=False)
     source = a_checkpoint(tmp_path / "duel.pt", config, players=2)
     out = export9(str(source), tmp_path / "duel.onnx")
+    assert read_metadata(out.read_bytes())["contract"] == contract
     reference = _torch_policy(source, config, players=2)
     rng = random.Random(5)
     rows = []
@@ -367,8 +372,59 @@ def test_a_two_seat_net_plays_a_table_dealt_four_by_its_live_seats(tmp_path):
             np.testing.assert_allclose(served.value_rows([(game, s)])[0], value, atol=1e-4)
 
 
-def test_a_two_seat_checkpoint_plays_whole_duels_at_a_table_dealt_four(tmp_path):
-    """`network:<file>` seats a contract-9d checkpoint at the arena's
+def test_a_joint_11d_net_exports_and_plays_the_double_turn_whole_or_in_parts(tmp_path):
+    """A "joint" contract-11d net exports a graph that asks the snake seat's
+    double turn whole (`double_rows`), chooses, values and scores as the
+    torch net does at a two-seat table and at a table dealt four with two
+    retired; exported asking it in parts, the same net's graph plays as the
+    torch net asked in parts."""
+    from hexset.rules import DUEL_VARIANT_GAME
+
+    config = replace(PARTS, contract="11d", others=True, points=False, double_turn="joint")
+    source = a_checkpoint(tmp_path / "joint.pt", config, players=2)
+    whole = export9(str(source), tmp_path / "joint.onnx")
+    parts = export9(str(source), tmp_path / "parts.onnx", double_turn="parts")
+    assert read_metadata(whole.read_bytes())["double_turn"] == "joint"
+    assert read_metadata(parts.read_bytes())["double_turn"] == "parts"
+    reference = _torch_policy(source, config, players=2)
+    in_parts = Policy9(reference.net, reference.space, double_turn="parts")
+    rows = positions(3, 120, players=2)
+    rng = random.Random(9)
+    for index in range(10):
+        game = deal_game(3, index, 4, game_type=DUEL_VARIANT_GAME, locked=(1, 3))
+        for _ in range(rng.choice((0, 2, 6, 40, 160))):
+            if is_over(game):
+                break
+            seat = _decider(game)
+            asking = seat if game.phase is Phase.DISCARD else None
+            apply(game, rng.choice(legal_actions(game, asking)), asking)
+        if not is_over(game):
+            rows.append((game, _decider(game)))
+    for index in range(4):           # the snake seat's double turn, two moves in, at either table
+        for game in (deal_game(5, index, 2, game_type=DUEL_VARIANT_GAME),
+                     deal_game(5, index, 4, game_type=DUEL_VARIANT_GAME, locked=(1, 3))):
+            for _ in range(2):
+                apply(game, rng.choice(legal_actions(game)))
+            rows.append((game, _decider(game)))
+    assert "double" in _kinds(rows, True, reference.space)
+    for path, torch_policy, joint in ((whole, reference, True), (parts, in_parts, False)):
+        served_by = {}
+        for game, seat in rows:
+            topology = game._state.board.topology
+            served = served_by.setdefault(id(topology), load(str(path), topology).policy)
+            assert ("double_rows" in served.inputs) == joint
+            options = tuple(options_for(game))
+            choice = torch_policy.act_rows([(game, seat, options)])[0]
+            assert choice in options and served.act_rows([(game, seat, options)]) == [choice]
+            live = [s for s in range(game.num_players) if s not in game.locked]
+            for s in live:
+                np.testing.assert_allclose(served.value_rows([(game, s)])[0], torch_policy.value_rows([(game, s)])[0],
+                                           atol=1e-4)
+
+
+@pytest.mark.parametrize("contract", ["9d", "11d"])
+def test_a_two_seat_checkpoint_plays_whole_duels_at_a_table_dealt_four(tmp_path, contract):
+    """`network:<file>` seats a two-seat (9d or 11d) checkpoint at the arena's
     four-dealt duel table, two seats retired, and every game is played out
     and kept."""
     import hexn.netbot  # noqa: F401  (registers the `network:` entrant kind)
@@ -376,7 +432,7 @@ def test_a_two_seat_checkpoint_plays_whole_duels_at_a_table_dealt_four(tmp_path)
     from hexset.game import UNSTRUCTURED_TURN_CAP
     from hexset.rules import DUEL_VARIANT_GAME
 
-    config = replace(PARTS, contract="9d", others=True, points=False)
+    config = replace(PARTS, contract=contract, others=True, points=False)
     source = a_checkpoint(tmp_path / "duel.pt", config, players=2)
     lineup = lineup_from_names([f"network:{source}!notrade", "retired", "random", "retired"])
     result = compete(lineup, 4, seed=98000, action_cap=1500, turn_cap=UNSTRUCTURED_TURN_CAP,

@@ -134,7 +134,7 @@ Start with [training.md](docs/training.md); the rest are listed by name.
   changed whenever that shape changes: the observation it reads, the
   action space it answers over, and the graph and metadata
   `hexn.export_onnx` writes into an ONNX file. The current ones are `8` and
-  `8.1` (`hexn.model`) and `9`, `9.1`, `9d` and `9d.1` (`hexn.model9`).
+  `8.1` (`hexn.model`) and `9`, `9.1`, `9d`, `9d.1` and `11d` (`hexn.model9`).
   HexSet's own `docs/onnx.md` defines every contract it serves (its record
   contract is `CONTRACT_VERSION`, `8.1`),
   and rejects a file naming any other. This package's own module docstrings

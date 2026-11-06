@@ -2,6 +2,81 @@
 
 All notable changes to the `hexn` package are recorded here.
 
+## 0.50.0
+
+### Added
+
+- **Contract 11d and its net.** `--contract 11d` trains on HexSet's 11d
+  observation (two seat tokens of their own widths, the board block, the
+  hex number one-hot) under the same two-seat rules as 9d. `HexNet` embeds
+  my token and the opponent's by layers of their own (`embed_me`,
+  `embed_other`) and the board block as a board token (`embed_board`) in
+  the table token's place: each round broadcasts it to the hexes, vertices
+  and seats as the table is, and updates it by an MLP over it, the hexes'
+  and vertices' means, my seat token, and one attention read over every hex
+  and vertex (a 16-wide query from the board token, each kind of node its
+  own keys and values). Its heads read a context of my token, the
+  opponent's and the board token: a score per move type
+  (`MOVE_TYPES`, one per `ActionType`, from a hidden layer so a move with no
+  target still weighs the position) and a 16-wide query per targeted role
+  (`QUERY_ROLES`), read against keys of each vertex, each edge (symmetric in
+  its ends) and each robber hex with its victim's token or nobody. Each
+  query and key is layer-normalised with a gain and their product divided
+  by 4 (the square root of 16) and scaled by the role's learned scale
+  (`role_scales`), starting at `QUERY_SCALE` and soft-capped at
+  `ROLE_SCALE_MAX` (4), so a score grows only through that scale and the
+  scale cannot run away. A board move scores its type plus its roles' query-key products: a
+  setup turn its settlement's and road's flat scores summed, Road Building
+  the card's type plus each road's read plus, for two roads,
+  `k_first' R k_second / 4` on the normalised edge keys (`R` learned, not
+  symmetric). A resource move scores its type plus a hand value, an MLP
+  over the context and the two hands the move leaves (mine and the
+  opponent's, counts over 10): Year of Plenty (a, b) my hand plus a and b,
+  Monopoly r my hand plus the opponent's r and its r none, a bank trade my
+  hand less my rate of what I give plus what I get, a discard the hand it
+  keeps (one card of r at a time: my hand less it). Rolling, ending the
+  turn, buying a card, playing a knight and the Road Building card alone
+  score their type. Each seat's win logit reads its own token with mine.
+  A setup settlement reads its own query for the seat's first and a paying
+  one for its second, which pays the starting hand: the observation says
+  which (my token's settlements left). There is no global, setup, discard or
+  points head: `points` and `global_seat` are refused, as are
+  `--points-head` and `--global-seat` with `--contract 11d`. A `"joint"` net
+  (`--double-turn joint`, contract 11d only) also scores the snake seat's
+  double turn whole, first by second (`double_scores`): the setup types, the
+  first turn's plain and the second's paying query against their vertex
+  keys, the setup-road query against both edges, and `k_first' P k_second / 4`
+  on the normalised vertex keys, with `P` a learned 16 x 16 matrix that is
+  not symmetric, so which settlement pays matters. Self-play asks the double turn in parts either
+  way. `Policy9(..., double_turn="parts")` and `export9(...,
+  double_turn="parts")` read a joint net in parts: each setup turn by its
+  own query and no pair term. The board token's key and value for each kind
+  of node come from one layer (`board_hex`, `board_vertex`; a checkpoint
+  with a key layer and a value layer loads into it), and the heads run as
+  few batched operations: each kind of key read by all its roles in one
+  product, the flat row gathered by slot, and the hand value's first layer
+  applied to the row once plus a term per resource move. At width 64, 3 rounds, pooled messages and
+  the others read, the net has 332,281 parameters, a joint one 332,537.
+  The export stamps `11d`, and the decision interface (`flat_scores`,
+  `setup_scores`, `double_scores`, `road_building_scores`,
+  `discard_scores`, `robber_logits`) is the same as every contract-9 net's.
+
+- **A contract-11d net searches whole decisions as a 9d.1 net does.** An
+  11d (architecture a10) export carries the whole-option outputs
+  (`option_flat`, `option_setup`, `option_road_building`,
+  `option_discard`), so `rollout:` and a file stamped with a rollout search
+  (`setup=full`, `det`, `mix`, `anchor`) search its setup turns, discards
+  and Road Building whole at a two-seat table and at a duel table dealt four
+  with two seats retired, its playout copies held on the native engine
+  there.
+
+- **Collection inference takes a contract-11d net.**
+  `hexn.inference9.WorkerInference` traces an 11d net's forward with every
+  field it fills (its heads' reads beside the trunk's), and leaves its weight
+  cast cache off the layers the forward reads outside their own call
+  (`HexNet.direct_weights`, the hand value's first layer), so BF16
+  collection answers as the original forward does, bit for bit.
+
 ## 0.49.4
 
 ### Fixed

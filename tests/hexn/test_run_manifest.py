@@ -115,12 +115,13 @@ def test_a_complete_freeze_fills_nothing(tmp_path):
     assert "filled" not in run.load(tmp_path / "unit").meta
 
 
-def test_two_seat_model_round_trips_without_changing_the_recipe(tmp_path):
-    written = _frozen_ppo(tmp_path, "--contract", "9d", "--players", "2", "--others",
-                          "--messages", "pooled", "--no-attention")
+@pytest.mark.parametrize("contract,double_turn", [("9d", "parts"), ("11d", "parts"), ("11d", "joint")])
+def test_two_seat_model_round_trips_without_changing_the_recipe(tmp_path, contract, double_turn):
+    written = _frozen_ppo(tmp_path, "--contract", contract, "--players", "2", "--others",
+                          "--messages", "pooled", "--no-attention", "--double-turn", double_turn)
     read = run.load(tmp_path / "unit")
     assert read.config == written.config
-    assert read.config["contract"] == "9d"
+    assert read.config["contract"] == contract
     assert read.config["others"] is True
     assert "filled" not in read.meta
 

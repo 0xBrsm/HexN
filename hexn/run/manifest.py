@@ -122,6 +122,7 @@ ADDED: dict[str, dict[str, Any]] = {
         "points_head": False,
         "others": False,
         "global_seat": False,
+        "double_turn": "parts",
         "discard_order": "seat",
         "zero_sum": 0.6,
         "c9_clip": "per-decision",

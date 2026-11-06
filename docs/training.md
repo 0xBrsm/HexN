@@ -185,7 +185,7 @@ table.
 
 ## Contract 9 training
 
-`--contract 9` (or `9.1`, `9d`, `9d.1`) trains `hexn.model9.HexNet`
+`--contract 9` (or `9.1`, `9d`, `9d.1`, `11d`) trains `hexn.model9.HexNet`
 ([checkpoints.md](checkpoints.md#the-contract-9-network-hexnmodel9)). The
 lanes ask the learner for whole decisions (`hexset.gym.lanes.LaneEnv`'s
 `decisions`), and `hexn.policy9.NetworkPolicy9` answers a tick in one
@@ -200,8 +200,8 @@ takes its entropy over them.
   `--attention`/`--no-attention`, `--others`, `--global-seat` and
   `--points-head` set the net's `ModelConfig`; a checkpoint carries it.
 - **Contracts.** `9.1` reads the table's rules, the next roll's odds and
-  live-seat flags. `9d` and `9d.1` are the two-seat observations and need
-  `--players 2`. `--rules-mix '<JSON>'` (contract `9.1`, `9d` or `9d.1`
+  live-seat flags. `9d`, `9d.1` and `11d` are the two-seat observations and
+  need `--players 2`. `--rules-mix '<JSON>'` (contract `9.1`, `9d`, `9d.1` or `11d`
   self-play only) freezes a `hexset.gym.distribution.Distribution`
   specification into the manifest, a format drawn per game; every game keeps
   the same number of dealt slots (`--players`), and unused seats retire

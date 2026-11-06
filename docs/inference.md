@@ -1,11 +1,14 @@
 # Collection inference
 
 An isolated CPU collection worker owns `hexn.inference9.WorkerInference` for
-its contract-9 policy. Eligible two- or four-seat models use contracts 9, 9d or 9d.1,
+its contract-9 policy. Eligible two- or four-seat models use contracts 9, 9d, 9d.1 or 11d,
 pooled messages without attention, normalization, linear heads, an MLP
 discard head and parts decisions. In eval mode with fused collection and the
 configured BF16 precision they cache Linear weight casts and trace the original
-network forward. FP32, other precisions, training models and unsupported
+network forward. A layer whose weight the forward reads outside the layer's
+own call (`HexNet.direct_weights`: an 11d net's hand value's first layer)
+keeps its FP32 weight, and the trace returns every field the forward fills,
+so the traced answers are the original forward's bit for bit. FP32, other precisions, training models and unsupported
 Torch interfaces keep the ordinary route. This does not change precision,
 decision heads, sampling, log probabilities or the sizes of policy calls.
 

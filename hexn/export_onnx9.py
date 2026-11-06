@@ -145,11 +145,11 @@ class _Export9(nn.Module):
     `hexn.model9.HexNet`, the scores `hexn.policy9.Policy9` reads, the legal
     masks and `hexn.policy9.best`'s argmax, traceable."""
 
-    def __init__(self, net: HexNet, layout: contract9.Layout9, topology: Topology) -> None:
+    def __init__(self, net: HexNet, layout: contract9.Layout9, topology: Topology, joint: bool | None = None) -> None:
         super().__init__()
         self.net = net
         self.layout = layout
-        self.joint = net.config.double_turn == "joint"
+        self.joint = net.config.double_turn == "joint" if joint is None else joint
         self.points = net.points_head is not None
         if self.joint:
             self.register_buffer("pairs_ok", torch.from_numpy(D.double_pairs(topology)), persistent=False)
@@ -310,7 +310,7 @@ def _dummy(net: HexNet, layout: contract9.Layout9, space: ActionSpace, topology:
     mistaken for fixed."""
     from .policy9 import Policy9
 
-    policy = Policy9(net, space)
+    policy = Policy9(net, space, double_turn="joint" if joint else "parts")
     rows = _sample_rows(layout.players, 3, seed=0)
     feed = _feed(rows, space, topology, joint, policy)
     feed["road_building"] = np.array([[0, 1], [2, -1]], dtype=np.int64)
@@ -380,7 +380,7 @@ def _verify_contract(path: Path, shapes: dict[str, tuple], joint: bool, points: 
 
 
 def _verify_parity(path: Path, net: HexNet, space: ActionSpace, topology: Topology, *, samples: int = 64,
-                   seed: int = 1) -> dict[str, float]:
+                   seed: int = 1, double_turn: str | None = None) -> dict[str, float]:
     """The graph against `hexn.policy9.Policy9` on `net`, on seeded positions
     of every kind of decision (`_sample_rows`), each asked its decision as
     HexSet asks it: the same `decision` on every row, `value` and
@@ -396,8 +396,8 @@ def _verify_parity(path: Path, net: HexNet, space: ActionSpace, topology: Topolo
 
     from .policy9 import Policy9
 
-    torch_policy = Policy9(net, space)
-    joint = net.config.double_turn == "joint"
+    torch_policy = Policy9(net, space, double_turn=double_turn)
+    joint = torch_policy.joint
     rows = _sample_rows(space.num_players, samples, seed)
     feed = _feed(rows, space, topology, joint, torch_policy)
     session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
@@ -433,6 +433,7 @@ def export9(
     opset: int = 18,
     serving: dict[str, str] | None = None,
     verify: bool = True,
+    double_turn: str | None = None,
 ) -> Path:
     """Load the contract-9 `checkpoint`, trace it to `out`, stamp it, verify
     its contract and parity, return `out`. `serving` is the serving keys to
@@ -444,14 +445,17 @@ def export9(
     net, space, meta = _load(checkpoint, topology)
     players = meta["players"]
     layout = contract9.layout(players, topology.num_hexes, topology.num_vertices, topology.num_edges, net.CONTRACT)
-    joint = net.config.double_turn == "joint"
+    double_turn = double_turn or net.config.double_turn
+    if double_turn == "joint" and net.config.double_turn != "joint":
+        raise ValueError(f"{checkpoint} is a {net.config.double_turn!r} net: it has no joint double-turn head")
+    joint = double_turn == "joint"
     points = net.points_head is not None
     serving = dict(serving or {})
     if "trader" in serving:
         from hexset.arena import entrant_from_name
 
         entrant_from_name(serving["trader"])  # refuse a name HexSet cannot seat, here
-    wrapper = _Export9(net, layout, topology).eval()
+    wrapper = _Export9(net, layout, topology, joint).eval()
     names_in, names_out = input_names(joint), output_names(points, joint)
     shapes = _shapes(topology, layout, space)
     out = Path(out)
@@ -472,7 +476,7 @@ def export9(
             "num_hexes": str(topology.num_hexes),
             "num_vertices": str(topology.num_vertices),
             "num_edges": str(topology.num_edges),
-            "double_turn": net.config.double_turn,
+            "double_turn": double_turn,
             "max_offers": "0",
             "iteration": str(meta["iteration"]),
             **_provenance(checkpoint),
@@ -481,7 +485,7 @@ def export9(
         _embed(temporary, props, shapes)
         _verify_contract(temporary, shapes, joint, points)
         if verify:
-            _verify_parity(temporary, net, space, topology)
+            _verify_parity(temporary, net, space, topology, double_turn=double_turn)
         os.replace(temporary, out)
     except BaseException:
         temporary.unlink(missing_ok=True)

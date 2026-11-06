@@ -182,13 +182,18 @@ class Policy9:
     """A contract-9 net as a `hexset.clients.policy.Policy` (the module
     docstring)."""
 
-    def __init__(self, net: HexNet, space: ActionSpace, *, device: str = "cpu") -> None:
+    def __init__(self, net: HexNet, space: ActionSpace, *, device: str = "cpu", double_turn: str | None = None) -> None:
+        """`double_turn` asks the snake seat's double turn as the net's config
+        says (None), or as named: a "joint" net may be asked it in "parts",
+        each setup turn by its own heads and no pair term."""
         self.net = net.eval()
         self.space = space
         self.device = device
         self.players = net.players
         self.layout = contract9.layout(net.players, net.num_hexes, net.num_vertices, net.num_edges, net.CONTRACT)
-        self.joint = net.config.double_turn == "joint"
+        self.joint = (double_turn or net.config.double_turn) == "joint"
+        if self.joint and net.config.double_turn != "joint":
+            raise ValueError("a 'parts' net has no joint double-turn head to be asked the double turn whole")
         self._plans = D.Plans()
 
     #: It lists a decision's whole options (`option_rows`).

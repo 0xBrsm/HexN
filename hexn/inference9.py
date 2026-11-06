@@ -8,6 +8,7 @@ FP32; ordinary in-place weight loads update the cache and live trace aliases.
 """
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 import threading
 import weakref
@@ -86,6 +87,10 @@ class _WeightCache:
         modules = [module for module in net.modules() if isinstance(module, nn.Linear)]
         if not modules or any(type(module) is not nn.Linear for module in modules):
             raise ValueError("weight caching requires ordinary Linear modules")
+        # A layer whose weight the forward reads outside its own call keeps its
+        # own weight: a cast copy would change that read (`HexNet.direct_weights`).
+        direct = {id(module) for module in getattr(net, "direct_weights", tuple)()}
+        modules = [module for module in modules if id(module) not in direct]
         if any(_BUFFER in module._buffers or _ENTRY in module.__dict__ for module in modules):
             raise ValueError("a weight cache is already installed")
         try:
@@ -158,27 +163,34 @@ class _Settings:
 
 
 class _Trunk(nn.Module):
-    def __init__(self, net):
+    """The net's forward as a tuple: the `Prediction` fields it fills
+    (`fields`), in that order."""
+
+    def __init__(self, net, fields):
         super().__init__()
         self.net = net
+        self.fields = fields
 
     def forward(self, seats, table, hexes, vertices, vertex_owner, road_owner, reach):
         out = self.net(seats, table, hexes, vertices, vertex_owner, road_owner, reach)
-        points = out.value.new_empty((seats.shape[0], 0)) if out.points is None else out.points
-        return (out.value, out.value_logits, points, out.logits, out.road,
-                out.me, out.table, out.vertices, out.hexes, out.seats)
+        return tuple(getattr(out, name) for name in self.fields)
 
 
 class _Forward:
     def __init__(self, owner, example):
         self.owner = weakref.ref(owner)
         self.original = owner.net.forward
-        self.has_points = owner.net.config.points
         self.inputs = tuple((tensor.dtype, tuple(tensor.shape[1:])) for tensor in example)
         # Keep parameters and buffers live. Freezing or inference optimization
         # would sever the aliases normal checkpoint refresh depends on.
         with torch.inference_mode(), torch.autocast("cpu", dtype=torch.bfloat16, cache_enabled=False):
-            self.traced = torch.jit.trace(_Trunk(owner.net).eval(), example, check_trace=False, strict=True)
+            # The fields this net's forward fills: the same on every input
+            # (a contract-11d net fills its heads' reads beside the trunk's).
+            probe = self.original(*example, policy=True)
+            self.fields = tuple(field.name for field in dataclasses.fields(Prediction)
+                                if getattr(probe, field.name) is not None)
+            self.traced = torch.jit.trace(_Trunk(owner.net, self.fields).eval(), example, check_trace=False,
+                                          strict=True)
 
     def __call__(self, seats, table, hexes, vertices, vertex_owner, road_owner, reach, *, policy=True):
         tensors = (seats, table, hexes, vertices, vertex_owner, road_owner, reach)
@@ -187,10 +199,7 @@ class _Forward:
                 or any(t.dtype != dtype or tuple(t.shape[1:]) != shape
                        for t, (dtype, shape) in zip(tensors, self.inputs))):
             return self.original(*tensors, policy=policy)
-        out = Prediction(*self.traced(*tensors))
-        if not self.has_points:
-            out.points = None
-        return out
+        return Prediction(**dict(zip(self.fields, self.traced(*tensors))))
 
 
 class WorkerInference:
@@ -249,7 +258,7 @@ class WorkerInference:
     def _supported_model(self):
         if (type(self.policy) is not NetworkPolicy9 or type(self.net) is not HexNet
                 or self.policy.device.type != "cpu" or self.policy.precision != "bf16"
-                or self.net.training or not self.net.fused or self.net.CONTRACT not in ("9", "9d", "9d.1")
+                or self.net.training or not self.net.fused or self.net.CONTRACT not in ("9", "9d", "9d.1", "11d")
                 or self.net.players not in (2, 4) or self.net.config.double_turn != "parts"
                 or self.net.config.messages != "pooled" or self.net.config.attention or not self.net.config.norm
                 or self.net.config.heads != "linear" or self.net.config.discard != "mlp"

@@ -495,3 +495,455 @@ def test_the_chosen_candidate_reads_without_masks_as_it_read_with_them(setting):
         assert torch.equal(a, r), case
         for x, z in zip(ga, gr):
             assert (x is None and (z is None or not z.any())) or (z is None and not x.any()) or torch.equal(x, z), case
+
+
+# --- contract 11d: two seat tokens of their own widths, no table token ----------
+
+
+def _duel_decisions(count=60, seed=0, contract="11d", every=6, double_turn=False):
+    """Positions from random two-seat duel-variant play with the decision at
+    each, every `every`th decision of whole games, so discards and Road
+    Building come up beside the setup; with `double_turn` the snake seat's
+    two setup turns are asked as one decision."""
+    from hexset.rules import DUEL_VARIANT_GAME
+
+    rng = random.Random(seed)
+    out = []
+    g = 0
+    while len(out) < count:
+        game = start(random_base_board(random.Random(seed + g)), 2, random.Random(seed + g),
+                     game_type=DUEL_VARIANT_GAME)
+        space = space_for(game)
+        step = 0
+        while not is_over(game) and len(out) < count:
+            seat = players_owing_discards(game)[0] if game.phase is Phase.DISCARD else to_move(game)
+            options = D.options(game, seat, double_turn=double_turn)
+            choice = rng.choice(options)
+            if step % every == 0 or game.phase is Phase.DISCARD or any(isinstance(o, D.Compound) for o in options):
+                decision = D.tensors(game, seat, space, double_turn=double_turn)
+                kind, index = D.locate(decision, choice, game, seat, space)
+                out.append((contract9.flatten(contract9.encode9(game, seat, contract)), decision, int(kind), index))
+            D.apply_option(game, choice, seat if game.phase is Phase.DISCARD else None)
+            step += 1
+        g += 1
+    return out, game
+
+
+def _two_seat_net(game, seed, **kwargs):
+    from hexn.model9 import ModelConfig
+
+    torch.manual_seed(seed)
+    config = ModelConfig(**{"heads": "linear", "messages": "pooled", "attention": False, "others": True,
+                            "double_turn": "parts", "contract": "11d", **kwargs})
+    net = HexNet(space_for(game), game._state.board.topology, 2, config).eval()
+    for p in net.parameters():                       # off its zero start, so every path carries signal
+        p.data.add_(0.05 * torch.randn_like(p))
+    return net
+
+
+def test_an_11d_net_has_two_seat_embeddings_a_board_token_and_query_key_heads():
+    """A contract-11d net embeds my token (35 columns) and the opponent's
+    (27) by layers of their own, the board block (3) as its board token, and
+    reads 17-wide hexes. Its heads are a type score per move type and a
+    query per role from my token, the opponent's and the board token, read
+    against vertex, edge and robber keys; no global, setup, joint
+    double-turn, discard, Road Building or points head; the move head has a
+    hidden layer, a hand value scores the resource moves, and Road
+    Building's two roads read a pair matrix. 332,281 parameters at width 64,
+    3 rounds, pooled, the others read on and attention off; a "joint" net
+    adds the 16 x 16 double-turn pair matrix, 332,537."""
+    from hexn.model9 import QUERY_ROLES, MOVE_TYPES, ModelConfig
+
+    rows, game = _duel_decisions(count=24)
+    net = _two_seat_net(game, 4)
+    width = net.config.width
+    assert net.embed_me.in_features == 35 and net.embed_other.in_features == 27 and net.embed_hex.in_features == 17
+    assert net.embed_board.in_features == 3 and not hasattr(net, "embed_table")
+    assert all(r.board and r.table[0].in_features == 4 * width + 16 for r in net.rounds)
+    for gone in ("vertex_head", "road_head", "robber_head", "nobody_head", "global_head", "setup_head", "first_head",
+                 "second_head", "pair_head", "discard_head", "road_building", "points_head"):
+        assert getattr(net, gone) is None, gone
+    assert len(MOVE_TYPES) == 15 and len(QUERY_ROLES) == 8
+    assert net.move_head[0].in_features == 3 * width and net.move_head[0].out_features == 64
+    assert net.move_head[-1].out_features == 15
+    assert net.query_head.in_features == 3 * width and net.query_head.out_features == 8 * 16
+    assert net.hand_value[0].in_features == 3 * width + 10 and net.hand_value[-1].out_features == 1
+    assert net.road_pair.shape == (16, 16) and net.query_gain.shape == (8, 16) and net.key_gain.shape == (3, 16)
+    assert sum(p.numel() for p in net.parameters()) == 332_281 and net.pair_matrix is None
+    joint = _two_seat_net(game, 4, double_turn="joint")
+    assert sum(p.numel() for p in joint.parameters()) == 332_537 and joint.pair_matrix.shape == (16, 16)
+    for refused in (dict(global_seat=True), dict(points=True)):
+        with pytest.raises(ValueError):
+            ModelConfig(contract="11d", **refused)
+    with pytest.raises(ValueError, match="two-seat"):
+        HexNet(space_for(game), game._state.board.topology, 4, net.config)
+    layout = contract9.layout(2, 19, 54, 72, "11d")
+    inputs = unpack9(layout, torch.from_numpy(np.stack([r[0] for r in rows])))
+    assert inputs["seats"].shape == (len(rows), 62) and inputs["table"].shape == (len(rows), 3)
+    with torch.no_grad():
+        for fused in (False, True):
+            net.fused = fused
+            out = net(**inputs)
+            assert out.table.shape == (len(rows), width) and out.points is None and out.seats.shape == (len(rows), 2, width)
+            me, other = out.seats[:, 0], out.seats[:, 1]
+            mine = net.value_head(torch.cat([me, me], -1)).squeeze(-1)
+            theirs = net.value_head(torch.cat([other, me], -1)).squeeze(-1)
+            torch.testing.assert_close(out.value_logits, torch.stack([mine, theirs], 1))
+            # The opponent's columns reach every output through its own layer.
+            changed = dict(inputs, seats=inputs["seats"].clone())
+            changed["seats"][:, 35:] += 0.5
+            assert not torch.allclose(net(**changed).logits, out.logits, atol=1e-4)
+            # The board block reaches every output through the board token.
+            changed = dict(inputs, table=inputs["table"].clone())
+            changed["table"] += 0.5
+            assert not torch.allclose(net(**changed).logits, out.logits, atol=1e-4)
+            assert not torch.allclose(net(**changed).value_logits, out.value_logits, atol=1e-5)
+
+
+def _unit_ref(x, gain):
+    mean = x.mean(-1, keepdim=True)
+    var = x.var(-1, unbiased=False, keepdim=True)
+    return (x - mean) / torch.sqrt(var + 1e-5) * gain
+
+
+def _query_reference(net, out, seats, game):
+    """Every flat action's 11d score, one action at a time from the net's own
+    layers (`hexn.model9._emit_queries`' formulas written out per option),
+    and the formula each used: the check that each option kind is scored by
+    exactly one formula. A query . key is the layer-normalised query (with
+    its gain) and key (with its kind's gain), over sqrt(16), times the role's
+    exp(scale); a resource move's hand value reads the context and the two
+    hands it leaves."""
+    from hexset.actions import YEAR_OF_PLENTY_PAIRS, ActionType as T
+    from hexset.contract9 import MY_COLUMNS_11D as M, OTHER_COLUMNS_11D as O
+    from hexn.model9 import QUERY_ROLES, KEY_WIDTH
+
+    space = net.space
+    topology = game._state.board.topology
+    rows = out.seats.shape[0]
+    me, other, h, v = out.seats[:, 0], out.seats[:, 1], out.hexes, out.vertices
+    context = torch.cat([me, other, out.table], -1)
+    types = net.move_head(context)
+    raw = net.query_head(context).reshape(rows, len(QUERY_ROLES), KEY_WIDTH)
+    q = {role: _unit_ref(raw[:, i], net.query_gain[i]) * net.role_scales()[i] / 4
+         for i, role in enumerate(QUERY_ROLES)}
+
+    def dot(role, key):
+        return (q[role] * key).sum(-1)
+
+    def k_vertex(x):
+        return _unit_ref(net.vertex_key(v[:, x]), net.key_gain[0])
+
+    def k_edge(e):
+        a, b = topology.edges[e]
+        both = net.edge_key(torch.cat([v[:, a], v[:, b]], -1)) + net.edge_key(torch.cat([v[:, b], v[:, a]], -1))
+        return _unit_ref(both, net.key_gain[1])
+
+    def k_robber(hex_, victim):
+        if victim == 2:
+            return _unit_ref(net.nobody_key(h[:, hex_]), net.key_gain[2])
+        return _unit_ref(net.robber_key(torch.cat([h[:, hex_], out.seats[:, victim]], -1)), net.key_gain[2])
+
+    scores, used = torch.zeros(rows, space.size), {}
+    resource = (T.BANK_TRADE, T.PLAY_YEAR_OF_PLENTY, T.PLAY_MONOPOLY, T.DISCARD)
+    for index in range(space.size):
+        action = space.decode(index)
+        t, a, b = action.type, action.a, action.b
+        base = types[:, int(t)]
+        if t in resource:
+            continue
+        if t in (T.ROLL, T.END_TURN, T.BUY_DEV_CARD, T.PLAY_KNIGHT, T.PLAY_ROAD_BUILDING):
+            formula, score = "type", base
+        elif t in (T.BUILD_SETTLEMENT, T.BUILD_CITY, T.SETUP_SETTLEMENT):
+            if t is T.SETUP_SETTLEMENT:
+                # The paying query where my token says a settlement is already placed.
+                placed = (seats[:, M["pieces"].start] * 10).round() < 5
+                score = base + torch.where(placed, dot("setup_settlement_paying", k_vertex(a)),
+                                           dot("setup_settlement", k_vertex(a)))
+                formula = "setup_settlement"
+            else:
+                role = {T.BUILD_SETTLEMENT: "settlement", T.BUILD_CITY: "city"}[t]
+                formula, score = role, base + dot(role, k_vertex(a))
+        elif t in (T.BUILD_ROAD, T.SETUP_ROAD):
+            role = "road" if t is T.BUILD_ROAD else "setup_road"
+            formula, score = role, base + dot(role, k_edge(a))
+        elif t is T.MOVE_ROBBER:
+            formula, score = "robber", base + dot("robber", k_robber(a, b))
+        else:
+            raise AssertionError(f"no 11d formula for {t}")
+        used.setdefault(t, set()).add(formula)
+        scores[:, index] = score
+
+    mine = seats[:, M["hand"]].clone()                     # counts over 10
+    theirs = seats[:, 35 + O["hand"].start:35 + O["hand"].stop].clone()
+    rate = seats[:, M["rates"]] * 4                        # cards a bank trade gives
+
+    def value(my_hand, their_hand, at=slice(None)):        # V(after | C), the whole MLP on the whole input
+        return net.hand_value(torch.cat([context[at], my_hand, their_hand], -1)).squeeze(-1)
+
+    def card(r, n=1.0):
+        out = torch.zeros(5)
+        out[r] = n / 10
+        return out
+
+    for index in range(space.size):
+        action = space.decode(index)
+        t, a, b = action.type, action.a, action.b
+        if t not in resource:
+            continue
+        base = types[:, int(t)]
+        if t is T.BANK_TRADE:
+            given = torch.zeros(rows, 5)
+            given[:, a] = rate[:, a] / 10
+            formula, score = "trade", base + value(mine - given + card(b), theirs)
+        elif t is T.PLAY_YEAR_OF_PLENTY:
+            first, second = YEAR_OF_PLENTY_PAIRS[a]
+            formula, score = "year_of_plenty", base + value(mine + card(first) + card(second), theirs)
+        elif t is T.PLAY_MONOPOLY:
+            taken = torch.zeros(rows, 5)
+            taken[:, a] = theirs[:, a]
+            formula, score = "monopoly", base + value(mine + taken, theirs - taken)
+        else:
+            formula, score = "discard", base + value(mine - card(a), theirs)
+        used.setdefault(t, set()).add(formula)
+        scores[:, index] = score
+    return scores, used, types, q, (k_vertex, k_edge, value, theirs)
+
+
+def test_every_flat_option_of_the_two_seat_space_is_scored_by_one_11d_formula():
+    """Written out one action at a time, each flat slot's score is its type's
+    plus its roles' normalised queries against its keys, or its hand value,
+    and the net's flat row, robber block included, is that score at every
+    slot: every `ActionType` has exactly one formula. The setup turn, Road
+    Building and discard candidates are their moves' scores summed, Road
+    Building's two roads with their pair term."""
+    from hexset.actions import ActionType as T
+
+    rows, game = _duel_decisions(count=60, seed=7)
+    net = _two_seat_net(game, 9)
+    inputs = unpack9(contract9.layout(2, 19, 54, 72, "11d"), torch.from_numpy(np.stack([r[0] for r in rows])))
+    batch = _batch(rows)
+    with torch.no_grad():
+        out = net(**inputs)
+        want, used, types, q, (_, k_edge, value, theirs) = _query_reference(net, out, inputs["seats"], game)
+        flat = net.flat_scores(out)
+        torch.testing.assert_close(flat, want, atol=1e-5, rtol=1e-5)
+        assert set(used) == set(T) and all(len(f) == 1 for f in used.values())
+        # A setup turn: its settlement's and its road's flat scores, summed.
+        at = torch.arange(len(rows))
+        pairs = contract9.incidences(game._state.board.topology)
+        space = net.space
+        setup = torch.stack([flat[:, space.index(net_action(T.SETUP_SETTLEMENT, v))]
+                             + flat[:, space.index(net_action(T.SETUP_ROAD, e))] for v, e in pairs], 1)
+        torch.testing.assert_close(net.setup_scores(out, at), setup, atol=1e-5, rtol=1e-5)
+        # Road Building: the card's type, q_road_building . k_e per road placed,
+        # and with two roads k_first' R k_second / 4.
+        assert len(batch["rb"]) and len(batch["disc"])
+        rb = net.road_building_scores(out, batch["rb_row"], batch["rb"])
+        want_rb, single = [], 0
+        for row, (e1, e2) in zip(batch["rb_row"].tolist(), batch["rb"].tolist()):
+            score = types[row, int(T.PLAY_ROAD_BUILDING)]
+            for e in (e1, e2):
+                if e >= 0:
+                    score = score + (q["road_building"][row] * k_edge(e)[row]).sum()
+            if e1 >= 0 and e2 >= 0:
+                score = score + k_edge(e1)[row] @ net.road_pair @ k_edge(e2)[row] / 4
+            single += e2 < 0
+            want_rb.append(score)
+        torch.testing.assert_close(rb, torch.stack(want_rb), atol=1e-5, rtol=1e-5)
+        row0, (e1, e2) = 0, (0, 5)
+        lone = net.road_building_scores(out, torch.tensor([row0]), torch.tensor([[e1, -1]]))
+        torch.testing.assert_close(lone, (types[row0, int(T.PLAY_ROAD_BUILDING)]
+                                          + (q["road_building"][row0] * k_edge(e1)[row0]).sum()).reshape(1),
+                                   atol=1e-5, rtol=1e-5)
+        # A whole discard: the discard type and the value of the hand it keeps.
+        disc = net.discard_scores(out, batch["disc_row"], batch["disc"])
+        row = batch["disc_row"]
+        kept = batch["disc"][:, :5].float() / 10
+        want_disc = types[row, int(T.DISCARD)] + value(kept, theirs[row], row)
+        torch.testing.assert_close(disc, want_disc, atol=1e-5, rtol=1e-5)
+        # A kept hand that is the hand before less what is given.
+        np.testing.assert_allclose(kept.numpy(), (out.hands[row, 0] - batch["disc"][:, 5:].float() / 10).numpy(),
+                                   atol=1e-6)
+
+
+def test_11d_query_key_scores_are_bounded_by_the_role_scale():
+    """However large the trunk's, the query head's and the keys' weights
+    grow, a query . key score is at most 4 exp(scale) times the largest query
+    and key gains (each normalised to length 4, their product over 4), so a
+    score runs away only through the learned scale; the initial scale is
+    `QUERY_SCALE`, and the scale stays under `ROLE_SCALE_MAX` however far its
+    parameter grows."""
+    from hexset.actions import ActionType as T
+    from hexn.model9 import QUERY_SCALE, ROLE_SCALE_MAX
+
+    rows, game = _duel_decisions(count=40, seed=7)
+    net = _two_seat_net(game, 5)
+    assert torch.allclose(HexNet(space_for(game), game._state.board.topology, 2, net.config).role_scales(),
+                          torch.full((8,), QUERY_SCALE))
+    grown = HexNet(space_for(game), game._state.board.topology, 2, net.config)
+    with torch.no_grad():
+        grown.role_scale.fill_(50.0)
+    assert grown.role_scales().max() <= ROLE_SCALE_MAX and grown.role_scales().min() > 0.99 * ROLE_SCALE_MAX
+    inputs = unpack9(contract9.layout(2, 19, 54, 72, "11d"), torch.from_numpy(np.stack([r[0] for r in rows])))
+    with torch.no_grad():
+        for module in (net.query_head, net.vertex_key, net.edge_key, net.robber_key, net.nobody_key):
+            for p in module.parameters():
+                p.mul_(1000)
+        out = net(**inputs)
+        flat = net.flat_scores(out)
+        space = net.space
+        bound = 4 * net.role_scales().max() * net.query_gain.abs().max() * net.key_gain.abs().max()
+        for t in (T.BUILD_SETTLEMENT, T.BUILD_CITY, T.BUILD_ROAD, T.SETUP_SETTLEMENT, T.SETUP_ROAD, T.MOVE_ROBBER):
+            block = flat[:, space.offsets[t]:space.offsets[t] + space.sizes[t]] - out.types[:, int(t), None]
+            assert block.abs().max() <= bound * 1.001, t
+            assert block.abs().max() > 0.1 * bound, t       # the bound is the scale, not a vanishing score
+        assert out.rb_road.abs().max() <= bound * 1.001
+
+
+def test_the_paying_setup_settlement_is_the_seats_second_by_its_settlements_left():
+    """The second setup settlement pays the starting hand
+    (`hexset.game._in_second_setup_round`), and in a two-seat snake, dealt
+    two or four with two retired, it is exactly the one placed with one of
+    the seat's own already down: my token's settlements left read 4, not 5."""
+    from hexset.contract9 import MY_COLUMNS_11D as M
+    from hexset.game import _in_second_setup_round
+    from hexset.play import step_randomly
+    from hexset.rules import DUEL_VARIANT_GAME
+
+    seen = {True: 0, False: 0}
+    for seed in range(12):
+        rng = random.Random(seed)
+        locked = (1, 3) if seed % 2 else ()
+        game = start(random_base_board(rng), 4 if locked else 2, rng, game_type=DUEL_VARIANT_GAME, locked=locked)
+        while game.phase in (Phase.SETUP_SETTLEMENT, Phase.SETUP_ROAD):
+            if game.phase is Phase.SETUP_SETTLEMENT:
+                seat = game.current_player
+                left = contract9.encode9(game, seat, "11d").seats[M["pieces"].start] * 10
+                paying = _in_second_setup_round(game)
+                assert round(float(left)) == (4 if paying else 5)
+                seen[paying] += 1
+            step_randomly(game, rng)
+    assert seen[True] == seen[False] == 24
+
+
+def test_an_11d_joint_net_scores_the_double_turn_with_a_paying_second_and_an_ordered_pair():
+    """A "joint" 11d net's double turn, first by second, is the setup types,
+    the first turn's plain query and the second's paying one against their
+    vertex keys, the setup-road query against both edges, and the pair
+    k_first' P k_second, which reads the order. Asked in parts the same net
+    scores each setup turn by its own query and no pair term."""
+    from hexset.actions import ActionType as T
+    from hexn.model9 import decision_scores
+
+    rows, game = _duel_decisions(count=40, seed=3, every=50, double_turn=True)
+    double = [i for i, r in enumerate(rows) if r[1].double]
+    assert double
+    net = _two_seat_net(game, 11, double_turn="joint")
+    inputs = unpack9(contract9.layout(2, 19, 54, 72, "11d"), torch.from_numpy(np.stack([r[0] for r in rows])))
+    pairs = contract9.incidences(game._state.board.topology)
+    with torch.no_grad():
+        out = net(**inputs)
+        _, _, types, q, (k_vertex, k_edge, _, _) = _query_reference(net, out, inputs["seats"], game)
+        at = torch.tensor(double)
+        got = net.double_scores(out, at)
+        P = net.pair_matrix
+        for n, row in enumerate(double):
+            kv = torch.stack([k_vertex(v)[row] for v, _ in pairs])
+            ke = torch.stack([k_edge(e)[row] for _, e in pairs])
+            first = (types[row, int(T.SETUP_SETTLEMENT)] + types[row, int(T.SETUP_ROAD)]
+                     + kv @ q["setup_settlement"][row] + ke @ q["setup_road"][row])
+            second = kv @ q["setup_settlement_paying"][row] + ke @ q["setup_road"][row]
+            want = first[:, None] + second[None, :] + kv @ P @ kv.T / 4
+            torch.testing.assert_close(got[n], want, atol=1e-4, rtol=1e-4)
+        assert not torch.allclose(P, P.T)
+        # Its losses train both ways: whole (the double rows) and in parts.
+        batch = _batch(rows)
+        scores = decision_scores(net, out, batch)
+        assert len(scores.double_rows) == len(double) and torch.isfinite(scores.total).all()
+        del batch["double"]
+        assert torch.isfinite(decision_scores(net, out, batch).total).all()
+
+
+def test_an_11d_joint_batch_trains_and_the_fused_trunk_agrees():
+    rows, game = _duel_decisions(count=60, seed=7, double_turn=True)
+    net = _two_seat_net(game, 1, double_turn="joint")
+    layout = contract9.layout(2, 19, 54, 72, "11d")
+    batch = _batch(rows)
+    assert batch["double"].any()
+    with torch.no_grad():
+        inputs = unpack9(layout, batch["x"])
+        net.fused = False
+        reference = net(**inputs)
+        net.fused = True
+        fused = net(**inputs)
+        at = batch["double"].nonzero().squeeze(1)
+        torch.testing.assert_close(net.double_scores(fused, at), net.double_scores(reference, at),
+                                   atol=2e-4, rtol=2e-4)
+    net.train()
+    optimiser = torch.optim.AdamW(net.parameters(), lr=3e-3)
+    losses = []
+    for _ in range(40):
+        out = net(**unpack9(layout, batch["x"]))
+        loss = -decision_log_prob(net, out, batch)[0].mean()
+        optimiser.zero_grad()
+        loss.backward()
+        optimiser.step()
+        losses.append(float(loss.detach()))
+    assert losses[-1] < 0.75 * losses[0]
+    assert net.pair_matrix.grad is not None and net.pair_matrix.grad.abs().sum() > 0
+
+
+def net_action(kind, a, b=0):
+    from hexset.actions import Action
+
+    return Action(kind, a, b)
+
+
+@pytest.mark.parametrize("messages,attention,others", [
+    ("separate", True, False), ("pooled", True, False), ("separate", False, False), ("pooled", False, False),
+    ("pooled", False, True), ("separate", False, True), ("pooled", True, True),
+])
+def test_the_fused_trunk_computes_the_reference_under_11d(messages, attention, others):
+    """Under 11d the node-major trunk broadcasts my seat token where the
+    table's was, as the reference loop does: every output and every
+    decision's scores agree, the query heads' candidates included."""
+    from hexn.model9 import decision_scores
+
+    rows, game = _duel_decisions(count=60, seed=7)
+    net = _two_seat_net(game, 6, messages=messages, attention=attention, others=others)
+    inputs = unpack9(contract9.layout(2, 19, 54, 72, "11d"), torch.from_numpy(np.stack([r[0] for r in rows])))
+    batch = _batch(rows)
+    del batch["double"]
+    assert len(batch["disc"]) and len(batch["rb"]) and batch["setup"].any()
+    with torch.no_grad():
+        net.fused = False
+        reference = net(**inputs)
+        want = decision_scores(net, reference, batch)
+        net.fused = True
+        fused = net(**inputs)
+        got = decision_scores(net, fused, batch)
+    for name in ("value_logits", "logits", "road", "vertices", "seats", "hexes", "me", "table", "types",
+                 "robber_query", "rb_road", "hand_context", "hands", "edge_keys"):
+        torch.testing.assert_close(getattr(fused, name), getattr(reference, name), atol=2e-4, rtol=2e-4, msg=name)
+    for name in ("flat", "setup", "rb", "disc", "total"):
+        torch.testing.assert_close(getattr(got, name), getattr(want, name), atol=2e-4, rtol=2e-4, msg=name)
+
+
+def test_a_11d_batch_trains():
+    rows, game = _duel_decisions(count=60, seed=7)
+    net = _two_seat_net(game, 1)
+    net.train()
+    layout = contract9.layout(2, 19, 54, 72, "11d")
+    batch = _batch(rows)
+    del batch["double"]
+    optimiser = torch.optim.AdamW(net.parameters(), lr=3e-3)
+    losses = []
+    for _ in range(40):
+        out = net(**unpack9(layout, batch["x"]))
+        loss = -decision_log_prob(net, out, batch)[0].mean()
+        optimiser.zero_grad()
+        loss.backward()
+        optimiser.step()
+        losses.append(float(loss.detach()))
+    assert losses[-1] < 0.75 * losses[0]
