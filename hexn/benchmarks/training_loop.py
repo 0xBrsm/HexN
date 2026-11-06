@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: GPL-3.0-only
 """Production-shape sync/async PPO timing for an otherwise idle GPU box.
 
-The live training job owns both the GPU and most CPU cores, so this harness is
-checked in rather than run against a contended box. It runs identical seeded
+A GPU or CPU cores shared with other work measure contention rather than
+overlap, so run it on an otherwise idle machine. It runs identical seeded
 training jobs with and without ``--async-collect`` and reports the median time
 between iteration records after the pipeline-fill iteration. That interval is
 the number that captures overlap; adding logged collection and update durations
 would double-count work that deliberately runs concurrently.
 
-Run from ``src/`` inside the GPU image, after the training container stops:
+Run from ``src/`` on an idle GPU machine:
 
     python -m hexn.benchmarks.training_loop
 """

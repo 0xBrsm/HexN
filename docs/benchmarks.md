@@ -26,7 +26,7 @@ does statistics on it. Both run where torch cannot be installed at all.
 | `expert_cost` | The cost of a search-played move on real hardware, split into engine time and network time by timing a real collector against a real checkpoint (`--simulations` sweepable). Extrapolates `games_per_hour` from the measured rate. |
 | `expert_scale` | Scaling of searched collection across independent CPU worker processes. Each process warms up and waits at a barrier, so the reported rate is steady-state rather than skewed by staggered compiler startup. |
 | `mix_cost` | Cost of an opponent mix (`--mix` on `hexn.ppo`) to a PPO iteration, per decision and per shard. Times the learner and each mix opponent in one process by default, or the real `ParallelCollector` under `--workers N` for wall-clock timing only. |
-| `training_loop` | Production-shape sync-vs-`--async-collect` PPO iteration timing. Runs identical seeded jobs with and without `--async-collect` and reports the median interval between iteration records after the pipeline-fill iteration. Requires an idle GPU box: the live training job owns the GPU and most CPU cores, so a contended run measures contention rather than overlap. |
+| `training_loop` | Production-shape sync-vs-`--async-collect` PPO iteration timing. Runs identical seeded jobs with and without `--async-collect` and reports the median interval between iteration records after the pipeline-fill iteration. Run it on an otherwise idle machine: a GPU or CPU cores shared with other work measure contention rather than overlap. |
 
 ## Value-head diagnostics
 
@@ -48,7 +48,7 @@ These two measure the update rather than the value head.
 | Module | What it measures |
 | --- | --- |
 | `noise_scale` | The gradient noise scale (McCandlish, Kaplan, Amodei, & Brown 2018): the batch size at which sampling noise stops dominating the gradient, estimated from the same quantity measured at two batch sizes. |
-| `minibatch_iso_kl` | What learning rate makes a bigger minibatch travel the same policy distance (end-to-end KL) as a reference arm, holding every other input identical (weights, warm Adam state, minibatch order). Answers whether `--minibatch` and `--learning-rate` were confounded in an earlier reading. |
+| `minibatch_iso_kl` | What learning rate makes a bigger minibatch travel the same policy distance (end-to-end KL) as a reference arm, holding every other input identical (weights, warm Adam state, minibatch order). Separates the effect of `--minibatch` from that of `--learning-rate`. |
 
 ## Running one
 

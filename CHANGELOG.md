@@ -2,6 +2,15 @@
 
 All notable changes to the `hexn` package are recorded here.
 
+## 0.49.1
+
+### Fixed
+
+- **`training_loop` and `minibatch_iso_kl` are described by what they
+  measure.** `docs/benchmarks.md` and `hexn.benchmarks.training_loop` say to
+  time on an otherwise idle machine, and `minibatch_iso_kl` separates the
+  effect of `--minibatch` from that of `--learning-rate`.
+
 ## 0.49.0
 
 ### Breaking
