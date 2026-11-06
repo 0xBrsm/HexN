@@ -347,7 +347,7 @@ def test_a_gate_plies_export_declares_itself_in_the_keys_hexset_reads(tmp_path):
     assert "search" not in meta
 
 
-@needs("heximax")
+@needs("mybot")
 def test_a_trader_export_names_it_in_the_key_hexset_reads(tmp_path):
     """`hexset.clients._modelmeta.trader_config`: a file naming `trader` is
     seated with that bot answering its trades; a file naming none is not
@@ -356,12 +356,12 @@ def test_a_trader_export_names_it_in_the_key_hexset_reads(tmp_path):
     board = a_checkpoint(checkpoint)
     out = tmp_path / "traded.onnx"
 
-    export(str(checkpoint), out, topology=board.topology, trader="heximax")
+    export(str(checkpoint), out, topology=board.topology, trader="mybot")
 
     meta = ort.InferenceSession(
         str(out), providers=["CPUExecutionProvider"]
     ).get_modelmeta().custom_metadata_map
-    assert meta["trader"] == "heximax"
+    assert meta["trader"] == "mybot"
     with pytest.raises(Exception):
         export(str(checkpoint), tmp_path / "x.onnx", topology=board.topology, trader="nobody")
 

@@ -216,7 +216,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--trader",
         default=None,
-        help="a bot, by lineup name (e.g. 'heximax', registered by a --runtime), that answers every network seat's trades (hexn.trade.trader_gate). Not combinable with --max-offers",
+        help="a bot, by lineup name (e.g. 'mybot', registered by a --runtime), that answers every network seat's trades (hexn.trade.trader_gate). Not combinable with --max-offers",
     )
     # HexSet ships no bots: `--trader`, `--mix` and a rung name one only once
     # the runtime registering it is loaded (`hexn.runtime`).

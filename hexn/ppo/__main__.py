@@ -150,7 +150,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--trader",
         default=None,
-        help="a bot, by lineup name (e.g. 'heximax', registered by a --runtime), that answers every network seat's trades in collection and the ladder (hexn.trade.trader_gate); the network still plays every move. Not combinable with --max-offers",
+        help="a bot, by lineup name (e.g. 'mybot', registered by a --runtime), that answers every network seat's trades in collection and the ladder (hexn.trade.trader_gate); the network still plays every move. Not combinable with --max-offers",
     )
     # HexSet ships no bots: `--trader`, `--mix` and a rung name one only once
     # the runtime registering it is loaded (`hexn.runtime`).
@@ -373,7 +373,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--search-rung",
         default="",
-        help="an extra ladder rung by arena entrant name, e.g. 'heximax' "
+        help="an extra ladder rung by arena entrant name, e.g. 'mybot' "
         "— the handcrafted baseline, local, and unlike catanatron it plays the "
         "trading game. Costs search time per eval, so it is opt-in; adding it "
         "leaves the parent rung untouched, so the existing trend stays "
@@ -384,7 +384,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--mix",
         default="",
         help="opponents in the training lanes, e.g. "
-        "'heximax=0.15,parent=0.1' — the share of games each plays, on "
+        "'mybot=0.15,parent=0.1' — the share of games each plays, on "
         "alternating seat pairs; their seats are never trained on. A name is "
         "'parent' or any arena entrant spec, so a held-out opponent "
         "can be collected against and not merely evaluated on",

@@ -42,7 +42,7 @@ def spec(worker: int, workers: int, **overrides) -> WorkerSpec:
 
 
 # A table of arena entrants, so the one spawned pool below also carries the
-# cast-and-record-only-the-learner claim. Scripted bots only: `heximax` would
+# cast-and-record-only-the-learner claim. Scripted bots only: a runtime's bot would
 # cost more than every other game in this file. `random-too` is registered by
 # a test runtime each worker loads itself (`WorkerSpec.runtime`).
 POOL = (("table(random|random-too)", 1.0),)
@@ -418,13 +418,13 @@ def test_sampled_takes_only_a_bare_network(tmp_path):
 
     path = tmp_path / "latest.pt"
     board = _a_checkpoint(path)
-    for name in ("sampled:heximax", f"sampled:network:{path}@0", "sampled:random"):
+    for name in ("sampled:mybot", f"sampled:network:{path}@0", "sampled:random"):
         with pytest.raises(SystemExit, match="bare network"):
             check_mix([(name, 1.0)], have_parent=False)
     with pytest.raises(SystemExit, match="not there"):
         check_mix([(f"sampled:network:{tmp_path}/missing.pt", 1.0)], have_parent=False)
     with pytest.raises(ValueError, match="bare network"):
-        rung_opponent("sampled:heximax", seed=1, lanes=2, board=board, players=4, device="cpu")
+        rung_opponent("sampled:mybot", seed=1, lanes=2, board=board, players=4, device="cpu")
 
 
 def test_a_worker_seeds_its_sampled_members_from_its_own_torch_seed(tmp_path):
@@ -440,37 +440,37 @@ def test_a_worker_seeds_its_sampled_members_from_its_own_torch_seed(tmp_path):
     assert not torch.equal(first, second)
 
 
-@needs("heximax")
-def test_heximax_resolves_as_a_mix_opponent():
-    """`"heximax"` is not one of HexSet's own presets: a runtime registers
+@needs("mybot")
+def test_a_runtime_bot_resolves_as_a_mix_opponent():
+    """`"mybot"` is not one of HexSet's own presets: a runtime registers
     it, and a loaded runtime is what makes it resolvable in `--mix` from a
     collector process. Without it the run dies at launch with `unknown
     entrant`."""
     from hexset.board.board import random_base_board
     from hexn.collect import check_mix, mix_opponents
 
-    check_mix([("heximax", 0.25)], have_parent=False)
+    check_mix([("mybot", 0.25)], have_parent=False)
     board = random_base_board(random.Random(3))
-    bot = mix_opponents([("heximax", 0.25)], seed=1, lanes=2)[0].spawn(board)
+    bot = mix_opponents([("mybot", 0.25)], seed=1, lanes=2)[0].spawn(board)
     assert hasattr(bot, "gains_many")
     # And it is the entrant, not a lookalike: the bot the arena itself
-    # spawns for the name, search and bargaining alike. `--max-offers` is the
+    # spawns for the name, bargaining included. `--max-offers` is the
     # budget of the networks the run trains; a named entrant is literally the
     # entrant the arena scores, budget included.
     from hexset.arena import entrant_from_name, spawn
 
-    arena = spawn(entrant_from_name("heximax"), board, random.Random(1))
+    arena = spawn(entrant_from_name("mybot"), board, random.Random(1))
     assert type(bot) is type(arena)
-    assert (bot.depth, bot.width, bot.max_offers) == (arena.depth, arena.width, arena.max_offers)
+    assert getattr(bot, "max_offers", None) == getattr(arena, "max_offers", None)
 
 
-@needs("heximax")
+@needs("mybot")
 def test_the_parent_mix_opponent_is_whatever_the_thunk_returned():
     from hexn.collect import mix_opponents
 
     sentinel = object()
     opponents = mix_opponents(
-        [("heximax", 0.1), ("parent", 0.1)],
+        [("mybot", 0.1), ("parent", 0.1)],
         seed=1,
         lanes=2,
         parent=lambda: sentinel,

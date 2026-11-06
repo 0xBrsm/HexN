@@ -2,6 +2,22 @@
 
 All notable changes to the `hexn` package are recorded here.
 
+## 0.49.2
+
+### Fixed
+
+- **Help, docstrings and tests name an example bot.** The `--trader`,
+  `--search-rung` and `--mix` help, the docstrings of `hexn.collect`,
+  `hexn.runtime`, `hexn.trade` and `hexn.run.manifest`, and the tests use
+  `mybot` for a bot a `--runtime` registers.
+
+- **The docs describe the package as it is.** `docs/checkpoints.md` covers
+  the contract-9 network, loading across contracts, `hexn.migrate_c8`, and
+  what each export writes with its serving flags. `docs/training.md` adds
+  contract-9 training, seeds and game keeping, and the README, benchmarks,
+  inference, runs and testing docs are brought up to date with the code; no
+  doc names a bot HexSet does not ship.
+
 ## 0.49.1
 
 ### Fixed

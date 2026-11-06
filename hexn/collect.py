@@ -148,12 +148,12 @@ def named_opponent(name: str, seed: int, lanes: int) -> BoardBots:
     reimplementation that happens to share a name.
 
     **A bot resolves here only once its runtime is loaded.** HexSet ships
-    no playing bots: `heximax` and `rehex` are registered with `hexset.arena`
+    no playing bots: a bot such as `mybot` is registered with `hexset.arena`
     by the runtime module that carries them (`register_preset`), so a
-    process that never loaded it fails `--mix heximax=...` with `unknown
+    process that never loaded it fails `--mix mybot=...` with `unknown
     entrant`. The trainers load their `--runtime` at start, and every worker
     loads `WorkerSpec.runtime` before it builds a lane opponent
-    (`hexn.runtime`); `test_heximax_resolves_as_a_mix_opponent` pins the
+    (`hexn.runtime`); `test_a_runtime_bot_resolves_as_a_mix_opponent` pins the
     resolution.
 
     The import is function-scoped because `hexset.arena` reaches for torch on some
@@ -191,7 +191,7 @@ def named_opponent(name: str, seed: int, lanes: int) -> BoardBots:
 # to. It is not re-pointed at another bot -- a mix name that silently changed
 # which opponent a run trained against is exactly what this list exists to
 # prevent -- so `--mix greedy=...` is now an unknown name, and a recipe that
-# wants a handcrafted opponent says `heximax` and means it.
+# wants a handcrafted opponent names that bot and means it.
 RESERVED_MIX = ("parent",)
 
 # The learner itself as a *table pool* member, and only there. A table whose
@@ -299,7 +299,7 @@ def mix_opponents(
     spelling, carries its own `TradeParams` (`Entrant.trade`, applied at
     `hexset.arena.spawn` time) — `frozen`'s policy has no such override and
     would silently lose it, so only the bare form qualifies. Every other name is an arena entrant spec resolved by
-    `named_opponent`, which is what makes `heximax` or `mcts:<ckpt>@64` a
+    `named_opponent`, which is what makes `mybot` or `mcts:<ckpt>@64` a
     training opponent without a branch here per bot, and makes the opponent
     a run trained against *literally* the entrant the arena scores.
 
@@ -636,7 +636,7 @@ def duel_pool(name: str) -> list[str] | None:
 
 
 def parse_mix(spec: str) -> list[tuple[str, float]]:
-    """`"heximax=0.15,parent=0.1"` — the share of games each opponent plays.
+    """`"mybot=0.15,parent=0.1"` — the share of games each opponent plays.
 
     A name is a reserved one (`RESERVED_MIX`), any arena entrant spec, or a
     `table(a|b|c)` pool (see `TABLE`); only the shares and the table syntax are
@@ -911,12 +911,12 @@ def mixed_caster(fractions: Sequence[float], players: int, seed: int):
     A fraction also buys less exposure than it reads like. In a cast game the
     learner holds 2 seats, so 2 of a learner seat's 3 opponents are the cast bot
     and the third is itself: exposure is `fraction * 2/3`, so e.g.
-    `heximax=0.15` gives the learner 10% opponent-facing exposure to heximax.
+    `mybot=0.15` gives the learner 10% opponent-facing exposure to mybot.
 
     Adding heterogeneous tables needs no new flag and should not get one — a new
     argparse dest changes `run.manifest.parameters` and every frozen config then
     fails `load`. It belongs in the spec string, as a `+` between names sharing
-    one share: `"heximax+parent=0.1"` keeps every existing spec
+    one share: `"mybot+parent=0.1"` keeps every existing spec
     byte-identical, keeps the shares exact because there is still one draw a
     game, and turns each entry's cast from an id into a pair of ids. The seat
     assignment within the pair is the part that needs care rather than taste —
@@ -1147,7 +1147,7 @@ def _build(spec: WorkerSpec) -> tuple[list[NetworkPolicy], Collector]:
         #
         # `opponents` is one flat list indexed by cast id, learners first, so a
         # mix's ids would start at `learners` while `mixed_caster` emits `k + 1`
-        # — a mix meaning `heximax` would silently seat *learner 1*. That much is
+        # — a mix meaning `mybot` would silently seat *learner 1*. That much is
         # an offset away from being fixed.
         #
         # The second is not. `league_caster` fills **every** seat with a learner

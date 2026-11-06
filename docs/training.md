@@ -6,17 +6,9 @@ resumed). All three share one checkpoint format, one evaluation harness and
 one network builder, in `hexn.loop`. This page describes what each mode
 does, and the mechanics they share.
 
-Contract `9.1` adds public rule inputs to contract `9`'s shared seat and
-table tokens. `--contract 9.1 --rules-mix '<JSON>'` freezes a
-`hexset.gym.distribution.Distribution` specification into the PPO manifest;
-it is supported for self-play with an empty `--mix`. All games keep the
-same number of dealt slots (`--players`); unused seats retire before setup.
-Checkpoints record the observation contract in `model_config`, and both
-checkpoint play and ONNX export use it. Loading contract-9 weights into a
-9.1 model appends zero input columns, preserving standard-game predictions
-before fine-tuning. Its win softmax and points predictions exclude retired
-slots. The auxiliary points target averages opponents and counts rounds
-over live seats only, with zero targets at retired slots.
+Every mode trains either network ([checkpoints.md](checkpoints.md#contracts)):
+contract 8's, one action a decision, or contract 9's, whole decisions
+([contract 9 training](#contract-9-training)).
 
 ## PPO self-play (`hexn.ppo`)
 
@@ -27,9 +19,12 @@ python -m hexn.ppo runs/my-run
 ```
 
 `hexn.selfplay.Collector` (or `hexn.collect.ParallelCollector` under
-`--collect-workers`) plays lockstep batches of games through
-`hexn.policy.NetworkPolicy`. `hexn.rewards` turns each finished game's
-`Outcome` into a per-seat target. `hexn.ppo`'s own math (GAE, the clipped
+`--collect-workers`) plays its games on HexSet's batched game loop
+(`hexset.gym.driver.Driver`) and keeps only the trainer's half: it batches
+each tick's requests to the policy (`hexn.policy.NetworkPolicy`, or
+`hexn.policy9.NetworkPolicy9` for a contract-9 net), and files a training
+row per decision and the finished episode. `hexn.rewards` turns each
+finished game's `Outcome` into a per-seat target. `hexn.ppo`'s own math (GAE, the clipped
 surrogate, the value loss) builds the update from the resulting batch.
 
 **The discount is fixed at 1 and is not a flag.** The reward is zero-sum, so
@@ -68,7 +63,7 @@ Adam step (`hexn.ddp`) — data parallelism at the gradient level, for boxes
 where a single-device GPU update is not the bottleneck.
 
 **Opponents in the training lanes** (`--mix`, e.g.
-`"heximax=0.15,parent=0.1"`): a share of games are played against a named
+`"rulesbot=0.15,parent=0.1"`): a share of games are played against a named
 arena entrant instead of self-play, on alternating seat pairs whose seats
 are never trained on. `parent` (the checkpoint named by `--parent`) and any
 `hexset` arena entrant spec both work, so a held-out opponent can be
@@ -76,6 +71,24 @@ collected against as well as evaluated on. A bot HexSet does not ship
 resolves only once its runtime is loaded: name the module with `--runtime`
 (repeatable; frozen into the config), and the trainer loads it before it
 resolves anything and hands it to every collector worker.
+
+**Seeds.** `--seed` is the run's training seed, and `hexn.run.init` holds
+it to the seed policy's `rl` seeds (`hexset.seeds`; [runs.md](runs.md#seeds)).
+`--eval-seed` is the seed every evaluation during training plays (the
+ladder, ExIt's duel), the same for every replicate so their evaluations are
+paired; `run.init` fills it from the policy's evaluation default, and unset
+it is `--seed + 10000`. `--sample-stream game` (the default) keys every
+sampled action on `(seed, game index, seat, step)`, so a game is a pure
+function of its index and the weights whatever the worker count and lanes;
+`worker` keeps each collector's own generator.
+
+**Collection options.** `--board-mode random|spiral` deals every self-play
+game's board by HexSet's board modes; a `--rules-mix` deals its own.
+`--discard-order random|seat` orders a seven's discards. `--collect-precision
+bf16` has the collect workers sample under bf16: a slightly different
+behaviour policy whose log-probabilities are still recorded exactly, in
+fp32 from its own logits. `--collect-trunk fused|reference` picks the
+workers' trunk, the same numbers up to float reassociation.
 
 **The learning rate follows a schedule** (`hexn.schedule`, `--lr-schedule`):
 `constant` keeps `--learning-rate` fixed; `linear` anneals it to
@@ -171,6 +184,44 @@ is the one budget every learner's network declares.
 There is no per-learner override for them: varying one would make the arms
 a sequential comparison rather than a shared-table league.
 
+## Contract 9 training
+
+`--contract 9` (or `9.1`, `9d`, `9d.1`) trains `hexn.model9.HexNet`
+([checkpoints.md](checkpoints.md#the-contract-9-network-hexnmodel9)). The
+lanes ask the learner for whole decisions (`hexset.gym.lanes.LaneEnv`'s
+`decisions`), and `hexn.policy9.NetworkPolicy9` answers a tick in one
+forward: every legal option of each decision, ordinary and compound, is
+scored and drawn by Gumbel-max, the noise keyed on the decision's draw key
+and the option's slot, so a game stays a pure function of its index. The
+update recomputes each decision's log-probability over the same options and
+takes its entropy over them.
+
+- **Shape.** `--width`, `--rounds`, `--heads linear|mlp`, `--discard-head
+  linear|mlp`, `--norm`/`--no-norm`, `--messages separate|pooled`,
+  `--attention`/`--no-attention`, `--others`, `--global-seat` and
+  `--points-head` set the net's `ModelConfig`; a checkpoint carries it.
+- **Contracts.** `9.1` reads the table's rules, the next roll's odds and
+  live-seat flags. `9d` and `9d.1` are the two-seat observations and need
+  `--players 2`. `--rules-mix '<JSON>'` (contract `9.1`, `9d` or `9d.1`
+  self-play only) freezes a `hexset.gym.distribution.Distribution`
+  specification into the manifest, a format drawn per game; every game keeps
+  the same number of dealt slots (`--players`), and unused seats retire
+  before setup. Win and points predictions exclude retired seats.
+- **Loading across contracts.** `--init` from contract-9 weights onto a
+  `9.1` net, or from `9d` onto `9d.1`, appends zero input columns, so the
+  loaded net predicts as before until it trains.
+- **The points head.** `--aux-target zero_sum` trains it on every seat's
+  later relative-points changes, discounted `--zero-sum` (0.6) per round, by
+  squared error at `--aux-margin-weight`; relative points and rounds count
+  live seats only. At a table with scripted opponents (`--mix`) each game
+  carries every seat's points before each opponent move, so the target is
+  the one self-play gives.
+- **Native lanes.** Where HexSet's native core is built, the collector plays
+  a cohort on native lanes when every seat it plays is a contract-9 net that
+  takes the double turn in parts, with per-game sample streams and no other
+  policy, opponent, outlook, marks or trades; otherwise on Python lanes, with
+  the same game files and training rows either way ([runs.md](runs.md)).
+
 ## The shared harness (`hexn.loop`)
 
 All three modes import their checkpointing, evaluation, and network-building
@@ -182,16 +233,23 @@ truncated `latest.pt` in place of the good one. Every checkpoint carries the
 game counter (`games_started`) alongside the network and optimiser state: a
 game is a pure function of `(seed, index)`, so a resumed run that lost the
 counter would replay games it has already trained on while looking healthy.
-`--keep-every N` additionally keeps `iter-NNNNN.pt` every N iterations, so
-earlier iterations remain available for comparison after `latest.pt` has
-moved on; `--keep-recent N` keeps a rolling ring of the last N periodic
+Every iteration's checkpoint is kept as `iter-NNNNN.pt`, so each game's
+behaviour policy is; `--keep-every` is read but ignored, so frozen configs
+still load. `--keep-recent N` keeps a rolling ring of the last N periodic
 saves. `--checkpoint-every` defaults to 1 in every mode.
 
 **Nothing waits for the end of a batch to reach the disk** (`hexn.durable`).
 Each game is written to `<checkpoint-dir>/partial/iter-NNNNN/` the moment it
 finishes, the log row and the checkpoint precede an iteration's evaluation,
-and a log line is flushed and fsynced as it is written. `docs/runs.md`
-covers what a resume does with them. A `ParallelCollector` polls its
+and a log line is flushed and fsynced as it is written. Once an iteration's
+collection is no longer needed, every game in it (index, seed, seats,
+outcome, trades and `hexset.record.Record`) is archived to
+`<checkpoint-dir>/games/iter-NNNNN.games.jsonl.gz` before the partial
+directory is removed. `hexn.loop.duel` and `versus` take a `journal`, and
+the ladder keeps each rung's games under `<checkpoint-dir>/evals/`. The
+log's `games` is the games collected for that iteration, and `games_total`
+every game through it across resumes (the checkpoint's `games_played`).
+[runs.md](runs.md) covers what a resume does with them. A `ParallelCollector` polls its
 workers rather than blocking on them: a worker that dies, or goes
 `hexn.collect.STALL_SECONDS` without a tick, fails the run with a sentence,
 and `<checkpoint-dir>/heartbeat.json` says what each worker is doing while
@@ -205,18 +263,19 @@ other, seats rotating, and reports paired terminal victory points (board
 and dice cancel) plus a Wilson interval on the win rate. `hexn.loop.ladder`
 runs the current weights, argmax'd, against every configured rung: the
 run's own `--parent` checkpoint, an optional `--search-rung` (a named arena
-entrant, e.g. `heximax`), and, if `--rival <directory>` names another run,
+entrant, e.g. `searchbot`), and, if `--rival <directory>` names another run,
 that run's checkpoint at the *matched* iteration. This gives the ladder a
 recipe-vs-recipe column alongside a common-opponent one. Rungs are fixed
 points: a duel against a fixed weak opponent saturates once the policy is
 reliably stronger, whereas a flat ladder reading means the policy stopped
 improving.
 
-**The network builder** (`hexn.loop.build`, `hexn.loop.add_head_flags`)
-constructs a `HexNet`/`NetworkPolicy` pair from a run's `ModelConfig` fields
-(`--width`, `--rounds`, `--value-head`, `--policy-head`, `--quantiles`),
-shared so the three trainers cannot build three subtly different networks
-from the same flags.
+**The network builder** (`hexn.loop.build`, `hexn.loop.add_head_flags`,
+`hexn.loop.add_net9_flags`) constructs the network and its policy from a
+run's flags: for contract 8, `--width`, `--rounds`, `--value-head`,
+`--policy-head` and `--quantiles`; for contract 9, the shape
+flags above. It is shared so the three trainers cannot build three subtly
+different networks from the same flags.
 
 ## Where to look next
 

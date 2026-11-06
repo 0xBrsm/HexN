@@ -255,7 +255,7 @@ def engine_provenance(runtimes: Sequence[str] = ()) -> dict[str, Any]:
     HexNet no longer vendors the engine, so a run's own tree being clean says
     nothing about which `hexset` it trained against. Nor does the engine's
     commit say which bots a run's names resolved to: HexSet ships none, and
-    `heximax` or `rehex` is whatever bot the run's `--runtime` provides
+    a bot name such as `mybot` is whatever bot the run's `--runtime` provides
     (`hexn.runtime`). So each runtime module gets its own entry under
     `runtimes`: the commit and dirty state of the checkout it was found in,
     null where it is not a git checkout and `{}` where it is not installed.

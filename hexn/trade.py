@@ -15,7 +15,7 @@ and reads as `None`.
 that answers every trade for the network instead (`trader_gate`): the network
 still plays every move, bank trades included. It is the network half of
 HexSet's `<entrant>~<trader>` lineup spelling, for the seats hexn gates
-itself. HexSet ships no playing bots, so a name like `heximax` resolves only
+itself. HexSet ships no playing bots, so a name like `mybot` resolves only
 in a process that loaded the runtime registering it (`hexn.runtime`).
 """
 

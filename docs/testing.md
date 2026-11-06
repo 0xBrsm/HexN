@@ -10,8 +10,8 @@ extra configuration.
 
 ## Named bots need their runtime
 
-HexSet ships no playing bots. The tests that seat `heximax` or `rehex` by
-name skip unless the module that registers them is loaded:
+HexSet ships no playing bots. The tests that seat a bot HexSet does not
+ship by name skip unless the module that registers it is loaded:
 
 ```bash
 python -m pytest tests -q --runtime <module>
@@ -32,27 +32,29 @@ call `pytest.importorskip("torch", reason="PyTorch runs on the training box
 only")` at import time, so the whole file is skipped cleanly, not failed,
 where torch is absent:
 
-`test_collect.py`, `test_netbot.py`, `test_ddp.py`, `test_widen.py`,
-`test_policy.py`, `test_export_onnx.py`, `test_ppo.py`, `test_ppo_main.py`,
-`test_migrate.py`, `test_exit.py`, `test_league.py`, `test_model.py`,
-`test_reanalyse.py`, and `test_run_manifest.py` (its
-parsers import torch even though the manifest format itself does not).
+`test_collect.py`, `test_model.py`, `test_model9.py`, `test_policy9.py`,
+`test_export_onnx.py`, `test_export_onnx9.py`, `test_ppo.py`,
+`test_migrate_c8.py` and `test_run_manifest.py` (its parsers import torch
+even though the manifest format itself does not) are among them. The rule,
+not a list, decides it: a file that imports torch, directly or through the
+module it tests, calls `importorskip` first.
 
 The rest of the suite needs only `numpy` and `hexset`, and runs on a machine
 that cannot install torch at all:
 
-`test_head_shape.py`, `test_no_raw_state.py`, `test_rewards.py`,
-`test_schedule.py`, `test_readout.py`,
-`test_replay.py`, `test_store.py`, `test_gate_wiring.py`, `test_expert.py`,
-and `test_selfplay.py`, plus `_mcts_fixtures.py`, a shared fixture module (not a
-test file itself) borrowed from HexSet's own search tests and kept in sync
-by hand rather than imported across the package boundary.
+`test_durable.py`, `test_expert.py`, `test_gate_wiring.py`,
+`test_head_shape.py`, `test_no_raw_state.py`, `test_optim.py`,
+`test_readout.py`, `test_replay.py`, `test_rewards.py`, `test_schedule.py`,
+`test_selfplay.py`, `test_store.py`, `test_trade.py` and `test_versions.py`,
+plus `_mcts_fixtures.py`, a shared fixture module (not a test file itself)
+borrowed from HexSet's own search tests and kept in sync by hand rather than
+imported across the package boundary.
 
 This split is deliberate: `hexn.selfplay`, `hexn.readout`, `hexn.rewards`,
-`hexn.schedule`, and `hexn.run` are themselves torch-free modules, and their
-tests are the proof that they stay that way. `hexn.collect` is not among
-them — it imports torch at module scope to load a checkpoint, which is why
-`test_collect.py` sits in the list above.
+`hexn.schedule`, `hexn.durable` and `hexn.run` are themselves torch-free
+modules, and their tests are the proof that they stay that way.
+`hexn.collect` is not among them — it imports torch at module scope to load
+a checkpoint, which is why `test_collect.py` skips without it.
 `hexn.benchmarks.rollout` and `hexn.benchmarks.return_shape` are the only
 benchmarks that share this property.
 

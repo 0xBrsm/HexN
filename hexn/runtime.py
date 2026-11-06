@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-only
 """The bots a run names, loaded the way HexSet loads them.
 
-HexSet ships no playing bots. A bot -- `heximax` or `rehex` as a ladder
+HexSet ships no playing bots. A bot -- `mybot`, say, as a ladder
 rung, a `--mix` opponent or a `--trader` -- is registered with
 `hexset.arena` by the runtime module that carries it, and a process can name
 it only once that module is imported (`hexset.arena.load_runtime`). hexn

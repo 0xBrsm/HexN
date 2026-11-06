@@ -2,7 +2,7 @@
 """`pytest --runtime <module>`: load a bot runtime before the suite.
 
 HexSet ships no playing bots, and hexn names no runtime of its own
-(`hexn.runtime`), so the tests that seat `heximax` or `rehex` need the
+(`hexn.runtime`), so the tests that seat a bot a runtime registers (`mybot`) need the
 module that registers them named here, as a run names it with
 `--runtime`. Without one those tests skip (`_bots.needs`); the rest of the
 suite runs on the engine alone.

@@ -900,7 +900,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--trader",
         default=None,
-        help="A bot, as a lineup names it (e.g. 'heximax', registered by a "
+        help="A bot, as a lineup names it (e.g. 'mybot', registered by a "
         "--runtime), that answers the served file's trades while the network "
         "plays every move. Default: the trader the run trained with, if any. "
         "Written as metadata; the server that loads the file needs the same runtime.",

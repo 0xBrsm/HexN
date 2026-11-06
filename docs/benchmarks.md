@@ -57,6 +57,20 @@ python -m hexn.benchmarks.value_head --checkpoint runs/example/latest.pt --games
 python -m hexn.benchmarks.rollout --players 4 --ticks 200
 ```
 
+Every benchmark that plays games keeps each one, its record included, as it
+finishes, under `--games-dir` (default
+`runs/benchmarks/<benchmark>/<UTC time>`).
+
+Each benchmark's seed comes from the seed policy (`hexset.seeds`), with
+`--bypass-seed-policy REASON` and `--registration PATH`. The ones that read
+a checkpoint's value head on its own games (`value_head`, `sibling`,
+`rank`, `horizon`, `floor`, `head_swap`, `head_shape`) take an evaluation
+seed, never a training one. The ones that time or measure training
+(`rollout`, `model_forward`, `mix_cost`, `noise_scale`,
+`minibatch_iso_kl`, `expert_scale`, `expert_cost`, `training_loop`) take an
+`rl` training seed, and `return_shape --null-seed` an analysis seed. With no
+policy, each keeps its own default.
+
 Most modules accept `--players` and `--seed` alongside their own knobs, and
 about half also accept `--action-cap`. The three that sample and replay real
 positions — `floor`, `rank`, `horizon` — take

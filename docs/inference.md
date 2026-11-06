@@ -1,7 +1,7 @@
 # Collection inference
 
 An isolated CPU collection worker owns `hexn.inference9.WorkerInference` for
-its contract-9 policy. Eligible two- or four-seat models use contracts 9/9d,
+its contract-9 policy. Eligible two- or four-seat models use contracts 9, 9d or 9d.1,
 pooled messages without attention, normalization, linear heads, an MLP
 discard head and parts decisions. In eval mode with fused collection and the
 configured BF16 precision they cache Linear weight casts and trace the original

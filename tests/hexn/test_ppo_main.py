@@ -289,14 +289,14 @@ def test_every_trainer_can_turn_the_batch_dump_off():
 
 def test_parse_mix_rejects_overcommitted_or_empty_shares():
     assert parse_mix("") == []
-    assert parse_mix("heximax=0.25,parent=0.25") == [
-        ("heximax", 0.25),
+    assert parse_mix("mybot=0.25,parent=0.25") == [
+        ("mybot", 0.25),
         ("parent", 0.25),
     ]
     with pytest.raises(ValueError):
-        parse_mix("heximax=0.7,parent=0.7")
+        parse_mix("mybot=0.7,parent=0.7")
     with pytest.raises(ValueError):
-        parse_mix("heximax=0")
+        parse_mix("mybot=0")
 
 
 def test_async_collection_prefetches_each_batch_once(tmp_path):
@@ -1135,7 +1135,7 @@ def test_a_contract_9_init_without_a_points_head_starts_the_head_fresh(tmp_path)
         run(tmp_path / "other", 1, C9 + ["--attention", "--init", str(source / "latest.pt")])
 
 
-@pytest.mark.parametrize("flags", [["--eval-every", "1"], ["--parent", "x.pt"], ["--search-rung", "rehex"]])
+@pytest.mark.parametrize("flags", [["--eval-every", "1"], ["--parent", "x.pt"], ["--search-rung", "rulesbot"]])
 def test_a_contract_9_run_refuses_what_it_is_not_built_for(tmp_path, flags):
     with pytest.raises(SystemExit):
         run(tmp_path, 1, C9 + flags)

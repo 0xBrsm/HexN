@@ -26,9 +26,9 @@ be looking at:
   numpy, so it is installable (and testable) on a machine where `hexn`'s
   dependencies cannot be. `hexn` depends on `hexset`; `hexset` never
   imports `hexn`. `hexset.bench` (throughput, baselines, duels) ships from
-  that same repository; playing bots do not. A bot such as `heximax` or
-  `rehex` comes from a runtime module (`hexset.arena.load_runtime`), and
-  every `hexn` command that names one takes `--runtime <module>`.
+  that same repository; playing bots do not. A bot HexSet does not ship
+  comes from a runtime module (`hexset.arena.load_runtime`), and every
+  `hexn` command that names one takes `--runtime <module>`.
 - The development repository this package is cut from also carries a
   research journal, training runs, and a training source tree that this
   README does not describe. Nothing about it is needed to build or run
@@ -49,9 +49,9 @@ pip install git+https://github.com/0xBrsm/HexN.git@<commit>
 `hexn` is not published to PyPI: `pyproject.toml`'s own dependency on
 `hexset` is a pinned git URL, and PyPI refuses a package whose dependencies
 include one, so `pip install hexn` will not work. `<commit>` above is a
-commit hash or a release tag; `pyproject.toml`'s own version field
-(`0.23.3`) is package metadata, so check this repository's tags for what is
-actually released. `pyproject.toml` pins `hexset` to one specific commit of
+commit hash or a release tag; `pyproject.toml`'s own version field is
+package metadata, so check this repository's tags for what is actually
+released. `pyproject.toml` pins `hexset` to one specific commit of
 the engine rather than to its latest release, so installing `hexn` this way
 pulls the exact `hexset` it was built and tested against.
 Torch is not declared as a dependency; provision it separately (a ROCm or
@@ -74,9 +74,9 @@ python -m hexn.run.init --mode ppo --name first \
 python -m hexn.ppo runs/first
 
 # duels naming a trained checkpoint (HexSet's CLI; --runtime loads the
-# checkpoint loader, and the module providing `heximax`)
+# checkpoint loader, and the module providing `searchbot`)
 python -m hexset.bench.duel --runtime hexn.netbot --runtime <bot runtime> \
-    network:runs/first/latest.pt heximax --games 400
+    network:runs/first/latest.pt searchbot --games 400
 
 # export for the served table: search budget and the trade gate's own look-ahead are
 # per-file metadata HexSet reads (`search`/`simulations`, `gate_plies`)
@@ -99,38 +99,47 @@ Start with [training.md](docs/training.md); the rest are listed by name.
 | Document | Contents |
 | --- | --- |
 | [benchmarks.md](docs/benchmarks.md) | The 16 standalone benchmarks: throughput/cost, value-head, and optimiser diagnostics — what each measures and how to run it |
-| [checkpoints.md](docs/checkpoints.md) | The network and its heads, contract versions, migrating and widening a checkpoint, ONNX export |
+| [checkpoints.md](docs/checkpoints.md) | The contract-8 and contract-9 networks and their heads, contract versions, loading across contracts, migrating and widening a checkpoint, ONNX export |
+| [inference.md](docs/inference.md) | Collection inference: the CPU BF16 worker path for contract-9 policies |
 | [runs.md](docs/runs.md) | The run-manifest system: creating, loading and resuming a run directory |
 | [testing.md](docs/testing.md) | Running the test suite, and which parts need PyTorch |
-| [training.md](docs/training.md) | The three training modes (PPO self-play, expert iteration, the learner league) and the harness they share |
+| [training.md](docs/training.md) | The three training modes (PPO self-play, expert iteration, the learner league), contract-9 training, and the harness they share |
 
 ## Source Layout
 
 | Path | Purpose |
 |------|---------|
-| `hexn/model.py`, `readout.py` | Message passing over the graph observation, and the index map from heads to flat action slots |
-| `hexn/selfplay.py`, `collect.py`, `policy.py`, `rewards.py` | Vectorised lockstep rollout collection behind a `BatchPolicy` protocol, its sharded multi-process parallel collector, the torch policy, and the per-seat terminal scalarisation |
+| `hexn/model.py`, `readout.py` | The contract-8 network: message passing over the graph observation, and the index map from heads to flat action slots |
+| `hexn/model9.py`, `policy9.py` | The contract-9 network over HexSet's seat, table, hex and vertex tokens, and its policy: whole decisions in self-play (`NetworkPolicy9`) and in play (`Policy9`) |
+| `hexn/selfplay.py`, `collect.py`, `policy.py`, `rewards.py` | The trainer's half of collection on HexSet's batched game loop behind a `BatchPolicy` protocol, its sharded multi-process parallel collector, the contract-8 torch policy, and the per-seat terminal scalarisation |
+| `hexn/inference9.py` | The collect workers' CPU BF16 inference for a contract-9 policy ([inference.md](docs/inference.md)) |
+| `hexn/durable.py`, `gamefile.py`, `steps.py` | Keeping every unit of a batch the moment it finishes, and resuming from it; one finished game as compact, exact bytes; an update's progress after its optimiser steps |
+| `hexn/coalition.py`, `trade.py`, `runtime.py` | A coalition member inside self-play; how the networks trade, in HexSet's terms; loading the runtime modules a run names |
+| `hexn/optim.py` | The Adam execution the trainers share |
 | `hexn/ppo/` (`__init__.py` the GAE/clipped-surrogate/value-loss math, `__main__.py` the runnable `python -m hexn.ppo` loop) | GAE, clipped surrogate, and value loss; the runnable, resumable training loop |
 | `hexn/loop.py` | The checkpointing (atomic write, saved game counter), duel/versus/ladder evaluation stack, and network builder that `hexn.ppo`, `hexn.league`, and `hexn.exit` all import rather than each reimplementing |
 | `hexn/league.py` | The table league: several learners training on their own seats of every shared game, for hyperparameter heats |
 | `hexn/schedule.py` | The learning-rate controller |
 | `hexn/expert.py`, `hexn/exit/` (`__init__.py` the distillation math, `__main__.py` the runnable `python -m hexn.exit` loop) | Expert iteration through the existing collector, and distilling a search's target back into the policy |
 | `hexn/store.py`, `reanalyse.py`, `replay.py` | The retained-position replay store expert iteration trains from; refreshing a stored position's search target against a newer net without recollecting it; rebuilding a stored episode's live game at any ply |
-| `hexn/netbot.py`, `export_onnx.py`, `migrate.py`, `widen.py`, `ddp.py` | A checkpoint as an arena entrant (`hexset.bench.duel --runtime hexn.netbot` is what registers it); the traced encoder and ONNX export; checkpoint migration and function-preserving widening; the data-parallel PPO update across CPU worker processes |
-| `hexn/run/` | `run.init`/`run.manifest`: freezing a run's full parameter set before launch, and reading it back |
+| `hexn/ppo/prepare.py` | Assembling a collection's batch in a helper process, off the trainer's critical path |
+| `hexn/netbot.py`, `export_onnx.py`, `export_onnx9.py`, `migrate_c8.py`, `widen.py`, `ddp.py` | A checkpoint as an arena entrant (`hexset.bench.duel --runtime hexn.netbot` is what registers it); the traced encoder and ONNX export, contract 8 and contract 9; the contract-7-to-8 migration and function-preserving widening; the data-parallel PPO update across CPU worker processes |
+| `hexn/run/` | `run.init`/`run.manifest`: freezing a run's full parameter set before launch, and reading it back; `resources.py` resolves the hardware choices a new manifest freezes |
 | `hexn/benchmarks/` | Forward-pass and rollout cost, value-head diagnostics, ranking probes, training-loop profiling |
 | `tests/` | The `hexn` test suite; the torch-dependent tests skip cleanly where PyTorch is absent |
 
 ## Design Notes
 
 - **"Contract N" is this package's observation/encoding version.** The
-  network's input and output shapes are versioned as a single integer,
-  bumped whenever that shape changes: the record fields it reads, the
-  action space it emits over, and the metadata `hexn.export_onnx` writes
-  into an ONNX file. This is not internal shorthand: HexSet's own
-  `docs/onnx.md` defines the current contract (`CONTRACT_VERSION`) and the
-  ones it still serves, and rejects a file naming any other. This package's own module docstrings
-  cite specific numbers (`contract 5`, `contract 6`) as shorthand for
+  network's input and output shapes are versioned as a named contract,
+  changed whenever that shape changes: the observation it reads, the
+  action space it answers over, and the graph and metadata
+  `hexn.export_onnx` writes into an ONNX file. The current ones are `8` and
+  `8.1` (`hexn.model`) and `9`, `9.1`, `9d` and `9d.1` (`hexn.model9`). This
+  is not internal shorthand: HexSet's own `docs/onnx.md` defines every
+  contract it serves (its record contract is `CONTRACT_VERSION`, `8.1`),
+  and rejects a file naming any other. This package's own module docstrings
+  cite older numbers (`contract 5`, `contract 6`) as shorthand for
   "before/after that shape changed," most often around the trading
   redesign. `hexn.migrate_c8` carries a checkpoint from contract 7 to
   contract 8.
@@ -143,10 +152,10 @@ Start with [training.md](docs/training.md); the rest are listed by name.
   continues its training set instead of replaying it. Checkpoints are
   written to a temporary file and renamed.
 - **Checkpoints outlive the observation and the trunk width, separately.**
-  `hexn.migrate` carries a checkpoint forward, function-preserving, across
-  a change to the encoder's own shape (a contract bump), so a changed
-  observation does not orphan every checkpoint trained under the version
-  before it. `hexn.widen` is a different, unrelated function-preserving
+  `hexn.migrate_c8` carries a contract-7 checkpoint onto contract 8's
+  inputs, and a contract-8, 9 or 9d checkpoint loads into an 8.1, 9.1 or
+  9d.1 net with its new input weights at zero, so a changed observation
+  does not orphan every checkpoint trained under the version before it. `hexn.widen` is a different, unrelated function-preserving
   transform (Net2WiderNet): it grows the *model's* own hidden width,
   leaving the observation unchanged, so a wider net can warm-start from a
   narrower checkpoint's exact function.

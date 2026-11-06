@@ -42,13 +42,17 @@ reference trunk for a manifest created before the collect-trunk flag existed.
 Checkpoint decisions batch all positions needing a forward automatically;
 single-position callers use the same implementation with one row.
 
-Parallel contract-9 workers select native game lanes automatically when the
-optional HexSet extension is installed. This covers trade-free self-play
-cohorts with two or four seats, per-game sampling and part-wise double turns.
-The existing collector still deals each game and controls lane counts,
-grouping, refill order, seeds and resume indices. Every completion goes through
-the same durable game sink before its native lane retires. Other configurations
-use the ordinary collector; a started native game never switches engines.
+Every collector, in process or in a worker, plays its games on HexSet's
+batched game loop (`hexset.gym.driver.Driver`). It plays a cohort on native
+lanes wherever HexSet's optional native core is built and nothing needs a
+Python game: two or four seats, every seat a contract-9 net that takes the
+double turn in parts, per-game sample streams (`--sample-stream game`), and
+no other policy, caster, coalition, temperature, outlook, marks or trades.
+Everything else plays on Python lanes. Either way the collector deals each
+game, keeps lane counts, refill order, seeds and resume indices, and writes
+the same game files and training rows; every completion goes through the
+same durable game sink before its lane is dealt again, and a started game
+never switches engines.
 
 CPU BF16 workers also cache weight casts and lazily trace their original
 forward on its first actual input. The manifest's precision stays in force,
@@ -56,7 +60,7 @@ and regular weight synchronization refreshes the cache without changing
 checkpoint parameters. This runs inside collect worker processes, leaving
 the learner's execution settings alone. See [inference.md](inference.md) for
 the inference lifecycle. HexSet documents extension installation and state
-ownership in its native lane API guide.
+ownership in its `docs/native.md`.
 
 ```bash
 python -m hexn.run.init --mode ppo --name my-run \
@@ -72,8 +76,10 @@ by that mode's own parser; everything before it configures `run.init` itself:
 | `--name` | required; the run's directory name |
 | `--category` | groups the run under `runs/<category>/<name>` instead of `runs/<name>` |
 | `--runs-root` | defaults to `runs` |
+| `--repo` | where to read the git commit from; defaults to the working directory |
 | `--parent` | the checkpoint this run continues from, recorded as lineage |
-| `--plan` | a document describing this run's design, recorded for reference |
+| `--plan` | the document registering this run's design, recorded for reference; a confirmation seed takes it as its registration ([seeds](#seeds)) |
+| `--bypass-seed-policy REASON` | freeze a seed the seed policy refuses; the reason is kept in `run.json` |
 | `--description` | free text |
 | `--force` | overwrite an existing run directory |
 | `--git-commit` / `--git-dirty` | record these instead of asking `git` (for a checkout where `git` cannot resolve the repository) |
@@ -87,9 +93,21 @@ This writes:
 
 ```
 runs/my-run/
-  run.json           # metadata: mode, name, parent, provenance, argv
+  run.json           # metadata: mode, name, parent, provenance, argv, seeds
   config/ppo.json    # every parameter build_parser() defines, resolved
 ```
+
+### Seeds
+
+`run.init` holds the run's seeds to the seed policy (`hexset.seeds`) before
+anything is written. `--seed` must be one of the policy's `rl` training
+seeds. `--eval-seed`, the seed the run's evaluations play, is filled with
+the policy's evaluation default for the table's seat count when left unset,
+and must be an evaluation seed; a confirmation seed needs the run's `--plan`
+as its registration, a file that names the seed. A refused seed stops the
+freeze unless `--bypass-seed-policy REASON` is given. How each seed passed
+is kept in `run.json` as `seeds`. With no policy nothing is checked or
+filled.
 
 and prints the launch command:
 
@@ -107,11 +125,15 @@ mode's current parser defines:
 - **Missing a parameter** the parser now defines: refused. A manifest
   written before a flag existed is not silently filled in from today's
   default, because that would change what the run meant without saying so.
-- **Carries a parameter** the parser no longer defines: refused. The flag
-  was renamed or removed and the manifest is stale.
+  The exception is `hexn.run.manifest.ADDED`: a flag whose old-behaviour
+  value is known is filled with *that* value, never today's default, and the
+  fill is listed in the loaded manifest's `meta["filled"]`.
+- **Carries a parameter** the parser no longer defines: dropped where it had
+  no effect, and listed in `meta["retired"]`; refused, naming the config,
+  where it acted (`hexn.run.manifest.RETIRED`). The file is never rewritten.
 
-Both failures raise `SystemExit` with the parameter names, and both point
-at re-freezing the run rather than patching the JSON by hand.
+A refusal raises `SystemExit` with the parameter names, and points at
+re-freezing the run rather than patching the JSON by hand.
 
 `Manifest.namespace()` turns the loaded config straight into an
 `argparse.Namespace`, the same object shape the trainer's own
@@ -151,7 +173,14 @@ A resume loses at most the games that were in flight. Every game is kept
 under `<checkpoint-dir>/partial/iter-NNNNN/` as it finishes, and a cohort
 writes the list of indices it deals there first; the resumed iteration
 loads those games and deals only the missing indices, and every later deal
-starts past them. `hexn.exit` also takes a replay shard written just before
+starts past them. Once a collection is no longer needed, `hexn.durable.prune`
+archives every game in it (index, seed, seats, outcome, trades and record)
+to `<checkpoint-dir>/games/iter-NNNNN.games.jsonl.gz` before it removes the
+partial directory, and every iteration's checkpoint stays as
+`iter-NNNNN.pt`, so each kept game's behaviour policy is kept too. The
+checkpoint carries `games_played`, every game through it across resumes,
+which the log reports as `games_total` beside the iteration's own `games`;
+a checkpoint written without it logs `None` there. `hexn.exit` also takes a replay shard written just before
 the crash as its iteration's collection. The log row and the checkpoint are
 written before an iteration's evaluation, which gets a row of its own, and a
 resumed run appends `{"resumed_from": N}` to `log.jsonl` before its first

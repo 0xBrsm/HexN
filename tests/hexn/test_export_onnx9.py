@@ -269,25 +269,25 @@ def test_the_metadata_names_contract_9_and_no_offers_unless_asked(tmp_path):
     assert not {"trader", "trader_veto", "trade_floor", "gate_own_frame", "robber_tip", "search"} & set(meta)
 
 
-@needs("heximax")
+@needs("mybot")
 def test_the_served_shape_is_written_by_the_command_line_in_the_keys_hexset_reads(tmp_path):
     """A trader, its veto by the file's own gate at a floor, one offer a
     turn and the own-frame gate: the keys a served file carries."""
     source = a_checkpoint(tmp_path / "net.pt", PARTS)
     out = tmp_path / "served.onnx"
-    export_main(["--checkpoint", str(source), "--out", str(out), "--trader", "heximax", "--trader-veto",
+    export_main(["--checkpoint", str(source), "--out", str(out), "--trader", "mybot", "--trader-veto",
                  "--trade-floor", "0.03", "--max-offers", "1", "--gate-own-frame", "1"])
     meta = read_metadata(out.read_bytes())
     assert {k: meta[k] for k in ("contract", "trader", "trader_veto", "trade_floor", "max_offers", "gate_own_frame")} \
-        == {"contract": "9", "trader": "heximax", "trader_veto": "1", "trade_floor": "0.03", "max_offers": "1",
+        == {"contract": "9", "trader": "mybot", "trader_veto": "1", "trade_floor": "0.03", "max_offers": "1",
             "gate_own_frame": "1"}
     from hexset.clients.netbot import declared_trader
 
     game = deal_game(0, 0, 4)
     loaded = load(str(out), game._state.board.topology)
-    assert loaded.trader == "heximax" and loaded.trader_veto and loaded.trade_floor == pytest.approx(0.03)
+    assert loaded.trader == "mybot" and loaded.trader_veto and loaded.trade_floor == pytest.approx(0.03)
     assert loaded.gate.max_offers == 1 and loaded.gate.gate_own_frame
-    assert declared_trader(loaded, str(out)) == "heximax"
+    assert declared_trader(loaded, str(out)) == "mybot"
 
 
 def test_a_search_is_written_in_the_keys_hexset_searches_by(tmp_path):
@@ -305,7 +305,7 @@ def test_a_veto_with_nothing_to_veto_is_refused_not_written(tmp_path):
     with pytest.raises(SystemExit):
         export_main(["--checkpoint", str(source), "--out", str(tmp_path / "x.onnx"), "--trader-veto"])
     with pytest.raises(ValueError):
-        serving_props(trader="heximax", trader_veto=True, max_offers=0)
+        serving_props(trader="mybot", trader_veto=True, max_offers=0)
     assert not list(tmp_path.glob("*.onnx")) and not list(tmp_path.glob(".x.onnx*"))
 
 

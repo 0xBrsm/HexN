@@ -271,19 +271,19 @@ def test_a_collector_hands_its_trader_to_every_network_gate():
             asked.append((seat, max_offers, trader))
             return None
 
-    collector = Collector(Hooked(random.Random(12)), lanes=1, seed=6, trader="rehex", keep=kept())
+    collector = Collector(Hooked(random.Random(12)), lanes=1, seed=6, trader="rulesbot", keep=kept())
     next(collector.in_flight())
-    assert asked and all(entry[1:] == (None, "rehex") for entry in asked)
+    assert asked and all(entry[1:] == (None, "rulesbot") for entry in asked)
 
 
-@needs("heximax")
+@needs("mybot")
 def test_a_trader_is_named_alone_and_must_resolve():
     from hexn.trade import check_trader
 
     check_trader(None, 0)
-    check_trader("heximax", None)
+    check_trader("mybot", None)
     with pytest.raises(ValueError, match="drop --max-offers"):
-        check_trader("heximax", 0)
+        check_trader("mybot", 0)
     with pytest.raises(Exception):
         check_trader("nobody-by-that-name", None)
 
@@ -396,11 +396,11 @@ def test_a_drawing_opponent_draws_its_own_stream_per_game_and_seat_however_colle
     assert len({draws[:4] for draws in one[0].values()}) == 4 * 4, "no two games or seats draw alike"
 
 
-@needs("heximax")
+@needs("mybot")
 def test_a_scripted_opponent_is_seated_as_its_own_trader():
     from hexset.arena import entrant_from_name, spawn
 
-    entrant = entrant_from_name("heximax")
+    entrant = entrant_from_name("mybot")
     bots = BoardBots(lambda board: spawn(entrant, board, random.Random(0)),
                      seat_spawn=lambda board, rng: spawn(entrant, board, rng))
     collector = Collector(
