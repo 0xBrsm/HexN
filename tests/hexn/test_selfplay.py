@@ -292,6 +292,7 @@ def test_an_opponent_that_reads_the_table_is_shown_every_move_from_a_seat_of_its
     """A `named_opponent` bot with a `seen` hook (`hexset.bots.watch`): one
     per seat per game, each built off its own stream and shown its game's
     every move, the learner's included, from its own seat."""
+    pytest.importorskip("torch", reason="hexn.collect imports torch")
     from hexset import arena
     from hexset.actions import options_for
     from hexn.collect import named_opponent
@@ -349,6 +350,7 @@ def test_a_drawing_opponent_draws_its_own_stream_per_game_and_seat_however_colle
     never one every game repeats, and the same one whether a collector plays
     the games in one lane, three, or split over two workers. Every seat is
     the bot's, so nothing else draws in tick order."""
+    pytest.importorskip("torch", reason="hexn.collect imports torch")
     from hexset import arena
     from hexset.actions import options_for
     from hexn.collect import named_opponent

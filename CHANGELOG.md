@@ -2,6 +2,28 @@
 
 All notable changes to the `hexn` package are recorded here.
 
+## 0.49.3
+
+### Fixed
+
+- **The tests that seat a named bot run without a runtime.** With no
+  `pytest --runtime`, the suite registers its own `mybot` (`tests/_mybot.py`),
+  which moves at random and trades by card scarcity, so the mix, trader and
+  export tests that seat one no longer skip.
+
+- **`hexn.selfplay` runs without torch.** `Collector` imported the
+  contract-9 policy, which needs torch, each time it checked for native
+  lanes; it now imports it only once every other native condition holds.
+  `test_optim.py` skips without torch, and so do the two `test_selfplay.py`
+  tests that build an opponent through `hexn.collect`.
+
+- **The docs match the code and read plainly.** `docs/testing.md` and the
+  README say the named-bot tests play the suite's own `mybot` and list the
+  torch-free tests as they are; `docs/runs.md` lists the `runtimes` that
+  `run.json` records under `engine`; `docs/training.md` gives `hexn.exit`'s
+  default evaluation seed. Every doc drops em dashes and stock phrasing, and
+  the `pytest --runtime` help says a runtime's `mybot` replaces the suite's.
+
 ## 0.49.2
 
 ### Fixed

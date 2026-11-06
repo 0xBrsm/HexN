@@ -5,23 +5,22 @@ graph-native network that plays the classic ruleset published as
 *Settlers of Catan* (see [Trademarks](#trademarks) below). The board is a
 heterogeneous graph of hexes, vertices, and edges; the network reads that
 graph directly and emits its policy as a per-node readout, so action
-legality is a node property rather than a mask bolted onto a flattened
-board. Published agents for this game instead flatten the hex board onto a
-rectangular grid so an ordinary CNN can approximate hex adjacency.
+legality is a property of each node. Published agents for this game flatten
+the hex board onto a rectangular grid so an ordinary CNN can approximate hex
+adjacency.
 
 ## Three repos, one package
 
 This package (`hexn`) is one of three things a reader of this README may
 be looking at:
 
-- **`hexn`** — this package. Model, PPO self-play, expert iteration, the
+- **`hexn`**: this package. Model, PPO self-play, expert iteration, the
   resumable training loop, and its benchmarks. Needs PyTorch. The search
   that expert iteration trains against is not here: `hexset.mcts` owns it,
   and this package supplies the batched network evaluation it runs against
-  (`hexn.policy`). The rule is that `hexn` calls the engine and never
-  reimplements it.
-- **`hexset`** — the rules engine, the gym, the ledger of public
-  knowledge an honest policy may read, the observation encoder, and the
+  (`hexn.policy`). `hexn` calls the engine and never reimplements it.
+- **`hexset`**: the rules engine, the gym, the ledger of public
+  knowledge a seat may read, the observation encoder, and the
   search (`hexset.mcts`), in its own public repository. Needs nothing but
   numpy, so it is installable (and testable) on a machine where `hexn`'s
   dependencies cannot be. `hexn` depends on `hexset`; `hexset` never
@@ -50,10 +49,9 @@ pip install git+https://github.com/0xBrsm/HexN.git@<commit>
 `hexset` is a pinned git URL, and PyPI refuses a package whose dependencies
 include one, so `pip install hexn` will not work. `<commit>` above is a
 commit hash or a release tag; `pyproject.toml`'s own version field is
-package metadata, so check this repository's tags for what is actually
-released. `pyproject.toml` pins `hexset` to one specific commit of
-the engine rather than to its latest release, so installing `hexn` this way
-pulls the exact `hexset` it was built and tested against.
+package metadata, so check this repository's tags for what is released.
+`pyproject.toml` pins `hexset` to one commit of the engine, so installing
+`hexn` this way pulls the exact `hexset` it was built and tested against.
 Torch is not declared as a dependency; provision it separately (a ROCm or
 CUDA build, matched to the training hardware) before training.
 
@@ -62,7 +60,7 @@ CUDA build, matched to the training hardware) before training.
 A run is a directory, and its frozen manifest is the only input. The
 configuration is frozen first, then launched: the trainers take a run
 directory and refuse every flag, so a recorded result is reproducible from
-what is committed rather than from whichever invocation happened to run.
+what is committed.
 
 ```bash
 # 1. freeze the configuration. Everything after `--` is the mode's own flags,
@@ -83,8 +81,9 @@ python -m hexset.bench.duel --runtime hexn.netbot --runtime <bot runtime> \
 python -m hexn.export_onnx --checkpoint runs/first/latest.pt --out latest.onnx \
     --search mcts --simulations 256 --gate-plies 8
 
-# the test suite; torch-dependent files skip cleanly where torch is absent, and
-# the tests that seat a named bot skip unless `--runtime <module>` provides it
+# the test suite; torch-dependent files skip where torch is absent, and the
+# tests that seat a named bot play the suite's own `mybot` unless a
+# `--runtime <module>` registers one
 python -m pytest tests -q
 ```
 
@@ -98,7 +97,7 @@ Start with [training.md](docs/training.md); the rest are listed by name.
 
 | Document | Contents |
 | --- | --- |
-| [benchmarks.md](docs/benchmarks.md) | The 16 standalone benchmarks: throughput/cost, value-head, and optimiser diagnostics — what each measures and how to run it |
+| [benchmarks.md](docs/benchmarks.md) | The 16 standalone benchmarks: throughput/cost, value-head, and optimiser diagnostics, with what each measures and how to run it |
 | [checkpoints.md](docs/checkpoints.md) | The contract-8 and contract-9 networks and their heads, contract versions, loading across contracts, migrating and widening a checkpoint, ONNX export |
 | [inference.md](docs/inference.md) | Collection inference: the CPU BF16 worker path for contract-9 policies |
 | [runs.md](docs/runs.md) | The run-manifest system: creating, loading and resuming a run directory |
@@ -117,7 +116,7 @@ Start with [training.md](docs/training.md); the rest are listed by name.
 | `hexn/coalition.py`, `trade.py`, `runtime.py` | A coalition member inside self-play; how the networks trade, in HexSet's terms; loading the runtime modules a run names |
 | `hexn/optim.py` | The Adam execution the trainers share |
 | `hexn/ppo/` (`__init__.py` the GAE/clipped-surrogate/value-loss math, `__main__.py` the runnable `python -m hexn.ppo` loop) | GAE, clipped surrogate, and value loss; the runnable, resumable training loop |
-| `hexn/loop.py` | The checkpointing (atomic write, saved game counter), duel/versus/ladder evaluation stack, and network builder that `hexn.ppo`, `hexn.league`, and `hexn.exit` all import rather than each reimplementing |
+| `hexn/loop.py` | The checkpointing (atomic write, saved game counter), duel/versus/ladder evaluation stack, and network builder that `hexn.ppo`, `hexn.league`, and `hexn.exit` share |
 | `hexn/league.py` | The table league: several learners training on their own seats of every shared game, for hyperparameter heats |
 | `hexn/schedule.py` | The learning-rate controller |
 | `hexn/expert.py`, `hexn/exit/` (`__init__.py` the distillation math, `__main__.py` the runnable `python -m hexn.exit` loop) | Expert iteration through the existing collector, and distilling a search's target back into the policy |
@@ -126,7 +125,7 @@ Start with [training.md](docs/training.md); the rest are listed by name.
 | `hexn/netbot.py`, `export_onnx.py`, `export_onnx9.py`, `migrate_c8.py`, `widen.py`, `ddp.py` | A checkpoint as an arena entrant (`hexset.bench.duel --runtime hexn.netbot` is what registers it); the traced encoder and ONNX export, contract 8 and contract 9; the contract-7-to-8 migration and function-preserving widening; the data-parallel PPO update across CPU worker processes |
 | `hexn/run/` | `run.init`/`run.manifest`: freezing a run's full parameter set before launch, and reading it back; `resources.py` resolves the hardware choices a new manifest freezes |
 | `hexn/benchmarks/` | Forward-pass and rollout cost, value-head diagnostics, ranking probes, training-loop profiling |
-| `tests/` | The `hexn` test suite; the torch-dependent tests skip cleanly where PyTorch is absent |
+| `tests/` | The `hexn` test suite; the torch-dependent tests skip where PyTorch is absent |
 
 ## Design Notes
 
@@ -135,18 +134,17 @@ Start with [training.md](docs/training.md); the rest are listed by name.
   changed whenever that shape changes: the observation it reads, the
   action space it answers over, and the graph and metadata
   `hexn.export_onnx` writes into an ONNX file. The current ones are `8` and
-  `8.1` (`hexn.model`) and `9`, `9.1`, `9d` and `9d.1` (`hexn.model9`). This
-  is not internal shorthand: HexSet's own `docs/onnx.md` defines every
-  contract it serves (its record contract is `CONTRACT_VERSION`, `8.1`),
+  `8.1` (`hexn.model`) and `9`, `9.1`, `9d` and `9d.1` (`hexn.model9`).
+  HexSet's own `docs/onnx.md` defines every contract it serves (its record
+  contract is `CONTRACT_VERSION`, `8.1`),
   and rejects a file naming any other. This package's own module docstrings
   cite older numbers (`contract 5`, `contract 6`) as shorthand for
   "before/after that shape changed," most often around the trading
   redesign. `hexn.migrate_c8` carries a checkpoint from contract 7 to
   contract 8.
-- **Vector value, not scalar.** This game has four players and one winner,
-  so the value head returns one number per seat rather than a zero-sum
-  scalar. Every output is trained from every position, which lets a search
-  back it up with max^n instead of a minimax sign flip.
+- **A value per seat.** This game has up to four players and one winner,
+  so the value head returns one number per seat. Every output is trained
+  from every position, which lets a search back it up with max^n.
 - **Reproducible runs.** A game is a pure function of its seed and index,
   and the game counter is checkpointed with the weights, so a resumed run
   continues its training set instead of replaying it. Checkpoints are
@@ -155,8 +153,9 @@ Start with [training.md](docs/training.md); the rest are listed by name.
   `hexn.migrate_c8` carries a contract-7 checkpoint onto contract 8's
   inputs, and a contract-8, 9 or 9d checkpoint loads into an 8.1, 9.1 or
   9d.1 net with its new input weights at zero, so a changed observation
-  does not orphan every checkpoint trained under the version before it. `hexn.widen` is a different, unrelated function-preserving
-  transform (Net2WiderNet): it grows the *model's* own hidden width,
+  does not orphan every checkpoint trained under the version before it.
+  `hexn.widen` is a separate function-preserving transform (Net2WiderNet):
+  it grows the *model's* own hidden width,
   leaving the observation unchanged, so a wider net can warm-start from a
   narrower checkpoint's exact function.
 
@@ -165,5 +164,5 @@ Start with [training.md](docs/training.md); the rest are listed by name.
 CATAN and SETTLERS OF CATAN are trademarks of Catan GmbH and Catan Studio. This
 project is not affiliated with, endorsed by, or sponsored by either, and it ships
 no Catan artwork, text, or other content. Those names appear here only to identify
-which game's rules this implements — nominative use, not a claim on the marks.
+which game's rules this implements: nominative use, not a claim on the marks.
 </content>

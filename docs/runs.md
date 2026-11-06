@@ -2,14 +2,14 @@
 
 A run is a directory, and its manifest is the only input a trainer reads.
 This page covers the mechanics of creating, loading, and resuming one. What
-each of the three trainers does — PPO, expert iteration, the learner
-league — is in [training.md](training.md).
+each of the three trainers does (PPO, expert iteration, the learner league)
+is in [training.md](training.md).
 
-## Why a manifest, not flags
+## The manifest holds the flags
 
-`python -m hexn.ppo`, `python -m hexn.league`, and `python -m hexn.exit` do
-not accept training flags at all. Each one's `main()` takes exactly one
-argument: a run directory.
+`python -m hexn.ppo`, `python -m hexn.league`, and `python -m hexn.exit`
+accept no training flags. Each one's `main()` takes one argument, a run
+directory.
 
 ```
 usage: python -m hexn.ppo <run-directory>
@@ -17,13 +17,12 @@ usage: python -m hexn.ppo <run-directory>
   the flags this used to accept are frozen into the run's config/ instead.
 ```
 
-The flags live in `python -m hexn.run.init` instead. It resolves them
-through the trainer's own `argparse.ArgumentParser` (`build_parser()` in
+The flags go to `python -m hexn.run.init`. It resolves them through the
+trainer's own `argparse.ArgumentParser` (`build_parser()` in
 `hexn.ppo.__main__`, `hexn.league`, `hexn.exit.__main__`) and writes every
-resulting value to disk before training starts, not only the values passed
-on the command line. Nothing downstream ever sees a default: a value a run
-trained under is a value that run's manifest names explicitly and
-permanently, whether or not it was ever mentioned on a command line.
+resulting value to disk before training starts, defaults included. Nothing
+downstream reads a default: every value a run trained under is named in its
+manifest.
 
 ## Creating a run
 
@@ -55,7 +54,7 @@ same durable game sink before its lane is dealt again, and a started game
 never switches engines.
 
 CPU BF16 workers also cache weight casts and lazily trace their original
-forward on its first actual input. The manifest's precision stays in force,
+forward on its first input. The manifest's precision stays in force,
 and regular weight synchronization refreshes the cache without changing
 checkpoint parameters. This runs inside collect worker processes, leaving
 the learner's execution settings alone. See [inference.md](inference.md) for
@@ -83,7 +82,7 @@ by that mode's own parser; everything before it configures `run.init` itself:
 | `--description` | free text |
 | `--force` | overwrite an existing run directory |
 | `--git-commit` / `--git-dirty` | record these instead of asking `git` (for a checkout where `git` cannot resolve the repository) |
-| `--allow-missing-sha` | permit a manifest with no commit recorded — for a throwaway smoke run only |
+| `--allow-missing-sha` | permit a manifest with no commit recorded, for a throwaway smoke run only |
 
 `run.init` refuses to write a manifest with no git commit unless
 `--allow-missing-sha` is passed: a result with no SHA cannot be tied to the
@@ -97,6 +96,12 @@ runs/my-run/
   config/ppo.json    # every parameter build_parser() defines, resolved
 ```
 
+and prints the launch command:
+
+```bash
+python -m hexn.ppo runs/my-run
+```
+
 ### Seeds
 
 `run.init` holds the run's seeds to the seed policy (`hexset.seeds`) before
@@ -108,12 +113,6 @@ as its registration, a file that names the seed. A refused seed stops the
 freeze unless `--bypass-seed-policy REASON` is given. How each seed passed
 is kept in `run.json` as `seeds`. With no policy nothing is checked or
 filled.
-
-and prints the launch command:
-
-```bash
-python -m hexn.ppo runs/my-run
-```
 
 ## Loading and validation (`hexn.run.load`)
 
@@ -133,12 +132,12 @@ mode's current parser defines:
   where it acted (`hexn.run.manifest.RETIRED`). The file is never rewritten.
 
 A refusal raises `SystemExit` with the parameter names, and points at
-re-freezing the run rather than patching the JSON by hand.
+re-freezing the run; do not patch the JSON by hand.
 
 `Manifest.namespace()` turns the loaded config straight into an
 `argparse.Namespace`, the same object shape the trainer's own
-`parser.parse_args()` would have produced, without a re-parse. There is no
-serialise/parse round trip to introduce a type mismatch.
+`parser.parse_args()` would have produced, without a re-parse, so no
+serialise/parse round trip can introduce a type mismatch.
 
 ## Resuming a run
 
@@ -165,8 +164,7 @@ restore the network, optimiser, RNG state, iteration count, and game
 counter, then re-assert the command line's learning rate and Adam epsilon
 onto the restored optimiser (loading an optimiser's `state_dict` otherwise
 keeps its old hyperparameters and only refreshes `params`). `--resume` with
-no `latest.pt` present is a refusal rather than a silent restart from
-scratch, and so is a fresh start into a `--checkpoint-dir` that already
+no `latest.pt` present is refused, and so is a fresh start into a `--checkpoint-dir` that already
 holds a `latest.pt`.
 
 A resume loses at most the games that were in flight. Every game is kept
@@ -180,8 +178,8 @@ partial directory, and every iteration's checkpoint stays as
 `iter-NNNNN.pt`, so each kept game's behaviour policy is kept too. The
 checkpoint carries `games_played`, every game through it across resumes,
 which the log reports as `games_total` beside the iteration's own `games`;
-a checkpoint written without it logs `None` there. `hexn.exit` also takes a replay shard written just before
-the crash as its iteration's collection. The log row and the checkpoint are
+a checkpoint written without it logs `None` there. `hexn.exit` also takes a
+replay shard written just before the crash as its iteration's collection. The log row and the checkpoint are
 written before an iteration's evaluation, which gets a row of its own, and a
 resumed run appends `{"resumed_from": N}` to `log.jsonl` before its first
 row: an iteration logged but not checkpointed is logged again, so a reader
@@ -193,14 +191,14 @@ from the rows before the iteration it resumes at.
 
 `run.json` carries a `"kind"` field:
 
-- **`"run"`** — a freeze written by `run.init`. Launchable.
-- **`"record"`** — a reconstruction of a run that predates this machinery,
+- **`"run"`**: a freeze written by `run.init`. Launchable.
+- **`"record"`**: a reconstruction of a run that predates this machinery,
   built from whatever a checkpoint's own `args`/`config` blobs recorded
   about themselves (`hexn.run.record`/`hexn.run.read_record`). It does not
   carry the full parameter set a mode's parser defines today, since old
-  runs were launched before some of today's flags existed; inventing values
-  for those from current defaults would misrepresent the run's actual
-  provenance. A record is read-only. `hexn.run.load` refuses to launch one
+  runs were launched before some of today's flags existed, and filling
+  those from current defaults would misstate the run's provenance. A record
+  is read-only. `hexn.run.load` refuses to launch one
   and says so, pointing at `hexn.run.init --parent <that checkpoint>` to
   continue the line as a new, frozen run instead.
 
@@ -208,18 +206,18 @@ from the rows before the iteration it resumes at.
 
 Every frozen run's `run.json` carries:
 
-- `git_commit`, `git_dirty`, `git_branch` — this repository's state at
-  freeze time (`hexn.run.manifest.provenance`), read **before** the run
-  directory is created. Reading it afterward would make an untracked new
-  directory appear as an uncommitted change, and `git_dirty` would read
-  `true` for every run regardless of the actual tree.
-- `engine` — the installed `hexset` package's own version, commit and dirty
-  flag (`hexn.run.manifest.engine_provenance`, reading
-  `hexset.experiment.provenance()`), `None` where `hexset` cannot be
-  imported. A run's own clean tree says nothing about which engine commit it
-  trained against; this is that fact recorded separately.
-- `argv` — exactly what followed `--` on the `run.init` command line.
-- `parent` — the checkpoint this run continues from, if any, so a run's
+- `git_commit`, `git_dirty`, `git_branch`: this repository's state at
+  freeze time (`hexn.run.manifest.provenance`), read before the run
+  directory is created, since the new untracked directory would otherwise
+  make `git_dirty` read `true` for every run.
+- `engine`: under `hexset`, the installed engine's own version, commit and
+  dirty flag (`hexn.run.manifest.engine_provenance`, reading
+  `hexset.experiment.provenance()`), or `null` where `hexset` cannot be
+  imported; under `runtimes`, the commit and dirty flag of the checkout
+  each `--runtime` module was found in. A run's own clean tree says nothing
+  about which engine or bots it trained against.
+- `argv`: what followed `--` on the `run.init` command line.
+- `parent`: the checkpoint this run continues from, if any, so a run's
   lineage does not have to be reconstructed later by matching iteration
   numbers between log files.
 
@@ -227,5 +225,5 @@ Every frozen run's `run.json` carries:
 
 `run.json["schema"]` is an integer (`hexn.run.manifest.SCHEMA`, currently
 `1`). `load` refuses a manifest whose schema does not match the running
-build's, rather than guessing how to interpret an older or newer shape.
+build's.
 </content>

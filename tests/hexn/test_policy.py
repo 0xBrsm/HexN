@@ -225,9 +225,10 @@ def test_a_named_trader_answers_the_seats_trades_instead_of_the_value_head():
 
     assert type(gate) is type(spawn(entrant_from_name("mybot"), board, random.Random(2)))
     assert gate.trade_offer_budget == 2
-    assert isinstance(gate.accepts(game.state(2), one_for_one(0, 1), 1), bool)
+    [gain] = gate.gains_many(game.state(2), [one_for_one(0, 1)], [1])
+    assert isinstance(gain, float)
     # Seeded by the seat: the same seat gets the same trader's draws.
-    assert policy.trader(game, 2, trader="mybot")._trade_seed == gate._trade_seed
+    assert policy.trader(game, 2, trader="mybot").rng.getstate() == gate.rng.getstate()
 
 
 def test_asking_for_a_gate_leaves_the_position_exactly_as_it_was():

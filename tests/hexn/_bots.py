@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: GPL-3.0-only
 """`needs(*names)`: skip a test unless a loaded runtime provides every bot it names.
 
-The bots come from the runtime `pytest --runtime <module>` loaded
-(`tests/conftest.py`); registration happens before collection, so the mark
-reads it as each test module is imported.
+The bots come from the runtime `pytest --runtime <module>` loaded, or the
+suite's own `mybot` (`tests/conftest.py`); registration happens before
+collection, so the mark reads it as each test module is imported.
 """
 
 from __future__ import annotations

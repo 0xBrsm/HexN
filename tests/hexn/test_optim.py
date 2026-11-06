@@ -2,9 +2,10 @@
 import copy
 
 import pytest
-import torch
 
-from hexn.optim import adam, adamw
+torch = pytest.importorskip("torch", reason="PyTorch runs on the training box only")
+
+from hexn.optim import adam, adamw  # noqa: E402
 
 
 @pytest.mark.parametrize("factory,kind", [(adam, torch.optim.Adam), (adamw, torch.optim.AdamW)])

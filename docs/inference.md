@@ -9,12 +9,13 @@ network forward. FP32, other precisions, training models and unsupported
 Torch interfaces keep the ordinary route. This does not change precision,
 decision heads, sampling, log probabilities or the sizes of policy calls.
 
-The owner traces the first actual input. That call finishes through the
-original forward, and later calls use the trace at their original sizes,
-including single-row tails. There is no synthetic warmup. Canonical model
-parameters and biases remain FP32, and cache buffers are absent from the
-state dictionary. Normal in-place `load_state_dict` refreshes copy weight
-casts into the same buffers so the trace continues to see current weights.
+`WorkerInference` traces the forward on its first input. That call finishes
+through the original forward, and later calls use the trace at their
+original sizes, including single-row tails. There is no synthetic warmup.
+Canonical model parameters and biases remain FP32, and cache buffers are
+absent from the state dictionary. Normal in-place `load_state_dict`
+refreshes copy weight casts into the same buffers so the trace continues to
+see current weights.
 
 Parameter or buffer replacement, storage or dtype/device changes, and
 module changes invalidate the owner permanently. Subsequent calls use the

@@ -18,19 +18,19 @@ loading 8.1 weights ([loading across contracts](#loading-across-contracts)).
 Module docstrings cite older numbers as shorthand for "before/after that
 shape changed":
 
-- **Contract 5** deleted the public trade layer outright
+- **Contract 5** deleted the public trade layer
   (`hexset.trading`): trades clear from each seat's own published
   valuation, which is observation, never a network action. The flat
   categorical policy stopped carrying a `PROPOSE_TRADE` slot with give/want
   heads riding alongside it.
 - **Contract 6** carries two further changes. The trading redesign deletes
-  the public layer's valuation columns from the encoding entirely, since
-  there is no seat vector left to publish. A knight-move fix collapses
+  the public layer's valuation columns from the encoding, since there is
+  no seat vector left to publish. A knight-move fix collapses
   `PLAY_KNIGHT`'s per-hex-and-victim block down to one slot: robber
   placement now runs through the same `MOVE_ROBBER` decision a rolled seven
-  already uses. Contract 6 also reinterprets the value head as a win head
-  (a win-probability softmax over seats) rather than a points margin, and
-  adds the auxiliary margin head as a warm-started copy of the old value
+  already uses. Contract 6 also reinterprets the value head, a points margin
+  before, as a win head (a win-probability softmax over seats), and adds the
+  auxiliary margin head as a warm-started copy of the old value
   head's weights.
 - **Contract 7** appended each seat's roads to take Longest Road and a
   one-hot of the seat to move to the globals.
@@ -54,17 +54,16 @@ shape changed":
 
 ## The contract-8 network (`hexn.model`)
 
-`HexNet` runs message passing directly over the encoded graph — hexes,
-vertices, edges, and a global token that reads and writes every type —
+`HexNet` runs message passing directly over the encoded graph (hexes,
+vertices, edges, and a global token that reads and writes every type),
 using a fixed adjacency (`hexset.encoding.StaticGraph`). A batch is dense
 `(B, nodes, features)` against one shared index set, not a block-diagonal
 union of graphs. Board layout is fixed at construction: a different layout
 needs a different model.
 
-Every policy head emits exactly the widths `hexn.readout` declares,
-scattered into the flat action space by its plan. Legality is therefore a
-per-node property carried through from the encoder, rather than a mask
-bolted onto a flattened board afterward.
+Every policy head emits the widths `hexn.readout` declares, scattered into
+the flat action space by its plan, so legality is a per-node property
+carried through from the encoder.
 
 `ModelConfig` fields:
 
@@ -78,23 +77,23 @@ bolted onto a flattened board afterward.
 | `fast_win` | build the fast-win head (`Prediction.fast`); off |
 | `contract` | `"8"`, or `"8.1"` for a net trained across rule sets; a checkpoint carries its own in its weights |
 
-The defaults (`"linear"`/`"linear"`) are load-bearing: every checkpoint
-written before these fields existed has to rebuild the same modules under
-the same `state_dict` keys, which `test_model` pins.
+The defaults (`"linear"`/`"linear"`) rebuild every checkpoint written
+before these fields existed with the same modules under the same
+`state_dict` keys, which `test_model` pins.
 
 `Prediction` (the network's output):
 
 | Field | Meaning |
 | --- | --- |
 | `logits` | flat action-space logits; mask with `legal_mask` before sampling |
-| `value` | `softmax(value_logits)` over the seat axis — each seat's own win probability, summing to one across `players` |
+| `value` | `softmax(value_logits)` over the seat axis: each seat's own win probability, summing to one across `players` |
 | `value_logits` | the same head's pre-softmax output, one number per seat, used for the cross-entropy loss |
-| `margin` | the auxiliary VP-margin head — a second linear read of the same trunk, trained only when `--aux-margin-weight > 0`; never read by a gate, an advantage, or a search |
+| `margin` | the auxiliary VP-margin head: a second linear read of the same trunk, trained only when `--aux-margin-weight > 0`; never read by a gate, an advantage, or a search |
 | `fast` | the fast-win head, `None` unless built: a softmax over `players + 1` slots, the seats and then "not won in time", so `fast[..., :players]` is each seat's expected time-weighted win |
 | `quantiles` | `(B, players, Q)` per-seat quantile tensor, present only under the `"quantile"` value head; its mean over the last axis is `value_logits` |
 
-There is no trade head: a seat's private gate is read straight off the value
-head (`hexset.clients.netbot.NetworkBot`), never a head of its own.
+There is no trade head. A seat's private gate is read off the value head
+(`hexset.clients.netbot.NetworkBot`).
 
 ## The contract-9 network (`hexn.model9`)
 
@@ -207,19 +206,17 @@ same function as the source, to float precision; `widen_state` checks this
 on real observations before anything is written. It widens a contract-8
 `HexNet`, on the contract its weights carry.
 
-This is a different, unrelated transform from `hexn.migrate_c8`: migration
-carries a checkpoint across a change to the *observation's* shape, while
-widening grows the *model's* own hidden width with the observation
-unchanged, so a wider net can warm-start from a narrower checkpoint's exact
-function.
+`hexn.migrate_c8` carries a checkpoint across a change to the
+*observation's* shape; widening grows the *model's* own hidden width with
+the observation unchanged, so a wider net can warm-start from a narrower
+checkpoint's exact function.
 
 `--noise σ` adds Gaussian noise (σ × each copied row's RMS) to the copies'
 incoming weights only, so the copies are not perfectly identical units that
 would receive identical gradients forever. A wide net built at `--noise 0`
 computes the same function as the narrow net, at a larger compute cost. The
 tool reports the resulting max output deviation and mean policy KL against
-the source, so the noise's effect on the function is visible rather than
-assumed. The widened checkpoint carries the parent's `iteration`,
+the source, so the noise's effect on the function is measured. The widened checkpoint carries the parent's `iteration`,
 `games_started`, and `torch_rng` (so `--resume` continues the same game
 count and RNG stream a same-width continuation would), a fresh Adam state
 (the parent's moments have the old shapes), and a `widen` block naming the
@@ -229,27 +226,27 @@ source path, its sha256, both widths, the noise, and the seed.
 
 `hexn.netbot.load(path, topology, device, compile_mode)` rebuilds the net
 from the checkpoint. A contract-8 checkpoint is rebuilt from its recorded
-`args` — width, rounds, and head shapes all default to what a checkpoint
-predating those fields was trained with — and wrapped in a greedy
+`args` (width, rounds, and head shapes all default to what a checkpoint
+predating those fields was trained with) and wrapped in a greedy
 `NetworkPolicy` (`greedy=True`, taking the argmax). A contract-9 checkpoint
 is rebuilt from its `model_config` and played by `hexn.policy9.Policy9`,
 which chooses each compound decision whole at its first move and plays the
 rest from its plan (`hexset.decisions.Plans`), lists a decision's whole
 options (`option_rows`), and makes no offers of its own; its gate still
-answers the table's. Sampling is the behaviour *distribution* PPO needs
-during training; it is not the policy worth scoring.
-The result is cached per `(path, topology)` (`lru_cache(maxsize=4)`), not by
-file mtime: a `.pt` under `runs/` is an immutable per-run artifact, unlike a
-served `models/*.onnx`, which is replaced by name.
+answers the table's. Sampling is the behaviour distribution PPO trains on;
+a scored policy plays the argmax. The result is cached per
+`(path, topology)` (`lru_cache(maxsize=4)`), not by file mtime: a `.pt`
+under `runs/` is an immutable per-run artifact, unlike a served
+`models/*.onnx`, which is replaced by name.
 
-`register_entrants(load)` runs at import time. This is the entire mechanism
-by which a checkpoint becomes playable through `hexset.bench.duel --runtime
+`register_entrants(load)` runs at import time, and is how a checkpoint
+becomes playable through `hexset.bench.duel --runtime
 hexn.netbot network:<path> ...` (or `mcts:<path>`, `rollout:<path>`) or any
 other `hexset.arena.spawn` caller; `hexset.arena` itself never imports torch
 or this module.
 
-How a loaded checkpoint is played — the bot, leaf evaluation, search, and
-trade gate — is runtime-agnostic and lives in `hexset.clients.netbot`, over
+How a loaded checkpoint is played (the bot, leaf evaluation, search, and
+trade gate) is runtime-agnostic and lives in `hexset.clients.netbot`, over
 the `hexset.clients.policy.Policy` protocol. `hexn.netbot` only supplies
 the torch-specific half: finding the file and rebuilding the net.
 
@@ -263,13 +260,13 @@ python -m hexn.export_onnx --checkpoint runs/example/latest.pt --out served.onnx
     --runtime <module> --trader <bot> --trader-veto --max-offers 1 --trade-floor 0.03
 ```
 
-Needs `torch` (not a declared dependency — see below) plus `onnx` and
+Needs `torch` (not a declared dependency; see below) plus `onnx` and
 `onnxruntime`, which are also not declared in this package's
 `pyproject.toml`. Install them separately (`pip install onnx onnxruntime`)
 before running this module.
 
-Traces the exact reconstruction path `hexn.netbot.load()` already trusts
-(same shapes, same `state_dict` keys) once with `torch.onnx.export`, and
+Traces the reconstruction path `hexn.netbot.load()` uses (same shapes,
+same `state_dict` keys) once with `torch.onnx.export`, and
 embeds the facts HexSet's `hexset.clients.onnxbot.load()` reads as ONNX
 metadata. `python -m hexn.export_onnx` dispatches on the checkpoint's own
 contract: a contract-8 or 8.1 checkpoint exports a record graph, a
@@ -288,7 +285,7 @@ contract-9 one a decision graph (`hexn.export_onnx9`).
 - **Outputs**, in order: `action_index` (`(B,)` int64, the argmax over the
   masked distribution), `prior` (`(B, space.size)` float32, normalised over
   legal entries, zero elsewhere), and `value` (`(B, players)` float32,
-  board-seat order, already un-rotated — each seat's own win probability).
+  board-seat order, already un-rotated: each seat's own win probability).
 - `contract` is `"8"`, or `"8.1"` (`hexset.onnx_record.CONTRACT_VERSION`)
   for an 8.1 net only.
 
@@ -350,10 +347,10 @@ The serving flags, written as HexSet's metadata keys of the same names
 | `--gate-own-frame 0\|1` | `gate_own_frame` |
 | `--robber-tip F` | `robber_tip`, in [0, 1] |
 
-A numerical parity check runs automatically after every export. It raises
-(a nonzero exit) rather than warns, since an export bug that silently
-degrades quality is far more expensive to catch later, on a served board,
-than here, against real seeded positions. A contract-9 file is held to
+A numerical parity check runs after every export, on real seeded
+positions, and a mismatch raises (a nonzero exit): an export bug that
+degrades quality costs less to catch here than on a served board. A
+contract-9 file is held to
 `Policy9` on positions of every kind of decision: the same `decision`,
 `value` and `prior` within tolerance, the same moves played through
 `hexset.clients.onnxbot`, and the same whole options. The stochastic
@@ -370,5 +367,4 @@ hardware), so that everything that does not need it stays installable and
 testable without it: `hexn.readout`, `hexn.selfplay`, `hexn.rewards`,
 `hexn.schedule`, `hexn.run`, `hexn.durable`, and the torch-free half of
 the test suite. Every module that trains, evaluates, exports, or migrates a
-network imports torch lazily, or declares it as a hard runtime requirement
-of that one module rather than the package as a whole.
+network imports torch lazily, or requires it in that module alone.

@@ -1006,9 +1006,7 @@ class Collector:
         or marks, no trades, and per-game sample streams."""
         from hexset.gym.native import available
 
-        from .policy9 import NetworkPolicy9
-
-        return bool(
+        if not (
             available()
             and self.contract in contract9.CONTRACTS
             and self.players in (2, 4)
@@ -1021,9 +1019,13 @@ class Collector:
             and self.sample_stream == "game"
             and self.max_offers == 0
             and self.trader is None
-            and all(type(policy) is NetworkPolicy9 and policy.net.config.double_turn == "parts"
-                    for policy in self._batched.values())
-        )
+        ):
+            return False
+        # Imported only here: `hexn.policy9` needs torch, and this module does not.
+        from .policy9 import NetworkPolicy9
+
+        return all(type(policy) is NetworkPolicy9 and policy.net.config.double_turn == "parts"
+                   for policy in self._batched.values())
 
     def _drive(self, env: LaneEnv, *, keeping: "Partial | None" = None) -> Driver:
         """HexSet's driver over `env`: native lanes where `_native_ready`, each
