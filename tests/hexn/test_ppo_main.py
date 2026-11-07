@@ -1058,6 +1058,36 @@ def test_a_board_mode_run_trains_on_its_boards_and_is_refused_beside_a_rules_mix
         run(tmp_path / "mixed", 1, C9 + ["--contract", "9.1", "--rules-mix", law, "--board-mode", "spiral"])
 
 
+@pytest.mark.parametrize("parallel", [False, True])
+def test_a_two_seat_rules_mix_run_trains_against_a_frozen_net_seated_as_an_arena_entrant(tmp_path, parallel):
+    """`--mix` beside `--rules-mix`: a frozen 9d net seated as
+    `network:<path>@0` takes the other seat of every game (share 1.0), the
+    learner keeping its own; the run collects, updates and saves. Entries a
+    rules mix cannot seat are refused before anything runs: one that deals its
+    own game, and a batched network (`parent`, a bare `network:<path>`)."""
+    from hexn.collect import mix_caster, parse_mix
+
+    torch.set_num_threads(1)
+    flags = ["--contract", "9d", "--players", "2", "--messages", "pooled", "--no-attention", "--others",
+             "--rules-mix", DUEL_LAW, "--action-cap", "48", "--games-per-iteration", "2", "--lanes", "2",
+             "--collect-trunk", "fused"]
+    if parallel:
+        flags += ["--collect-workers", "2", "--async-collect", "--decoupled"]
+    frozen_net = tmp_path / "frozen"
+    assert run(frozen_net, 1, flags) == 0
+    mix = f"network:{frozen_net / 'latest.pt'}@0=1.0"
+    assert all(1 in mix_caster(parse_mix(mix), 2, 0)(index) for index in range(8))
+    learner = tmp_path / "learner"
+    assert run(learner, 2, flags + ["--mix", mix]) == 0
+    lines = [json.loads(line) for line in (learner / "log.jsonl").read_text().splitlines()]
+    trained = [line for line in lines if "positions" in line]
+    assert [line["iteration"] for line in trained] == [0, 1] and all(line["positions"] > 0 for line in trained)
+    assert torch.load(learner / "latest.pt", weights_only=False)["args"]["mix"] == mix
+    for refused in (f"network:{frozen_net / 'latest.pt'}=0.1", "duel(rehex)=0.1"):
+        with pytest.raises(SystemExit):
+            run(tmp_path / "refused", 1, flags + ["--mix", refused])
+
+
 def test_a_contract_9_init_from_a_joint_checkpoint_drops_the_joint_head(tmp_path, capsys):
     """A contract-9 BC checkpoint ("joint") carries the double turn's first,
     second and pair heads; the net PPO trains ("parts") has none. `--init`

@@ -127,6 +127,7 @@ ADDED: dict[str, dict[str, Any]] = {
         "zero_sum": 0.6,
         "c9_clip": "per-decision",
         "eval_seed": None,
+        "lr_warmup": 0,
     },
     "exit": {
         "collect_trunk": "reference",

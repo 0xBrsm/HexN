@@ -459,6 +459,11 @@ class Stats:
     approx_kl_first_minibatch: float = 0.0
     approx_kl_last_epoch: float = 0.0
     clip_fraction_last_epoch: float = 0.0
+    # Under decoupled PPO every `approx_kl` gauge above is weighted by the
+    # decoupled weight (`kl_gauge`); this is `approx_kl` unweighted, the
+    # gauge as it read before, so a curve stays comparable across the change.
+    # Without decoupling the two are the same number.
+    approx_kl_unweighted: float = 0.0
     # The pre-clip global norm, median over the update's steps.
     # `clip_grad_norm_` has always returned it and all three call sites threw
     # it away, which is why "is max_grad_norm binding?" was unanswerable
@@ -1055,6 +1060,11 @@ class Terms:
     entropy: Tensor
     approx_kl: Tensor
     clip_fraction: Tensor
+    # `approx_kl` with every row counted alike (`kl_gauge`), and the mean
+    # decoupled weight `approx_kl` was weighted by: `None` without decoupling,
+    # where `approx_kl` is the plain mean. `_accumulate` combines slices by it.
+    approx_kl_unweighted: Tensor | None = None
+    kl_weight: Tensor | None = None
     # `config.prior_kl * prior_kl`, attached, and the divergence itself,
     # detached. Both `None` when the minibatch came with no prior, so a caller
     # that never attaches one sees exactly the four summands it always has.
@@ -1066,6 +1076,52 @@ class Terms:
     # averaged: decisions, decisions whose summed ratio left the clip range,
     # parts, parts whose own ratio did (`Stats.clip_by_parts`).
     clip_by_parts: Tensor | None = None
+
+
+def kl_gauge(log_ratio: Tensor, anchor: Tensor, old: Tensor | None) -> tuple[Tensor, Tensor, Tensor | None]:
+    """`(approx_kl, approx_kl_unweighted, kl_weight)` over rows whose
+    learner-to-anchor log-ratio is `log_ratio`, the estimator
+    `expm1(r) - r` per row.
+
+    Without decoupling (`old` is `None`, the anchor is the behaviour policy)
+    the gauge is the rows' plain mean, and `kl_weight` is `None`. Under
+    decoupled PPO the anchor is the proximal policy, and each row is weighted
+    as the surrogate weights it, by `min(pi_prox / pi_behaviour,
+    DECOUPLED_CAP)`: the gauge then estimates how far the proximal policy
+    moved, where the plain mean also counted rows the behaviour policy sampled
+    and the proximal one all but never would, whose log-ratio an update can
+    move by tens of nats while the surrogate gives them no weight.
+    `kl_weight` is the rows' mean weight."""
+    # `expm1`, not `ratio - 1`. The estimator is non-negative in exact
+    # arithmetic, but in float32 `exp(x)` rounds to 1.0 for any |x| below
+    # the ~1.2e-7 epsilon, so the difference collapses to `-log_ratio` and
+    # the gauge reports a negative KL for a genuinely on-policy batch,
+    # whose log-ratios sit near machine epsilon from reduction order
+    # alone. `expm1` is accurate for small arguments, so the floor reads
+    # 0 instead of a small impossible negative number, and the
+    # correction only matters in that regime -- it leaves any log-ratio
+    # above roughly 1e-3 unchanged.
+    per_row = torch.expm1(log_ratio) - log_ratio
+    plain = per_row.mean()
+    if old is None:
+        return plain, plain, None
+    log_weight = (anchor - old).clamp(max=math.log(DECOUPLED_CAP))
+    weight = log_weight.exp()
+    # A row's term is w * (expm1(r) - r). Its log-ratio r can pass float32's
+    # `expm1` overflow (about 88 nats) only where the proximal policy gave the
+    # sampled move almost nothing, which is also where its weight w is tiny
+    # or underflows: a bf16 collector at a knife edge samples a move the fp32
+    # proximal policy puts below e**-88. There the product `w * inf` read inf
+    # (or NaN at w = 0), so the gauge broke on rows the surrogate gives no
+    # weight. Those rows take the same term in log space,
+    # exp(log w + r) - w - w * r, whose exponent is the learner's log-ratio
+    # to the behaviour policy and stays finite. Every other row keeps
+    # `w * (expm1(r) - r)`, accurate near zero. A slice whose every weight is
+    # zero and whose rows did not overflow reads 0 rather than 0 / 0.
+    direct = weight * per_row
+    in_logs = torch.exp(log_weight + log_ratio) - weight - weight * log_ratio
+    weighted = torch.where(torch.isfinite(per_row), direct, in_logs)
+    return weighted.sum() / weight.sum().clamp_min(torch.finfo(weight.dtype).tiny), plain, weight.mean()
 
 
 def decision_surrogate(
@@ -1158,7 +1214,8 @@ def decision_terms(
     loss = policy_loss + value_term + margin_term - config.entropy_coefficient * entropy
     with torch.no_grad():
         log_ratio = by_decision(evaluation.log_prob) - by_decision(anchor)
-        kl = (torch.expm1(log_ratio) - log_ratio).mean()
+        kl, kl_plain, kl_weight = kl_gauge(log_ratio, by_decision(anchor),
+                                           None if prox_log_prob is None else by_decision(old_log_prob))
         decision_out = (log_ratio.exp() - 1).abs().gt(config.clip)
         part_out = ((evaluation.log_prob - anchor).exp() - 1).abs().gt(config.clip)
         clipped = (decision_out if config.c9_clip == "per-decision" else part_out).float().mean()
@@ -1182,6 +1239,8 @@ def decision_terms(
         entropy=entropy.detach(),
         approx_kl=kl,
         clip_fraction=clipped,
+        approx_kl_unweighted=kl_plain,
+        kl_weight=kl_weight,
         clip_by_parts=tally,
     )
 
@@ -1338,16 +1397,7 @@ def minibatch_terms(
         # mean is non-negative and so cannot hide a diverging update behind
         # cancellation.
         log_ratio = evaluation.log_prob - anchor
-        # `expm1`, not `ratio - 1`. The estimator is non-negative in exact
-        # arithmetic, but in float32 `exp(x)` rounds to 1.0 for any |x| below
-        # the ~1.2e-7 epsilon, so the difference collapses to `-log_ratio` and
-        # the gauge reports a negative KL for a genuinely on-policy batch,
-        # whose log-ratios sit near machine epsilon from reduction order
-        # alone. `expm1` is accurate for small arguments, so the floor reads
-        # 0 instead of a small impossible negative number, and the
-        # correction only matters in that regime -- it leaves any log-ratio
-        # above roughly 1e-3 unchanged.
-        kl = (torch.expm1(log_ratio) - log_ratio).mean()
+        kl, kl_plain, kl_weight = kl_gauge(log_ratio, anchor, None if prox_log_prob is None else old_log_prob)
         clipped = (ratio - 1).abs().gt(config.clip).float().mean()
     return Terms(
         loss=loss,
@@ -1367,6 +1417,8 @@ def minibatch_terms(
         entropy=entropy.detach(),
         approx_kl=kl,
         clip_fraction=clipped,
+        approx_kl_unweighted=kl_plain,
+        kl_weight=kl_weight,
         prior_term=prior_term,
         prior_kl=prior_kl,
         fast_loss=None if fast_loss is None else fast_loss.detach(),
@@ -1499,6 +1551,7 @@ def _accumulate(
     total = len(rows)
     sums: dict[str, Tensor | None] = {}
     values: list[Tensor] = []
+    weighted = weights = None
     for start in range(0, total, config.micro_batch):
         piece = slice(start, start + config.micro_batch)
         terms = _terms_for(policy, batch, rows[piece], advantage[piece], config)
@@ -1511,9 +1564,16 @@ def _accumulate(
             else:
                 got = share * got.detach()
                 sums[field] = got if start == 0 else sums[field] + got
+        if terms.kl_weight is not None:
+            # A weighted gauge's slices combine by their weight, not their rows.
+            mass = share * terms.kl_weight
+            weighted = mass * terms.approx_kl if start == 0 else weighted + mass * terms.approx_kl
+            weights = mass if start == 0 else weights + mass
         values.append(terms.value)
         if terms.clip_by_parts is not None:
             tally = terms.clip_by_parts if start == 0 else tally + terms.clip_by_parts
+    if weights is not None:
+        sums["approx_kl"], sums["kl_weight"] = weighted / weights, weights
     return Terms(value=torch.cat(values), **sums,
                  clip_by_parts=tally if batch.dec_off is not None else None)
 
@@ -1522,7 +1582,7 @@ def _accumulate(
 _ACCUMULATED = (
     "loss", "policy_term", "value_term", "entropy_term", "margin_term",
     "policy_loss", "value_loss", "value_mse", "margin_loss", "entropy",
-    "approx_kl", "clip_fraction", "prior_term", "prior_kl", "fast_loss",
+    "approx_kl", "clip_fraction", "prior_term", "prior_kl", "fast_loss", "approx_kl_unweighted",
 )
 
 
@@ -1574,7 +1634,7 @@ def update(
         for name in (
             "policy_losses", "value_losses", "entropies", "kls", "clipped",
             "value_mses", "margin_losses", "prior_kls", "fast_losses",
-            "grad_norms", "epoch_kls", "epoch_clips", "clip_tallies",
+            "grad_norms", "epoch_kls", "epoch_clips", "clip_tallies", "kls_unweighted",
         )
     }
     g["variance"] = None
@@ -1637,6 +1697,7 @@ def update(
                 g["fast_losses"].append(terms.fast_loss)
             g["entropies"].append(terms.entropy)
             g["kls"].append(terms.approx_kl)
+            g.setdefault("kls_unweighted", []).append(terms.approx_kl_unweighted)
             g["clipped"].append(terms.clip_fraction)
             g["epoch_kls"][epoch].append(terms.approx_kl)
             g["epoch_clips"][epoch].append(terms.clip_fraction)
@@ -1653,7 +1714,9 @@ def update(
         # decision to keep taking epochs has to be made in Python, and
         # `config.kl_break > 0` short-circuits it away entirely at the
         # every-run-on-record default of 0.
-        if config.kl_break > 0 and _stack_mean(g["epoch_kls"][epoch]) > config.kl_break:
+        # `not <=`, so a gauge that is not a number (an overflowed estimator)
+        # breaks rather than slipping past the comparison.
+        if config.kl_break > 0 and not _stack_mean(g["epoch_kls"][epoch]) <= config.kl_break:
             break
     cursor.finish()
     predicted_for_variance = g["variance"]
@@ -1683,6 +1746,7 @@ def update(
         ),
         approx_kl_last_epoch=_stack_mean(epoch_kls[-1]),
         clip_fraction_last_epoch=_stack_mean(epoch_clips[-1]),
+        approx_kl_unweighted=_stack_mean(g.get("kls_unweighted") or []),
         grad_norm=_stack_median(g["grad_norms"]),
         value_target_variance=float(batch.value_target[:, 0].var()),
         lr=float(optimiser.param_groups[0]["lr"]),

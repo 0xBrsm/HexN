@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import pytest
 
-from hexn.schedule import AdaptiveLR, current_lr, linear_anneal, set_lr
+from hexn.schedule import AdaptiveLR, current_lr, linear_anneal, set_lr, warmup
 
 
 class FakeOptimiser:
@@ -72,3 +72,30 @@ def test_linear_anneal_endpoints_and_floor():
     assert linear_anneal(6e-4, 250, 100, floor=0.1) == pytest.approx(6e-5)
     # A degenerate total is the constant schedule, not a division by zero.
     assert linear_anneal(6e-4, 3, 0) == pytest.approx(6e-4)
+
+
+def test_warmup_ramps_in_and_then_holds():
+    rates = [warmup(6e-4, i, 4) for i in range(6)]
+    assert rates == pytest.approx([1.5e-4, 3e-4, 4.5e-4, 6e-4, 6e-4, 6e-4])
+
+
+def test_no_warmup_is_the_rate():
+    assert [warmup(6e-4, i, 0) for i in range(3)] == [6e-4] * 3
+    assert warmup(6e-4, 0, 1) == 6e-4
+
+
+def test_the_schedule_warms_the_constant_and_the_linear_rate():
+    from argparse import Namespace
+
+    from hexn.ppo.__main__ import scheduled_lr
+
+    def args(schedule, length):
+        return Namespace(learning_rate=6e-4, lr_schedule=schedule, iterations=10, lr_floor=0.5, lr_warmup=length)
+
+    assert [scheduled_lr(args("constant", 0), i) for i in (0, 9)] == [6e-4, 6e-4]
+    assert [scheduled_lr(args("constant", 2), i) for i in (0, 1, 2)] == pytest.approx([3e-4, 6e-4, 6e-4])
+    # Without a warm-up, linear is the anneal the loop always set; with one, the anneal ramped in.
+    assert [scheduled_lr(args("linear", 0), i) for i in range(10)] == pytest.approx(
+        [linear_anneal(6e-4, i, 10, 0.5) for i in range(10)])
+    assert scheduled_lr(args("linear", 2), 0) == pytest.approx(linear_anneal(6e-4, 0, 10, 0.5) / 2)
+    assert scheduled_lr(args("linear", 2), 5) == pytest.approx(linear_anneal(6e-4, 5, 10, 0.5))

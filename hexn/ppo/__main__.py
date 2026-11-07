@@ -63,6 +63,7 @@ from ..collect import (
     mix_temperatures,
     parse_mix,
     release_memory,
+    rules_mix_refusals,
     rung_opponent,
 )
 from ..loop import (
@@ -98,7 +99,7 @@ from . import (
 )
 from ..model import graft_fast_win
 from ..optim import adam
-from ..schedule import AdaptiveLR, current_lr, linear_anneal, set_lr
+from ..schedule import AdaptiveLR, current_lr, linear_anneal, set_lr, warmup
 from ..selfplay import SAMPLE_STREAMS, BatchPolicy, Collector, Episode
 from ..steps import Steps, by_index, fingerprint, remove as remove_steps
 from ..trade import check_trader
@@ -176,8 +177,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--rules-mix", default="",
                         help="JSON specification for hexset.gym.distribution.Distribution; "
-                        "contract 9.1, 9d, 9d.1 or 11d self-play only (9d, 9d.1 and 11d deal every game to two "
-                        "seats), frozen in the run manifest")
+                        "contract 9.1, 9d, 9d.1 or 11d (9d, 9d.1 and 11d deal every game to two seats), frozen in "
+                        "the run manifest; beside it --mix seats arena entrants only (network:<path>@0 for a net)")
     parser.add_argument("--board-mode", choices=sorted(BOARD_MODES), default="random",
                         help="how every self-play game's board is dealt (hexset.board.board.BOARD_MODES); "
                         "a --rules-mix names its own")
@@ -212,6 +213,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr-min", type=float, default=1e-5)
     parser.add_argument("--lr-max", type=float, default=1e-2)
     parser.add_argument("--lr-floor", type=float, default=0.0)
+    parser.add_argument(
+        "--lr-warmup",
+        type=int,
+        default=0,
+        help="iterations over which the constant or linear rate ramps in "
+        "linearly from 1/N of itself (hexn.schedule.warmup); 0 is none. For "
+        "a run that starts a fresh optimiser at a rate its checkpoint was "
+        "not trained at",
+    )
     parser.add_argument("--clip", type=float, default=0.2)
     parser.add_argument("--lam", type=float, default=0.95)
     # The win head's target: `hexn.rewards.win_loss`, the eventual winner's
@@ -542,6 +552,14 @@ def bind_optimiser(net: torch.nn.Module, optimiser: torch.optim.Optimizer, args)
     return adam(live, lr=args.learning_rate, eps=args.adam_eps)
 
 
+def scheduled_lr(args: argparse.Namespace, iteration: int) -> float:
+    """The constant or linear schedule's rate for `iteration`, warm-up included."""
+    rate = args.learning_rate
+    if args.lr_schedule == "linear":
+        rate = linear_anneal(rate, iteration, args.iterations, args.lr_floor)
+    return warmup(rate, iteration, args.lr_warmup)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the directory named on the command line, and take nothing else.
 
@@ -575,8 +593,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     rules_mix = getattr(args, "rules_mix", "")
     if rules_mix:
-        if args.contract not in ("9.1", "9d", "9d.1", "11d") or args.mix:
-            parser.error("--rules-mix requires --contract 9.1, 9d, 9d.1 or 11d and an empty --mix (self-play)")
+        if args.contract not in ("9.1", "9d", "9d.1", "11d"):
+            parser.error("--rules-mix requires --contract 9.1, 9d, 9d.1 or 11d")
+        try:
+            refused = rules_mix_refusals(parse_mix(args.mix))
+        except ValueError as exc:
+            parser.error(f"invalid --mix: {exc}")
+        if refused:
+            parser.error("--mix beside --rules-mix: " + "; ".join(refused))
         from hexset.gym.distribution import Distribution
         try:
             Distribution(rules_mix, args.players, args.seed)
@@ -643,6 +667,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         ) if on]
         if unbuilt:
             parser.error(f"not built for --contract 9: {', '.join(unbuilt)}")
+    if args.lr_warmup < 0:
+        parser.error("--lr-warmup is a number of iterations, 0 or more")
+    if args.lr_warmup and args.lr_schedule == "adaptive":
+        parser.error("--lr-warmup ramps a constant or linear rate; the adaptive "
+                     "controller sets its own, so run one governor at a time")
     if args.kl_break > 0 and args.lr_schedule == "adaptive":
         parser.error("--kl-break truncates the epochs the adaptive controller "
                      "reads its gauge from; run one governor at a time")
@@ -991,6 +1020,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             ]
         )
 
+    if args.lr_schedule != "adaptive":
+        # The rate the schedule gives the first iteration this process runs:
+        # under a warm-up a fraction of the rate, and on a resume the rate the
+        # uninterrupted run would have stepped at there, not the full one.
+        set_lr(optimiser, scheduled_lr(args, start_iteration))
     controller = AdaptiveLR(
         target_kl=args.target_kl,
         band=args.lr_band,
@@ -1263,13 +1297,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 # converged controller, which also holds the rate still.
                 record["lr_deaf"] = True
             set_lr(optimiser, moved)
-        elif args.lr_schedule == "linear":
-            set_lr(
-                optimiser,
-                linear_anneal(
-                    args.learning_rate, iteration + 1, args.iterations, args.lr_floor
-                ),
-            )
+        else:
+            set_lr(optimiser, scheduled_lr(args, iteration + 1))
 
         # The iteration's row and checkpoint first, the evaluation after: an
         # evaluation that crashes must not take the iteration with it.

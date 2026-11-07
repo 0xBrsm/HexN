@@ -2,6 +2,67 @@
 
 All notable changes to the `hexn` package are recorded here.
 
+## 0.51.0
+
+### Added
+
+- **`--mix` beside `--rules-mix`.** A rules-mix run (contract 9.1, 9d,
+  9d.1 or 11d) may seat arena entrants in a share of its games, as any other run
+  does: a frozen net is `network:<path>@0`, played a whole decision at a time
+  and never trained on. Entries a rules mix cannot seat are refused at
+  launch with the reason: one that deals its own game (`duel(...)`,
+  `table(...)`, `coalition(...)`) and a batched network (`parent`, a bare
+  `network:<path>`) (`hexn.collect.rules_mix_refusals`). A mixed run's
+  games play on Python lanes, as every run with an opponent does.
+
+- **A collector worker seats a `network:` arena entrant.** `named_opponent`
+  imports `hexn.netbot`, which registers the network entrant kinds, so a
+  worker process resolves `network:<path>@0` as the trainer's own process
+  does.
+
+- **`--lr-warmup N` for `hexn.ppo`.** It ramps a `constant` or `linear`
+  learning rate in over the first `N` iterations (`hexn.schedule.warmup`):
+  iteration `i` steps at `(i + 1) / N` of the scheduled rate. The default
+  is 0, and a manifest frozen before the flag loads with 0, which is no
+  warm-up. `adaptive` refuses it.
+
+### Changed
+
+- **The KL gauge under decoupled PPO is weighted as the surrogate is.**
+  `approx_kl` (and `approx_kl_first_minibatch`, `approx_kl_last_epoch`),
+  which `--kl-break` and the adaptive schedule read, is the mean of
+  `expm1(r) - r` over the rows weighted by `min(pi_prox / pi_behaviour, 2)`
+  (`hexn.ppo.kl_gauge`), where it was the plain mean. A row the behaviour
+  policy sampled and the proximal policy all but never would no longer
+  dominates it, so it no longer stops an update that leaves the proximal
+  policy where it was. The plain mean is logged beside it as
+  `approx_kl_unweighted`. Without decoupling nothing changes.
+
+- **A tempered `network:` mix opponent samples through its arena seat.** A
+  `--mix` entry naming a temperature (`network:<path>@0:temperature=<T>`,
+  HexSet's sampling network seat) is never the batched `frozen` policy, which
+  plays the top move (`hexn.collect._bare_network`).
+
+### Fixed
+
+- **A knife-edge row no longer breaks the weighted KL gauge.** A row whose
+  log-ratio passes float32's `expm1` overflow (a bf16 collector's sampled
+  move that the fp32 proximal policy all but never plays) now takes its term
+  in log space, `exp(log w + r) - w - w * r`, which stays finite and adds
+  about `1/n`, where its tiny weight times an overflowed estimator read inf
+  and broke every update. Rows whose estimator is finite read exactly as
+  before; a row with real weight moved past the overflow still reads inf.
+
+- **The weighted KL gauge stays a number.** A row whose decoupled weight
+  underflows to zero now adds nothing to `approx_kl`, where its overflowed
+  estimator (a log-ratio past float32's `expm1` limit) made the whole gauge
+  NaN. `--kl-break` reads a gauge that is not a number as a breach, so it can
+  no longer be skipped. Finite gauges are unchanged.
+
+- **A resumed `linear` run resumes at its scheduled rate.** The first
+  iteration after a resume stepped at the full `--learning-rate`; it now
+  steps at the annealed rate the uninterrupted run used there.
+
 ## 0.50.0
 
 ### Added

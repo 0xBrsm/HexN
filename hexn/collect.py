@@ -162,6 +162,11 @@ def named_opponent(name: str, seed: int, lanes: int) -> BoardBots:
     """
     from hexset.arena import entrant_from_name, spawn
 
+    # The network entrant kinds resolve once `hexn.netbot` is imported (it
+    # registers them, `hexset.clients.netbot.register_entrants`). The trainer's
+    # process has; a collector worker, which imports only this module, may not.
+    from . import netbot  # noqa: F401
+
     try:
         entrant = entrant_from_name(name)
     except KeyError:
@@ -235,14 +240,16 @@ def sampled_spec(name: str) -> str | None:
 
 def _bare_network(name: str):
     """The entrant a bare `network:<path>` names -- one `frozen` can play --
-    or None for any other name."""
+    or None for any other name (a tempered one, `:temperature=`, samples
+    through its arena seat, which `frozen` would not)."""
     from hexset.arena import entrant_from_name
 
     try:
         entrant = entrant_from_name(name)
     except (KeyError, ValueError):
         return None
-    if entrant.kind == "network" and entrant.trade is None and isinstance(entrant.weights, str):
+    if (entrant.kind == "network" and entrant.trade is None and isinstance(entrant.weights, str)
+            and not entrant.option("temperature")):
         return entrant
     return None
 
@@ -381,6 +388,28 @@ def rung_opponent(
     if entrant is not None and board is not None:
         return frozen(entrant.weights, device, board, players)
     return named_opponent(name, seed, lanes)
+
+
+def rules_mix_refusals(mix: Sequence[tuple[str, float]]) -> list[str]:
+    """The `--mix` entries a `--rules-mix` run cannot seat, each with why; empty
+    when every entry can sit at its tables.
+
+    A rules mix deals every game's format itself (`hexset.gym.distribution`),
+    so an entry that deals its own -- `duel(...)`, `table(...)`,
+    `coalition(...)` -- has no game to deal. And a rules mix trains a
+    contract-9 learner, which sits only beside arena entrants a lane plays
+    itself (`BoardBots`): `parent` and a bare `network:<path>` (or its
+    `sampled:` form) are batched networks a contract-9 collector would have to
+    ask a move at a time. The same net seated as an arena entrant is
+    `network:<path>@0`, HexSet's no-trade spelling, which the arena plays whole
+    decisions at a time."""
+    out: list[str] = []
+    for name in mix_names(mix):
+        if table_pool(name) is not None:
+            out.append(f"{name}: the rules mix deals every game; this entry deals its own")
+        elif name == "parent" or sampled_spec(name) is not None or _bare_network(name) is not None:
+            out.append(f"{name}: a batched network; seat it as an arena entrant (network:<path>@0)")
+    return out
 
 
 def check_mix(mix: Sequence[tuple[str, float]], *, have_parent: bool) -> None:

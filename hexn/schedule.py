@@ -30,7 +30,9 @@ it is happening rather than discovering it in the wreckage.
 
 `linear_anneal` is kept alongside because it is the other standard answer and
 the two compose: anneal the *ceiling* over a run while the controller works
-underneath it. What this module deliberately does **not** do is touch the
+underneath it. `warmup` ramps a constant or annealed rate in over a run's first
+iterations, for a run that starts a fresh optimiser at a rate its checkpoint
+was not trained at. What this module deliberately does **not** do is touch the
 entropy coefficient. Exploration here is steered by the trading canary
 (`trades_per_turn`), a gauge on a different timescale with a different
 failure mode, and moving two controllers at once would make a regression
@@ -133,3 +135,18 @@ def linear_anneal(initial: float, iteration: int, total: int, floor: float = 0.0
         return initial
     progress = min(max(iteration / total, 0.0), 1.0)
     return initial * (1.0 - progress * (1.0 - floor))
+
+
+def warmup(rate: float, iteration: int, length: int) -> float:
+    """`rate` ramped in linearly over the first `length` iterations.
+
+    Iteration `i` below `length` steps at `rate * (i + 1) / length`, so the
+    first update moves at `1 / length` of the rate and iteration `length - 1`
+    at the full rate. A fresh Adam takes full-size steps from its first one
+    (bias correction scales the early moments up), so a checkpoint started on
+    a new optimiser at a rate it was not trained at moves furthest exactly
+    when its advantage estimates are least settled. `length` 0 is no warm-up.
+    """
+    if length <= 0 or iteration >= length:
+        return rate
+    return rate * (max(iteration, 0) + 1) / length

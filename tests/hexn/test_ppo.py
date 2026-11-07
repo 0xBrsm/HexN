@@ -1104,6 +1104,102 @@ def test_a_runaway_ratio_stays_finite(collected):
     assert torch.isfinite(terms.policy_loss) and torch.isfinite(terms.loss)
 
 
+def test_the_kl_gauge_is_the_plain_mean_without_decoupling_or_staleness():
+    # No decoupling: the plain mean, unchanged. Decoupled with the proximal
+    # policy the behaviour policy (every weight one): the same number, exactly.
+    g = torch.Generator().manual_seed(3)
+    log_ratio = torch.randn(4096, generator=g) * 0.05
+    anchor = torch.randn(4096, generator=g) - 2.0
+    plain = (torch.expm1(log_ratio) - log_ratio).mean()
+    kl, unweighted, weight = ppo.kl_gauge(log_ratio, anchor, None)
+    assert torch.equal(kl, plain) and torch.equal(unweighted, plain) and weight is None
+    kl, unweighted, weight = ppo.kl_gauge(log_ratio, anchor, anchor.clone())
+    assert torch.equal(kl, plain) and torch.equal(unweighted, plain) and weight == 1.0
+
+
+def test_a_row_the_proximal_policy_all_but_never_plays_does_not_move_the_kl_gauge():
+    # One row the behaviour policy sampled at e**0 that the proximal policy
+    # gives e**-30, then moved 30 nats by the update: its expm1(r) - r is about
+    # 1e13 and owns the plain mean; weighted by its e**-30 it adds about 1/n.
+    g = torch.Generator().manual_seed(4)
+    log_ratio = torch.randn(4096, generator=g) * 0.05
+    anchor = torch.full((4096,), -1.0)
+    old = anchor.clone()
+    log_ratio[7], anchor[7], old[7] = 30.0, -30.0, 0.0
+    rest = torch.cat([log_ratio[:7], log_ratio[8:]]).double()
+    w = float(np.exp(-30.0))
+    want = (float((torch.expm1(rest) - rest).sum()) + w * float(np.expm1(30.0) - 30.0)) / (4095 + w)
+    kl, unweighted, _ = ppo.kl_gauge(log_ratio, anchor, old)
+    assert unweighted > 1e9
+    assert float(kl) == pytest.approx(want, rel=1e-4)
+    assert float(kl) < 2e-3
+
+
+def test_an_overflowed_row_with_no_weight_adds_its_true_term_to_the_kl_gauge():
+    # A row the update moved past float32's expm1 overflow (r = 200) whose
+    # weight underflows to zero (pi_prox / pi_behaviour = e**-200): its term
+    # w * (expm1(r) - r) is exp(log w + r) - w - w * r = 1 in log space, so it
+    # adds 1 to the numerator, where 0 * inf made the gauge NaN.
+    g = torch.Generator().manual_seed(5)
+    log_ratio = torch.randn(1024, generator=g) * 0.05
+    anchor = torch.full((1024,), -1.0)
+    old = anchor.clone()
+    clean, _, _ = ppo.kl_gauge(log_ratio[1:].clone(), anchor[1:].clone(), old[1:].clone())
+    log_ratio[0], anchor[0], old[0] = 200.0, -200.0, 0.0
+    kl, unweighted, _ = ppo.kl_gauge(log_ratio, anchor, old)
+    assert torch.isinf(unweighted)
+    assert float(kl) == pytest.approx((float(clean) * 1023 + 1.0) / 1023, rel=1e-5)
+
+
+def test_a_bf16_knife_edge_row_with_a_subnormal_weight_stays_finite():
+    # duel1-sp, 2026-11-07: a bf16 collector sampled a move the fp32 proximal
+    # policy put at e**-95 (weight about 5e-42, subnormal but not zero), and
+    # the update moved it 95 nats. w * inf read inf and the break fired on
+    # every update; in log space the row adds about 1.
+    g = torch.Generator().manual_seed(6)
+    log_ratio = torch.randn(4096, generator=g) * 0.05
+    anchor = torch.full((4096,), -1.0)
+    old = anchor.clone()
+    rest = log_ratio[1:].double()
+    log_ratio[0], anchor[0], old[0] = 95.0, -95.0, 0.0
+    assert 0.0 < float(torch.tensor(-95.0).exp()) < torch.finfo(torch.float32).tiny
+    want = (float((torch.expm1(rest) - rest).sum()) + 1.0) / 4095
+    kl, _, _ = ppo.kl_gauge(log_ratio, anchor, old)
+    assert torch.isfinite(kl)
+    assert float(kl) == pytest.approx(want, rel=1e-4)
+
+
+def test_finite_rows_read_the_gauge_as_before_and_a_weighted_overflow_still_breaks():
+    # Every row whose expm1 is finite keeps w * (expm1(r) - r) exactly; a row
+    # with full weight moved past the overflow is a real move and reads inf.
+    g = torch.Generator().manual_seed(7)
+    log_ratio = torch.randn(2048, generator=g) * 0.3
+    anchor = torch.randn(2048, generator=g) - 2.0
+    old = anchor + torch.randn(2048, generator=g) * 0.2
+    weight = (anchor - old).exp().clamp(max=ppo.DECOUPLED_CAP)
+    per_row = torch.expm1(log_ratio) - log_ratio
+    kl, _, _ = ppo.kl_gauge(log_ratio, anchor, old)
+    assert torch.equal(kl, (weight * per_row).sum() / weight.sum())
+    kl, _, _ = ppo.kl_gauge(torch.tensor([200.0, 0.01]), torch.tensor([-1.0, -1.0]), torch.tensor([-1.0, -1.0]))
+    assert torch.isinf(kl)
+    kl, _, weight = ppo.kl_gauge(torch.tensor([0.02, 0.01]), torch.tensor([-200.0, -200.0]), torch.tensor([0.0, 0.0]))
+    assert float(kl) == 0.0 and float(weight) == 0.0
+
+
+def test_the_logged_kl_is_weighted_and_the_plain_mean_logged_beside_it(collected):
+    # On fresh data every weight is one, so the two read alike, micro-batched
+    # or not; a stale batch makes them differ only through the weights.
+    policy, episodes = collected
+    batch = assemble(episodes, policy.layout, PPOConfig())
+    config = PPOConfig(epochs=2, minibatch=256, decoupled=True)
+    whole = _decoupled_update(a_student(policy), batch, config)
+    sliced = _decoupled_update(a_student(policy), batch, dataclasses.replace(config, micro_batch=64))
+    assert whole.approx_kl == pytest.approx(whole.approx_kl_unweighted, rel=1e-6)
+    assert sliced.approx_kl == pytest.approx(whole.approx_kl, rel=1e-4, abs=1e-9)
+    plain = _decoupled_update(a_student(policy), batch, dataclasses.replace(config, decoupled=False))
+    assert plain.approx_kl == plain.approx_kl_unweighted
+
+
 def test_decoupled_and_the_proximal_log_probs_come_together(collected):
     policy, episodes = collected
     batch = assemble(episodes, policy.layout, PPOConfig())

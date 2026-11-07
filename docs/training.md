@@ -56,7 +56,14 @@ during iteration `k`'s update, by the pre-update policy, so each batch is one
 update stale (`--no-async-collect` restores the synchronous loop). In
 `cohort` mode each prefetched cohort is still played whole. Async collection
 turns on decoupled PPO (`--decoupled`) by default, which clips against the
-learner as the update starts and so absorbs the staleness. On a GPU device
+learner as the update starts and so absorbs the staleness. Each row's
+surrogate is weighted by `min(pi_prox / pi_behaviour, 2)`, and so is the KL
+gauge (`hexn.ppo.kl_gauge`): `approx_kl`, its first-minibatch and last-epoch
+readings, `--kl-break` and the adaptive schedule all read the weighted mean
+of `expm1(r) - r` over the rows, `r` the learner-to-proximal log-ratio, so a
+row the behaviour policy sampled and the proximal one all but never would
+does not move it. `approx_kl_unweighted` logs the plain mean beside it;
+without decoupling the two are the same. On a GPU device
 the learner's update also defaults to the fused trunk (`--fused`) and fp16
 autocast (`--amp auto`); on CPU both stay off. `--update-workers
 N` shards the PPO *update* itself across `N` CPU processes with a central
@@ -98,7 +105,10 @@ workers' trunk, the same numbers up to float reassociation.
 holds the update's finished-epoch `approx_kl` inside a band around
 `--target-kl` by scaling the rate multiplicatively, clamped to
 `[--lr-min, --lr-max]` so a KL reading that does not respond to the rate
-cannot walk it to infinity.
+cannot walk it to infinity. `--lr-warmup N` ramps a `constant` or `linear`
+rate in over the first `N` iterations: iteration `i` steps at `(i + 1) / N`
+of the scheduled rate. Use it when a checkpoint starts a fresh optimiser at a
+rate it was not trained at. It does not combine with `adaptive`.
 
 ## Expert iteration (`hexn.exit`)
 
@@ -201,11 +211,14 @@ takes its entropy over them.
   `--points-head` set the net's `ModelConfig`; a checkpoint carries it.
 - **Contracts.** `9.1` reads the table's rules, the next roll's odds and
   live-seat flags. `9d`, `9d.1` and `11d` are the two-seat observations and
-  need `--players 2`. `--rules-mix '<JSON>'` (contract `9.1`, `9d`, `9d.1` or `11d`
-  self-play only) freezes a `hexset.gym.distribution.Distribution`
+  need `--players 2`. `--rules-mix '<JSON>'` (contract `9.1`, `9d`, `9d.1` or `11d`)
+  freezes a `hexset.gym.distribution.Distribution`
   specification into the manifest, a format drawn per game; every game keeps
   the same number of dealt slots (`--players`), and unused seats retire
-  before setup. Win and points predictions exclude retired seats.
+  before setup. Win and points predictions exclude retired seats. Beside
+  it, `--mix` may seat arena entrants in a share of the games (a frozen net
+  is `network:<path>@0`), never trained on; an entry that deals its own game
+  or a batched network is refused at launch.
 - **Loading across contracts.** `--init` from contract-9 weights onto a
   `9.1` net, or from `9d` onto `9d.1`, appends zero input columns, so the
   loaded net predicts as before until it trains.
