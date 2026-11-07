@@ -9,12 +9,13 @@ the source of truth for them. This package trains two networks:
 
 | Contract | Network | Reads | Answers |
 | --- | --- | --- | --- |
-| `8`, `8.1` | `hexn.model.HexNet` | `hexset.encoding`'s hex, vertex, edge and global inputs | One flat action a decision |
+| `6`, `8`, `8.1` | `hexn.model.HexNet` | `hexset.encoding`'s hex, vertex, edge and global inputs | One flat action a decision |
 | `9`, `9.1`, `9d`, `9d.1`, `11d` | `hexn.model9.HexNet` | `hexset.contract9`'s seat, table, hex and vertex tokens | A whole decision (`hexset.decisions`) |
 
 A trainer's `--contract` picks one (`8`, `9`, `9.1`, `9d`, `9d.1` or `11d`;
 the two-seat `9d`, `9d.1` and `11d` with `--players 2`). A contract-8 net becomes an 8.1 net by
-loading 8.1 weights ([loading across contracts](#loading-across-contracts)).
+loading 8.1 weights, and a contract-6 net by loading contract-6 weights
+([loading across contracts](#loading-across-contracts)).
 Module docstrings cite older numbers as shorthand for "before/after that
 shape changed":
 
@@ -150,6 +151,11 @@ input weights at zero, so the loaded net plays as it did:
 - 8.1 weights loaded onto a contract-8 net make it an 8.1 net; contract-8
   weights loaded onto an 8.1 net are widened with zero columns, which change
   only how points are read against a game played to more than 10.
+- Contract-6 weights loaded onto a contract-8 net make it a contract-6 net:
+  all four input projections are rebuilt at contract 6's widths
+  (`hexset.encoding` contract 6) and the net reads that encoding from then
+  on, in training and at a `network:` seat. A contract-6 net is not exported
+  to ONNX.
 - A contract-9 checkpoint loads into a 9.1 net, and a 9d checkpoint into a
   9d.1 net. A checkpoint without `global_seat` loads into a net with it, its
   head's seat weights at zero.

@@ -40,12 +40,12 @@ from torch import Tensor, nn
 
 from hexset.actions import ActionSpace
 from hexset.encoding import (
-    HEX_FEATURES,
     OBSERVATION_CONTRACTS,
     Observation,
     StaticGraph,
     edge_features,
     global_features,
+    hex_features,
     vertex_features,
 )
 from .readout import EDGES, GLOBALS, HEXES, VERTICES, plan
@@ -114,9 +114,10 @@ class ModelConfig:
     # default, so every checkpoint written before it keeps its exact key set.
     fast_win: bool = False
     # The observation contract the net reads (`hexset.encoding.OBSERVATION_CONTRACTS`):
-    # "8", or "8.1" for a net trained across rule sets. A checkpoint carries
-    # its own: `HexNet` takes it from the weights at load, so a builder that
-    # does not know it in advance still loads the net it is given.
+    # "8", "8.1" for a net trained across rule sets, or "6" for a net trained
+    # on the older encoding. A checkpoint carries its own: `HexNet` takes it
+    # from the weights at load, so a builder that does not know it in advance
+    # still loads the net it is given.
     contract: str = "8"
 
     def __post_init__(self) -> None:
@@ -460,16 +461,20 @@ class HexNet(nn.Module):
         self.num_edges = graph.num_edges
         width = self.config.width
 
-        self.embed_hex = nn.Linear(HEX_FEATURES, width)
-        self.embed_vertex = nn.Linear(vertex_features(players), width)
-        self.embed_edge = nn.Linear(edge_features(players), width)
-        self.embed_global = nn.Linear(global_features(players, self.config.contract), width)
+        contract = self.config.contract
+        self.embed_hex = nn.Linear(hex_features(contract), width)
+        self.embed_vertex = nn.Linear(vertex_features(players, contract), width)
+        self.embed_edge = nn.Linear(edge_features(players, contract), width)
+        self.embed_global = nn.Linear(global_features(players, contract), width)
         # A checkpoint whose input projections read another contract's
         # inputs is refused by name: contract 8 re-encodes all four, so no
         # padding computes what an older net did (`hexn.migrate_c8` refits them).
         # Contract 8.1 only appends globals: a contract-8.1 checkpoint turns a
         # contract-8 net into an 8.1 one at load, and a contract-8 checkpoint
         # loads onto an 8.1 net with zero weights on the appended columns.
+        # A contract-6 checkpoint, whose hex rows are contract 6's width, makes
+        # this net a contract-6 one: all four projections are rebuilt at
+        # contract 6's widths before the weights are copied in.
         self._register_load_state_dict_pre_hook(self._refuse_other_inputs)
 
         self.rounds = nn.ModuleList(Round(width) for _ in range(self.config.rounds))
@@ -679,7 +684,20 @@ class HexNet(nn.Module):
         an 8.1 net is widened in place with zero columns: the net then
         computes on every input what it did, but for the points it reads
         against a game's target, which is the old reading wherever the game
-        is played to 10."""
+        is played to 10.
+
+        A checkpoint whose `embed_hex` reads contract 6's hex width makes this
+        net a contract-6 one the same way, all four projections rebuilt."""
+        hexes = state_dict.get(f"{prefix}embed_hex.weight")
+        if (hexes is not None and hexes.dim() == 2 and hexes.shape[1] == hex_features("6")
+                and self.config.contract != "6"):
+            self.config = replace(self.config, contract="6")
+            for name, width in (("embed_hex", hex_features("6")),
+                                ("embed_vertex", vertex_features(self.players, "6")),
+                                ("embed_edge", edge_features(self.players, "6")),
+                                ("embed_global", global_features(self.players, "6"))):
+                old = getattr(self, name)
+                setattr(self, name, nn.Linear(width, old.out_features).to(device=old.weight.device, dtype=old.weight.dtype))
         key = f"{prefix}embed_global.weight"
         weight = state_dict.get(key)
         plain = global_features(self.players, "8")
@@ -932,10 +950,14 @@ class Packing:
 
 
 def packing(graph: StaticGraph, players: int, contract: str = "8") -> Packing:
+    return _packing(graph.num_hexes, graph.num_vertices, graph.num_edges, players, contract)
+
+
+def _packing(hexes: int, vertices: int, edges: int, players: int, contract: str) -> Packing:
     shapes = (
-        ("hexes", (graph.num_hexes, HEX_FEATURES)),
-        ("vertices", (graph.num_vertices, vertex_features(players))),
-        ("edges", (graph.num_edges, edge_features(players))),
+        ("hexes", (hexes, hex_features(contract))),
+        ("vertices", (vertices, vertex_features(players, contract))),
+        ("edges", (edges, edge_features(players, contract))),
         ("globals", (global_features(players, contract),)),
     )
     blocks = []
@@ -949,26 +971,24 @@ def packing(graph: StaticGraph, players: int, contract: str = "8") -> Packing:
 
 def layout_contract(layout: Packing) -> tuple[int, str]:
     """The seat count and observation contract `layout` packs, read off its
-    own blocks: the vertex row's width names the seats (`vertex_features`),
-    and the globals block is contract 8's width or 8.1's."""
+    own blocks: a hex row of contract 6's width is contract 6, the vertex
+    row's width names the seats (`vertex_features`), and otherwise the
+    globals block is contract 8's width or 8.1's."""
     shapes = {name: shape for name, _, _, shape in layout.blocks}
+    if shapes["hexes"][1] == hex_features("6"):
+        players = next(p for p in range(1, 9) if vertex_features(p, "6") == shapes["vertices"][1])
+        return players, "6"
     players = next(p for p in range(1, 9) if vertex_features(p) == shapes["vertices"][1])
     contract = "8.1" if shapes["globals"][0] == global_features(players, "8.1") else "8"
     return players, contract
 
 
 def for_contract(layout: Packing, contract: str) -> Packing:
-    """`layout` with its globals block sized for observation `contract`, every
-    other block as it was: the layout a net reads once its contract is known."""
+    """`layout` with every block sized for observation `contract`, over the
+    same board and seats: the layout a net reads once its contract is known."""
     players, _ = layout_contract(layout)
-    blocks, start = [], 0
-    for name, _, _, shape in layout.blocks:
-        if name == "globals":
-            shape = (global_features(players, contract),)
-        size = int(np.prod(shape))
-        blocks.append((name, start, start + size, shape))
-        start += size
-    return Packing(width=start, blocks=tuple(blocks))
+    shapes = {name: shape for name, _, _, shape in layout.blocks}
+    return _packing(shapes["hexes"][0], shapes["vertices"][0], shapes["edges"][0], players, contract)
 
 
 def pack(layout: Packing, observations: list[Observation], dtype=np.float32) -> Tensor:

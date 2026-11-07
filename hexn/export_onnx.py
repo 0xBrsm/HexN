@@ -817,6 +817,10 @@ def export(
     shapes = _shapes(graph, players, space)
 
     contract = net.config.contract
+    if contract not in ("8", "8.1"):
+        # The graph encodes the record itself (`RecordEncoder`), which writes
+        # contracts 8 and 8.1 only.
+        raise ValueError(f"a contract-{contract} net is not exported: the graph encodes contracts 8 and 8.1")
     names = _input_names(contract)
     encoder = RecordEncoder(graph, players, contract)
     encoder.eval()

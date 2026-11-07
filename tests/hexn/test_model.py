@@ -745,3 +745,40 @@ def test_ppo_rebinds_its_optimiser_when_8_1_weights_widen_the_net():
     assert after is not before
     assert {id(p) for group in after.param_groups for p in group["params"]} == {id(p) for p in net.parameters()}
     assert after.param_groups[0]["lr"] == 2e-4 and after.param_groups[0]["eps"] == 1e-5
+
+
+def test_a_contract_6_checkpoint_makes_the_net_a_contract_6_one():
+    """A builder that does not know the checkpoint's contract still loads a
+    contract-6 one: its hex rows' width rebuilds all four projections at
+    contract 6's widths, the layout follows, and the net computes what the
+    net that wrote the weights did."""
+    from hexset.encoding import edge_features, global_features, hex_features, vertex_features
+    from hexn.model import for_contract, layout_contract, packing
+
+    _, _, old = a_net(seed=4, contract="6")
+    assert (old.embed_hex.in_features, old.embed_vertex.in_features, old.embed_edge.in_features,
+            old.embed_global.in_features) == (hex_features("6"), vertex_features(4, "6"), edge_features(4, "6"),
+                                              global_features(4, "6"))
+    game, _, loaded = a_net(seed=5)
+    loaded.load_state_dict(old.state_dict())
+    assert loaded.config.contract == "6"
+    batch = collate(observations(3, contract="6"))
+    with torch.no_grad():
+        torch.testing.assert_close(loaded(*batch).logits, old(*batch).logits, rtol=0, atol=0)
+        torch.testing.assert_close(loaded(*batch).value, old(*batch).value, rtol=0, atol=0)
+
+    graph = static_graph(game.state(0, hidden=False).board.topology)
+    six = for_contract(packing(graph, 4), "6")
+    assert six == packing(graph, 4, "6") and layout_contract(six) == (4, "6")
+    assert for_contract(six, "8") == packing(graph, 4) and layout_contract(packing(graph, 2, "6")) == (2, "6")
+
+
+def test_a_contract_6_net_is_not_exported(tmp_path):
+    """The exported graph encodes the record itself, for contracts 8 and 8.1."""
+    from hexn.export_onnx import export
+
+    _, _, net = a_net(contract="6")
+    path = tmp_path / "six.pt"
+    torch.save({"net": net.state_dict(), "args": {"width": 64, "rounds": 2}}, path)
+    with pytest.raises(ValueError, match="contract-6"):
+        export(path, tmp_path / "six.onnx")

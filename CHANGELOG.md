@@ -2,6 +2,20 @@
 
 All notable changes to the `hexn` package are recorded here.
 
+## 0.52.0
+
+### Added
+
+- **Contract-6 checkpoints load and train.** `HexNet` takes contract 6
+  from a checkpoint's weights as it takes 8.1: an `embed_hex` of contract
+  6's hex width rebuilds all four input projections at contract 6's widths
+  before the weights are copied in, and `config.contract` reads `"6"`.
+  `packing` sizes every block by the contract, and `for_contract` and
+  `layout_contract` carry all four, so a collector, the trainer and a
+  `network:` seat encode the position the net reads (`hexset.encoding`
+  contract 6). The ONNX export refuses a contract-6 net: the graph encodes
+  the record for contracts 8 and 8.1 only.
+
 ## 0.51.0
 
 ### Added
