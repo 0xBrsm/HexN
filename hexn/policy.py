@@ -183,6 +183,14 @@ class NetworkPolicy:
         return getattr(getattr(self.net, "config", None), "contract", "8")
 
     @property
+    def native_contract(self) -> str | None:
+        """The contract a native position (`hexset.native.playout.NativeCopy`)
+        encodes for this net, which `hexset.encoding.encode_batch` reads from
+        it: the net's own observation contract, 8 or 8.1."""
+        contract = self.observation_contract
+        return contract if contract in ("8", "8.1") else None
+
+    @property
     def layout(self) -> Packing:
         """The packing the net reads, re-sized when loading a checkpoint
         changed the net's observation contract after this policy was built."""
@@ -401,18 +409,26 @@ class NetworkPolicy:
         """
         if not rows:
             return []
-        seats = [seat for _, seat, _ in rows]
-        observations = encode_batch([game for game, _, _ in rows], seats, self.observation_contract)
-        masks = np.asarray(
-            [mask_of(self.space, options) for _, _, options in rows], dtype=bool
-        )
-        slots, values = self.score(observations, masks)
+        return self.score_read(rows, *self.score(*self.score_feed(rows)))
+
+    def score_feed(self, rows: Sequence[tuple[Game, int, tuple[Action, ...]]]) -> tuple[list, np.ndarray]:
+        """The forward `score_rows` makes (`score`): each row's observation and
+        its options' mask. A caller running `score` elsewhere (`hexn.serve`)
+        calls `score_read` on what it returns."""
+        observations = encode_batch([game for game, _, _ in rows], [seat for _, seat, _ in rows],
+                                    self.observation_contract)
+        masks = np.asarray([mask_of(self.space, options) for _, _, options in rows], dtype=bool)
+        return observations, masks
+
+    def score_read(self, rows: Sequence[tuple[Game, int, tuple[Action, ...]]], slots: np.ndarray,
+                   values: np.ndarray) -> list[tuple[np.ndarray, tuple[float, ...]]]:
+        """`score_rows`' answer from `score`'s masked log-probs and values."""
         return [
             (
                 self._prior(options, slots[row]),
-                from_frame(values[row].tolist(), seats[row]),
+                from_frame(values[row].tolist(), seat),
             )
-            for row, (_, _, options) in enumerate(rows)
+            for row, (_, seat, options) in enumerate(rows)
         ]
 
     def _prior(self, options: Sequence[Action], slots: np.ndarray) -> np.ndarray:

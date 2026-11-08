@@ -372,10 +372,24 @@ class Policy9:
         onto its first atomic move (`hexn.model9.first_move_prior`), at each
         option's flat action, renormalised over the options (uniform where
         none has mass), and the win head in board-seat order -- what an
-        exported file's `prior` gives."""
+        exported file's `prior` gives. One forward (`_heads`) between
+        `score_feed` and `score_read`, which a caller running that forward
+        elsewhere (`hexn.serve`) calls around its own."""
         if not rows:
             return []
-        _, _, heads = self._scored([(game, seat) for game, seat, _ in rows], prior=True)
+        observations, arrays = self.score_feed(rows)
+        return self.score_read(rows, self._heads(observations, arrays, prior=True))
+
+    def score_feed(self, rows: Sequence[tuple[Game, int, tuple[Action, ...]]]) -> tuple[np.ndarray, dict]:
+        """The forward `score_rows` makes: each row's observation and its
+        decision's arrays (`hexset.decisions.arrays`), for `_heads` with the
+        prior."""
+        decisions = [self.decision(game, seat) for game, seat, _ in rows]
+        arrays = D.arrays(decisions, self.space, D.topology_of(rows[0][0]))
+        return self.observations([(game, seat) for game, seat, _ in rows]), arrays
+
+    def score_read(self, rows: Sequence[tuple[Game, int, tuple[Action, ...]]], heads: Heads9):
+        """`score_rows`' answer from the heads of `score_feed`'s forward."""
         out = []
         for i, (game, seat, options) in enumerate(rows):
             frame = D.frame_for(game, seat, self.space)

@@ -339,3 +339,32 @@ def test_older_torch_query_apis_are_ineligible_before_any_model_mutation(monkeyp
             assert all(value is buffers[name] for name, value in candidate.net.named_buffers())
             assert all(type(module) is torch.nn.Linear for module in candidate.net.modules() if isinstance(module, torch.nn.Linear))
     assert observe(monkeypatch, reference, rows) == observe(monkeypatch, candidate, rows)
+
+
+def test_several_nets_in_one_process_each_get_an_owner_and_share_the_jit_settings(monkeypatch):
+    """A learner and frozen nets beside it in one worker: each net its own
+    owner, each traced answer the original's, the process's JIT switches set
+    while any owner is traced and restored when the last one closes."""
+    before = jit_settings()
+    built_nets = [built(4, points=points) for points in (False, True)] + [built(2)]
+    owners = [WorkerInference(candidate) for _, candidate, _ in built_nets]
+    try:
+        assert all(owner.eligible for owner in owners)
+        assert not WorkerInference(built_nets[0][1]).eligible  # a second owner for one net
+        for (reference, candidate, rows), owner in zip(built_nets, owners):
+            assert observe(monkeypatch, reference, rows) == observe(monkeypatch, candidate, rows)
+            assert owner.traced and owner.valid
+        traced = jit_settings()
+        assert traced == (False, False, False, True, False)
+        owners[0].close()
+        assert jit_settings() == traced
+        for (reference, candidate, rows), owner in list(zip(built_nets, owners))[1:]:
+            for count in (1, 3, 5):
+                assert observe(monkeypatch, reference, rows[:count]) == observe(monkeypatch, candidate, rows[:count])
+            assert owner.traced and owner.valid
+        reference, candidate, rows = built_nets[0]
+        assert observe(monkeypatch, reference, rows) == observe(monkeypatch, candidate, rows)
+    finally:
+        for owner in owners:
+            owner.close()
+    assert jit_settings() == before

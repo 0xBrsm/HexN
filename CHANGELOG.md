@@ -2,6 +2,37 @@
 
 All notable changes to the `hexn` package are recorded here.
 
+## 0.53.0
+
+### Added
+
+- **`NetworkPolicy.native_contract`.** A contract-8 net names the contract
+  (8 or 8.1) a native position encodes for it, so a
+  `hexset.gym.seats.PolicySeat` reading it plays on native lanes.
+
+- **`hexn.serve`: one process runs every net's forward for many workers.**
+  `Server` loads each `.pt` net once on its device and, each round, joins
+  the rows every client asked of one net into one forward. `Panel` is a
+  worker's side: `score_rows_all(rows)` sends every served net's feed in one
+  message, scores an exported file on the worker's CPU meanwhile, and reads
+  each answer; it is the `scorer` a `hexset.gym.seats.PolicySeat` takes.
+  `precision="bf16"` serves under bf16 autocast, a separate treatment;
+  `gather` holds a round open for more clients. `Panel.stop()` returns the
+  server's counters: rounds, requests, forwards, rows and busy seconds.
+
+- **`score_feed` and `score_read` on both policies.** `Policy9.score_rows`
+  and `NetworkPolicy.score_rows` are now their encoding, one forward and
+  their reading, each callable on its own, so the forward can run in
+  another process. `score_rows` answers as before.
+
+### Changed
+
+- **`WorkerInference` allows one owner per net, not one per process.** A
+  worker running several contract-9 nets accelerates each of them; the JIT
+  settings the traces need are set by the first owner to trace and restored
+  when the last one closes. A collection worker now accelerates every learner
+  it runs.
+
 ## 0.52.0
 
 ### Added

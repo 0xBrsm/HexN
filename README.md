@@ -99,7 +99,7 @@ Start with [training.md](docs/training.md); the rest are listed by name.
 | --- | --- |
 | [benchmarks.md](docs/benchmarks.md) | The 16 standalone benchmarks: throughput/cost, value-head, and optimiser diagnostics, with what each measures and how to run it |
 | [checkpoints.md](docs/checkpoints.md) | The contract-8 and contract-9 networks and their heads, contract versions, loading across contracts, migrating and widening a checkpoint, ONNX export |
-| [inference.md](docs/inference.md) | Collection inference: the CPU BF16 worker path for contract-9 policies |
+| [inference.md](docs/inference.md) | Collection inference: the CPU BF16 worker path for contract-9 policies, and one process serving every net's forward to many workers |
 | [runs.md](docs/runs.md) | The run-manifest system: creating, loading and resuming a run directory |
 | [testing.md](docs/testing.md) | Running the test suite, and which parts need PyTorch |
 | [training.md](docs/training.md) | The three training modes (PPO self-play, expert iteration, the learner league), contract-9 training, and the harness they share |
@@ -111,7 +111,7 @@ Start with [training.md](docs/training.md); the rest are listed by name.
 | `hexn/model.py`, `readout.py` | The contract-8 network: message passing over the graph observation, and the index map from heads to flat action slots |
 | `hexn/model9.py`, `policy9.py` | The contract-9 network over HexSet's seat, table, hex and vertex tokens, and its policy: whole decisions in self-play (`NetworkPolicy9`) and in play (`Policy9`) |
 | `hexn/selfplay.py`, `collect.py`, `policy.py`, `rewards.py` | The trainer's half of collection on HexSet's batched game loop behind a `BatchPolicy` protocol, its sharded multi-process parallel collector, the contract-8 torch policy, and the per-seat terminal scalarisation |
-| `hexn/inference9.py` | The collect workers' CPU BF16 inference for a contract-9 policy ([inference.md](docs/inference.md)) |
+| `hexn/inference9.py`, `serve.py` | The collect workers' CPU BF16 inference for a contract-9 policy, one owner per net; one process running every net's forward for many workers ([inference.md](docs/inference.md)) |
 | `hexn/durable.py`, `gamefile.py`, `steps.py` | Keeping every unit of a batch the moment it finishes, and resuming from it; one finished game as compact, exact bytes; an update's progress after its optimiser steps |
 | `hexn/coalition.py`, `trade.py`, `runtime.py` | A coalition member inside self-play; how the networks trade, in HexSet's terms; loading the runtime modules a run names |
 | `hexn/optim.py` | The Adam execution the trainers share |

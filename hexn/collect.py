@@ -1356,16 +1356,16 @@ def _serve(spec: WorkerSpec, connection, beat=None) -> None:
     def stamp() -> None:
         beat.value = time.time()
 
-    acceleration = None
+    acceleration = []
     try:
         policies, collector = _build(spec)
-        policy = policies[0]
         if spec.contract in CONTRACTS9:
             from .inference9 import WorkerInference
 
             # The collector plays its cohorts on native lanes where it can
-            # (`hexn.selfplay.Collector._native_ready`).
-            acceleration = WorkerInference(policy)
+            # (`hexn.selfplay.Collector._native_ready`). One owner per net:
+            # every learner the worker runs is accelerated, not only the first.
+            acceleration = [WorkerInference(learner) for learner in policies]
         if beat is not None:
             collector.beat = stamp
         while True:
@@ -1373,7 +1373,7 @@ def _serve(spec: WorkerSpec, connection, beat=None) -> None:
             if beat is not None:
                 stamp()
             if kind == "weights":
-                # `policy` is the `NetworkPolicy`, which is what a `SearchPolicy`
+                # Each learner is the `NetworkPolicy`, which is what a `SearchPolicy`
                 # wraps and what its evaluator holds — so syncing here reaches
                 # the searched path too, and `_build` returns it deliberately
                 # rather than returning whatever is acting. A list is the
@@ -1424,8 +1424,8 @@ def _serve(spec: WorkerSpec, connection, beat=None) -> None:
         except Exception:
             pass
     finally:
-        if acceleration is not None:
-            acceleration.close()
+        for owner in acceleration:
+            owner.close()
 
 
 class ParallelCollector:

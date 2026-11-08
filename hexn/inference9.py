@@ -24,7 +24,9 @@ __all__ = ["WorkerInference"]
 _INPUTS = ("seats", "table", "hexes", "vertices", "vertex_owner", "road_owner", "reach")
 _BUFFER = "_inference9_weight"
 _ENTRY = "_inference9_entry"
-_ACTIVE = None
+# The installed owners, one per net, by the net's id; a net with an open
+# owner gets no second one.
+_OWNERS: "weakref.WeakValueDictionary[int, WorkerInference]" = weakref.WeakValueDictionary()
 _JIT_METHODS = ("_jit_can_fuse_on_cpu", "_jit_texpr_fuser_enabled", "_jit_llga_enabled",
                 "_get_graph_executor_optimize", "_jit_set_autocast_mode",
                 "_jit_override_can_fuse_on_cpu", "_jit_set_texpr_fuser_enabled",
@@ -133,7 +135,11 @@ class _WeightCache:
 
 
 class _Settings:
-    """Preserve optimized execution without fusion or autocast rewrites."""
+    """Preserve optimized execution without fusion or autocast rewrites.
+
+    The switches are the process's, so every traced owner shares one
+    `_Settings` (`_settings_acquire`): set when the first owner traces,
+    restored when the last one closes."""
     def __init__(self):
         c = torch._C
         self.previous = (c._jit_can_fuse_on_cpu(), c._jit_texpr_fuser_enabled(),
@@ -160,6 +166,26 @@ class _Settings:
         c._set_graph_executor_optimize(optimize)
         c._jit_set_autocast_mode(self.autocast)
         self.closed = True
+
+
+_SHARED: dict = {"settings": None, "holders": 0}
+
+
+def _settings_acquire() -> "_Settings":
+    if _SHARED["holders"] == 0:
+        _SHARED["settings"] = _Settings()
+    _SHARED["holders"] += 1
+    return _SHARED["settings"]
+
+
+def _settings_release(settings: "_Settings") -> None:
+    if settings is not _SHARED["settings"] or _SHARED["holders"] <= 0:
+        settings.close()
+        return
+    _SHARED["holders"] -= 1
+    if _SHARED["holders"] == 0:
+        _SHARED["settings"].close()
+        _SHARED["settings"] = None
 
 
 class _Trunk(nn.Module):
@@ -214,11 +240,12 @@ class WorkerInference:
     Normal in-place ``load_state_dict`` refreshes preserve trace aliases.
     Parameter/buffer rebinding, storage or dtype/device changes permanently
     invalidate this owner and retain the canonical eager path. It never
-    changes ``policy.precision``. JIT settings belong to this worker's process
-    until close, so only one inference owner may be installed in a process.
+    changes ``policy.precision``. A process may hold one owner per net, so
+    every net a worker runs (a learner and the frozen nets beside it) gets
+    its own; the JIT settings they need are the process's, set while any
+    traced owner is open and restored when the last one closes.
     """
     def __init__(self, policy):
-        global _ACTIVE
         self.policy = policy
         self.net = getattr(policy, "net", None)
         self.eligible, self.valid, self.closed = False, False, False
@@ -228,7 +255,8 @@ class WorkerInference:
         self._thread = threading.get_ident()
         if not self._supported():
             return
-        if _ACTIVE is not None and _ACTIVE() is not None and not _ACTIVE().closed:
+        held = _OWNERS.get(id(self.net))
+        if held is not None and not held.closed and held.net is self.net:
             return
         try:
             self._cache = _WeightCache(self.net)
@@ -241,7 +269,7 @@ class WorkerInference:
             self._pre_hook = self.net.register_forward_pre_hook(self._first_forward, with_kwargs=True)
             self._load_hook = self.net.register_load_state_dict_post_hook(self._after_load)
             self.eligible = self.valid = True
-            _ACTIVE = weakref.ref(self)
+            _OWNERS[id(self.net)] = self
         except Exception:
             self.close()
 
@@ -334,20 +362,20 @@ class WorkerInference:
         self._pre_hook.remove()
         self._pre_hook = None
         try:
-            self._settings = _Settings()
+            self._settings = _settings_acquire()
             self._forward = _Forward(self, tensors)
             self.net.forward = self._forward
             self.traced = True
         except Exception:
             self._invalidate()
             if self._settings is not None:
-                self._settings.close()
+                _settings_release(self._settings)
+                self._settings = None
 
     def _after_load(self, module, incompatible):
         self._intact()
 
     def close(self):
-        global _ACTIVE
         if self.closed:
             return
         self._invalidate()
@@ -357,7 +385,7 @@ class WorkerInference:
         if self._forward is not None and self.net.__dict__.get("forward") is self._forward:
             del self.net.forward
         if self._settings is not None:
-            self._settings.close()
+            _settings_release(self._settings)
         if self._cache is not None:
             self._cache.close()
         self._pre_hook = self._load_hook = None
@@ -366,8 +394,8 @@ class WorkerInference:
             self._tracked.clear()
             self._storages.clear()
         self.closed = True
-        if _ACTIVE is not None and _ACTIVE() is self:
-            _ACTIVE = None
+        if _OWNERS.get(id(self.net)) is self:
+            del _OWNERS[id(self.net)]
 
     def __enter__(self):
         return self
