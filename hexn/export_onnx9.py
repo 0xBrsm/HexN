@@ -97,6 +97,7 @@ from hexset import contract9, decisions as D
 from hexset.actions import ActionSpace, build_space
 from hexset.board.topology import Topology
 
+from .hold import KEY as HOLD_KEY, carried as carried_hold
 from .model9 import HexNet, config_of, first_move_prior, option_probs, unpack9
 
 __all__ = ["CONTRACT", "input_names", "output_names", "serving_props", "is_contract9", "export9"]
@@ -221,7 +222,10 @@ def _load(checkpoint: str, topology: Topology) -> tuple[HexNet, ActionSpace, dic
     # The node-major trunk, as every contract-9 reader runs it: the same
     # numbers as the reference loop up to float reassociation.
     net.fused = True
-    return net, space, {"players": players, "iteration": int(state.get("iteration") or 0)}
+    # The hold model the checkpoint declares (`hexn.hold`), written into the
+    # file's metadata as `hold_shape` and `hold_scale`.
+    return net, space, {"players": players, "iteration": int(state.get("iteration") or 0),
+                        "hold": carried_hold(state).get(HOLD_KEY, {})}
 
 
 def serving_props(
@@ -479,6 +483,7 @@ def export9(
             "double_turn": double_turn,
             "max_offers": "0",
             "iteration": str(meta["iteration"]),
+            **meta["hold"],
             **_provenance(checkpoint),
             **serving,
         }

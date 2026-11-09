@@ -650,6 +650,26 @@ def test_init_starts_the_run_from_the_given_weights_at_iteration_zero(tmp_path):
     assert start["args"]["max_offers"] == 0
 
 
+def test_every_checkpoint_carries_the_hold_model_its_parent_declares(tmp_path):
+    """`--init` from a checkpoint that declares a hold model (`hexn.hold`)
+    writes it into every checkpoint the run keeps, and a resume keeps
+    writing it; a run from random weights declares none."""
+    from hexn.hold import declared, stamp
+    from hexset.holding import HoldModel
+
+    hold = HoldModel(shape=1.0, scale=(0.5, 1.0, 0.6, 0.6, 0.7))
+    source = tmp_path / "source"
+    assert warm_run(source, 1, ["--checkpoint-every", "1", "--seed", "5"]) == 0
+    assert declared(torch.load(source / "latest.pt", weights_only=False)) is None
+    stamp(source / "latest.pt", hold)
+    warm = tmp_path / "warm"
+    flags = ["--checkpoint-every", "1", "--init", str(source / "latest.pt"), "--resume"]
+    assert warm_run(warm, 1, flags) == 0
+    assert warm_run(warm, 2, flags) == 0
+    for name in ("iter-00000.pt", "iter-00001.pt", "iter-00002.pt", "latest.pt"):
+        assert declared(torch.load(warm / name, weights_only=False)) == hold, name
+
+
 def test_init_with_resume_initialises_once_and_then_resumes(tmp_path):
     source = tmp_path / "source"
     warm_run(source, 1, ["--checkpoint-every", "1", "--seed", "5"])

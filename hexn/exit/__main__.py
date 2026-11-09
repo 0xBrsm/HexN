@@ -91,6 +91,7 @@ from ..ppo import attach_prior
 from ..reanalyse import reanalyse
 from ..selfplay import Collector
 from ..store import EpisodeStore
+from ..hold import carried as carried_hold, declared as declared_hold
 from ..loop import GameCount, add_head_flags, build, duel, eval_journal, prune_recent, save, summarise
 from ..steps import Steps, by_index, fingerprint, remove as remove_steps
 
@@ -433,8 +434,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             "the fresh run in an empty --checkpoint-dir"
         )
     resuming = args.resume and latest.exists()
+    # The hold model the run's parent declares (`hexn.hold`), written into
+    # every checkpoint this run keeps; a run from random weights has none.
+    hold = {}
     if resuming:
         state = torch.load(latest, map_location=args.device, weights_only=False)
+        hold = carried_hold(state)
         policy.net.load_state_dict(state["net"])
         optimiser.load_state_dict(state["optimiser"])
         # The loaded state carries the *checkpoint's* learning rate in its
@@ -488,6 +493,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         # scale the first steps by a history that no longer describes
         # the loss.
         state = torch.load(args.init, map_location=args.device, weights_only=False)
+        hold = carried_hold(state)
         policy.net.load_state_dict(state["net"])
         print(f"initialised from {args.init}", file=sys.stderr)
         # Kept as this run's own iteration 0, as `hexn.ppo` does: the same
@@ -505,6 +511,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "torch_rng": torch.get_rng_state(),
                 "args": vars(args),
                 "config": asdict(config),
+                **hold,
             },
         )
 
@@ -517,6 +524,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         root_noise=args.root_noise,
         noise_fraction=args.noise_fraction,
         k=args.k,
+        # The worlds deal the other seats' held cards by the hold model the
+        # run's checkpoint declares (`hexn.hold`), as a served seat does.
+        hold=declared_hold(hold),
         rng=random.Random(args.seed),
     )
     expert = SearchPolicy(
@@ -554,6 +564,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     noise_fraction=args.noise_fraction,
                     play_temperature=args.play_temperature,
                     k=args.k,
+                    hold=declared_hold(hold),
                     trunk=args.collect_trunk,
                 )
                 for worker in range(args.collect_workers)
@@ -727,6 +738,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "torch_rng": torch.get_rng_state(),
                 "args": vars(args),
                 "config": asdict(config),
+                **hold,
             }
             save(latest, state)
             # The step file was this round's update; latest.pt holds it now.

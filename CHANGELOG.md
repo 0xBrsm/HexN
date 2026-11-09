@@ -2,6 +2,38 @@
 
 All notable changes to the `hexn` package are recorded here.
 
+## 0.54.0
+
+### Added
+
+- **A checkpoint declares a hold model, and its descendants carry it.**
+  A torch checkpoint's `hold` entry (`hexn.hold`; `hold_shape` and
+  `hold_scale`, as `hexset.holding.HoldModel.meta` writes them) is read by
+  `hexn.netbot.load` into `hexn.netbot.Loaded.hold`, which the network seats deal their
+  search and gate worlds by. `hexn.ppo`, `hexn.exit`, `hexn.league` and
+  `hexn.widen` write the entry their parent or resumed checkpoint carries
+  into every checkpoint they keep, both exporters copy it into the ONNX
+  file's metadata, and `hexn.hold.stamp` declares one in an existing
+  checkpoint. A checkpoint without the entry deals the worlds alike, as
+  before.
+
+### Changed
+
+- **Searched training deals its worlds by the checkpoint's hold model.**
+  `hexn.exit`'s search, in process and in every collection worker
+  (`WorkerSpec.hold`), and `hexn.benchmarks.rank`'s deal the other seats'
+  held development cards by the hold model the run's checkpoint declares
+  (`hexn.hold`), as the served network seats do, where they dealt every
+  unseen card alike. A run whose checkpoint declares none still deals alike.
+  The search targets a run trains on change with it.
+
+### Fixed
+
+- **`docs/inference.md` says what `Panel.policy` answers.** The net it
+  returns answers `score_rows` and carries `space` and `players`; the page
+  called it a `hexset.clients.policy.Policy`, which also has `act_rows` and
+  `value_rows`.
+
 ## 0.53.0
 
 ### Added

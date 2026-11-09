@@ -56,7 +56,8 @@ A worker reads through `hexn.serve.Panel(connection, paths, topology)`.
 (`score_feed`), sends one message for all of them, scores any exported
 `.onnx` file on the worker's own CPU while the server works, and reads each
 answer (`score_read`): one `score_rows` answer per net, in order.
-`panel.policy(k)` is net `k` alone as a `hexset.clients.policy.Policy`. A
+`panel.policy(k)` is net `k` alone: its `space`, `players` and
+`score_rows`, served the same way, with no `act_rows` or `value_rows`. A
 `hexset.gym.seats.PolicySeat` takes `scorer=panel.score_rows_all`, so a seat
 reading several nets makes one round trip a tick for all of them.
 `panel.stop()` ends the client and returns the server's counters.

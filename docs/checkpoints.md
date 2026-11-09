@@ -256,6 +256,20 @@ hexn.netbot network:<path> ...` (or `mcts:<path>`, `rollout:<path>`) or any
 other `hexset.arena.spawn` caller; `hexset.arena` itself never imports torch
 or this module.
 
+A checkpoint may declare a hold model under its `hold` key
+(`hexn.hold`): the pair `hold_shape`, `hold_scale` an ONNX file declares
+it by (`hexset.holding.HoldModel.meta`). The loader reads it into
+`hexn.netbot.Loaded.hold`, and the network seats deal the other seats' held
+development cards in their search and gate worlds by it, as do
+`hexn.exit`'s searches, in process and in its collection workers
+(`WorkerSpec.hold`); a checkpoint without the key deals them alike.
+`hexn.ppo`, `hexn.exit`, `hexn.league` and `hexn.widen` write the key their parent or resumed checkpoint carries into every
+checkpoint they keep, so a declared model reaches every descendant; a run
+from random weights declares none. `hexn.hold.stamp(path, model)` declares
+one in an existing checkpoint, rewriting the file through a temporary file
+and a rename, and refuses a file that already declares another. HexN
+carries no parameters of its own for it.
+
 How a loaded checkpoint is played (the bot, leaf evaluation, search, and
 trade gate) is runtime-agnostic and lives in `hexset.clients.netbot`, over
 the `hexset.clients.policy.Policy` protocol. `hexn.netbot` only supplies
@@ -334,7 +348,9 @@ HexSet's `docs/onnx.md` gives both graphs' inputs and outputs in full.
   Only when asked for on the command line: `search=mcts` with
   `simulations`/`wave`, `gate_plies` (the served trade gate's own look-ahead
   budget, independent of `--search`), and the serving keys below. A
-  contract-8 export also writes `trader` when the run trained with one.
+  contract-8 export also writes `trader` when the run trained with one, and
+  every export writes `hold_shape` and `hold_scale` when the checkpoint
+  declares a hold model (`hexn.hold`).
 - **Provenance props**, read by tooling afterward, not at runtime:
   `source_checkpoint`, `checkpoint_sha256`, `exported_at`, and
   `exporter_commit` when determinable. The digest pins the weights and the

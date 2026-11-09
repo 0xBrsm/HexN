@@ -61,8 +61,8 @@ surrogate is weighted by `min(pi_prox / pi_behaviour, 2)`, and so is the KL
 gauge (`hexn.ppo.kl_gauge`): `approx_kl`, its first-minibatch and last-epoch
 readings, `--kl-break` and the adaptive schedule all read the weighted mean
 of `expm1(r) - r` over the rows, `r` the learner-to-proximal log-ratio, so a
-row the behaviour policy sampled and the proximal one all but never would
-does not move it. `approx_kl_unweighted` logs the plain mean beside it;
+row the behaviour policy sampled but the proximal policy would almost never
+sample does not move it. `approx_kl_unweighted` logs the plain mean beside it;
 without decoupling the two are the same. On a GPU device
 the learner's update also defaults to the fused trunk (`--fused`) and fp16
 autocast (`--amp auto`); on CPU both stay off. `--update-workers

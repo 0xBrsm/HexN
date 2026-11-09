@@ -167,6 +167,7 @@ from hexset.encoding import (
     static_graph,
 )
 from hexset.game import Game, is_over, start, to_move
+from .hold import KEY as HOLD_KEY, carried as carried_hold
 from .model import HexNet, config_from_args
 from hexset.cards import DECK_SIZE
 from hexset.onnx_record import RECORD_FIELDS, record_batch, record_shapes
@@ -512,6 +513,8 @@ def _load_checkpoint(
         "iteration": int(state.get("iteration", 0)),
         # The trader the run trained with (`hexn.trade`), `None` for its own gate.
         "trader": args.get("trader") or None,
+        # The hold model the checkpoint declares (`hexn.hold`).
+        "hold": carried_hold(state).get(HOLD_KEY, {}),
     }
 
 
@@ -594,6 +597,7 @@ def _embed_metadata(
     trader: str | None = None,
     serving: dict[str, str] | None = None,
     contract: str = "8",
+    hold: dict[str, str] | None = None,
 ) -> None:
     """The facts `hexset.clients.onnxbot.load()` needs back at runtime: which
     contract the graph speaks, enough to build an `ActionSpace`, enough to
@@ -624,6 +628,8 @@ def _embed_metadata(
         "num_edges": str(topology.num_edges),
         "max_offers": "" if max_offers is None else str(max_offers),
         "iteration": str(iteration),
+        # The hold model the checkpoint declares (`hold_shape`, `hold_scale`).
+        **(hold or {}),
         **_provenance(source_checkpoint),
     }
     if search == "mcts":

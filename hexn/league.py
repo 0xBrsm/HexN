@@ -51,6 +51,7 @@ from .ppo import PPOConfig, assemble, update
 from .rewards import reward
 from .selfplay import owned
 from .trade import check_trader
+from .hold import carried as carried_hold
 from .loop import preserve_blowout, prune_recent, save
 
 # What a --learner override may set, mapped onto PPOConfig fields. Collection
@@ -303,6 +304,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         raise SystemExit("pass --base for a fresh heat or --resume to continue one")
     stored = state.get("args", {})
+    # The hold model the base declares (`hexn.hold`), written into every
+    # seat's checkpoints; a resumed heat reads it from its own.
+    hold = carried_hold(state)
     base_config = PPOConfig(
         **{
             key: value
@@ -560,6 +564,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "torch_rng": rng,
                     "args": {**stored, **{"league_overrides": args.learner[k]}},
                     "config": asdict(config),
+                    **hold,
                 }
                 save(seat_dir / "latest.pt", payload)
                 if args.keep_recent:

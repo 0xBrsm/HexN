@@ -51,6 +51,8 @@ from hexset.clients.netbot import (
 )
 from hexset.encoding import static_graph
 from hexset.contract9 import CONTRACTS as CONTRACTS9
+from hexset.holding import HoldModel
+from .hold import declared as declared_hold
 from .model import HexNet, config_from_args, packing
 from .policy import NetworkPolicy
 from .trade import recorded_budget, trade_params as _trade_params
@@ -83,6 +85,10 @@ class Loaded:
     players: int
     max_offers: int | None
     iteration: int
+    #: The hold model the checkpoint declares (`hexn.hold`), which its search
+    #: and gate worlds deal the other seats' held development cards by;
+    #: `None` deals them alike.
+    hold: HoldModel | None = None
 
     @property
     def trade_params(self):
@@ -112,6 +118,7 @@ def load(
     players = int(args.get("players", 4))
     if str(args.get("contract", "")) in CONTRACTS9:
         return _load9(state, args, topology, players, device)
+    hold = declared_hold(state)
     # The head shapes read the same way width and rounds do, and default to the
     # shape every checkpoint written before they existed was trained with. A
     # checkpoint that records a shape has to be rebuilt with it or
@@ -138,6 +145,7 @@ def load(
         players=players,
         max_offers=recorded_budget(args),
         iteration=int(state.get("iteration", 0)),
+        hold=hold,
     )
 
 
@@ -153,7 +161,7 @@ def _load9(state: dict, args: dict, topology: Topology, players: int, device: st
     net.load_state_dict(state["net"])
     net = net.to(device).eval()
     return Loaded(policy=Policy9(net, space, device=device), space=space, players=players,
-                  max_offers=0, iteration=int(state.get("iteration", 0)))
+                  max_offers=0, iteration=int(state.get("iteration", 0)), hold=declared_hold(state))
 
 
 # Registered at import, so importing this module is the whole of naming the

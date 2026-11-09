@@ -71,6 +71,7 @@ from hexset.casting import alternating  # noqa: F401
 from hexset.casting import league_rotation, paired
 from hexset.gym.lanes import BoardBots
 from hexset.contract9 import CONTRACTS as CONTRACTS9
+from hexset.holding import HoldModel
 from . import runtime
 from . import gamefile
 from .durable import Partial, write_atomic
@@ -1042,6 +1043,9 @@ class WorkerSpec:
     # the mover's own belief (`hexset.mcts.Search.worlds`); the tree never
     # roots on the true state here.
     k: int = 1
+    # How those worlds deal the other seats' held development cards: the hold
+    # model the learner's checkpoint declares (`hexn.hold`), `None` alike.
+    hold: HoldModel | None = None
     # Where sampling draws come from (`hexn.selfplay.SAMPLE_STREAMS`). "game"
     # keys every draw on `(seed, index, seat, step)`, so the games a cohort
     # plays do not depend on the worker count or the lanes.
@@ -1267,6 +1271,7 @@ def _build(spec: WorkerSpec) -> tuple[list[NetworkPolicy], Collector]:
                 root_noise=spec.root_noise,
                 noise_fraction=spec.noise_fraction,
                 k=spec.k,
+                hold=spec.hold,
                 # Per worker (`torch_seed` is), so the workers' searches do
                 # not draw the same worlds and rolls in lockstep.
                 rng=random.Random(spec.torch_seed + 991),

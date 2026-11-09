@@ -53,6 +53,7 @@ from hexset.actions import space_for
 from hexset.board.board import random_base_board
 from hexset.encoding import encode, static_graph
 from hexset.game import is_over, start
+from .hold import carried as carried_hold
 from .model import HexNet, ModelConfig, collate, config_from_args
 from hexset.play import step_randomly
 
@@ -273,6 +274,7 @@ def widen_checkpoint(
         "torch_rng": state["torch_rng"],
         "args": args,
         "config": asdict(new_config),
+        **carried_hold(state),
         "widen": {
             "source": str(source),
             "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),

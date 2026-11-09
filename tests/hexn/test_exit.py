@@ -699,6 +699,53 @@ def test_a_shard_written_before_a_crash_is_that_iterations_collection(
     assert min(later) > max(e.index for e in orphan)
 
 
+def test_a_searched_worker_deals_its_worlds_by_the_hold_model_it_is_given():
+    """A worker's search deals the other seats' held cards by `spec.hold`,
+    the hold model the learner's checkpoint declares; `None` deals alike."""
+    from hexn.collect import WorkerSpec, _build
+    from hexset.holding import HoldModel
+
+    hold = HoldModel(shape=1.0, scale=(0.5, 1.0, 0.6, 0.6, 0.7))
+    for given in (None, hold):
+        spec = WorkerSpec(
+            seed=5, players=4, lanes=1, action_cap=50, max_offers=0, first_game=0,
+            stride=1, width=8, rounds=1, torch_seed=1000, simulations=4, wave=2, k=3, hold=given,
+        )
+        _, collector = _build(spec)
+        collector.sink = kept().keep
+        assert collector.policy.search.hold == given
+
+
+def test_a_run_from_a_checkpoint_that_declares_a_hold_model_searches_and_keeps_it(
+    tmp_path, monkeypatch
+):
+    """`--init` from a checkpoint that declares a hold model (`hexn.hold`):
+    the run's search deals its worlds by it, and every checkpoint the run
+    keeps declares it; a run from random weights searches alike."""
+    from hexn.exit import __main__ as exit_main
+    from hexn.hold import declared, stamp
+    from hexset.holding import HoldModel
+
+    hold = HoldModel(shape=1.0, scale=(0.5, 1.0, 0.6, 0.6, 0.7))
+    holds = []
+    real_search = exit_main.Search
+
+    def search(*args, **kwargs):
+        holds.append(kwargs.get("hold"))
+        return real_search(*args, **kwargs)
+
+    monkeypatch.setattr(exit_main, "Search", search)
+    seed_run = tmp_path / "seed"
+    assert launch(seed_run, 1, ["--replay-positions", "0"]) == 0
+    assert holds == [None]
+    stamp(seed_run / "latest.pt", hold)
+    run = tmp_path / "run"
+    assert launch(run, 1, ["--replay-positions", "0", "--init", str(seed_run / "latest.pt")]) == 0
+    assert holds == [None, hold]
+    for name in ("iter-00000.pt", "latest.pt"):
+        assert declared(torch.load(run / name, weights_only=False)) == hold, name
+
+
 def test_without_a_store_a_resumed_iteration_plays_only_its_missing_games(
     tmp_path, monkeypatch
 ):

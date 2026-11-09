@@ -97,6 +97,7 @@ from . import (
     update,
     win_round,
 )
+from ..hold import carried as carried_hold
 from ..model import graft_fast_win
 from ..optim import adam
 from ..schedule import AdaptiveLR, current_lr, linear_anneal, set_lr, warmup
@@ -779,6 +780,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"{latest} already holds a run; resume it with --resume, or start "
             "the fresh run in an empty --checkpoint-dir"
         )
+    # The hold model the run's parent declares (`hexn.hold`), written into
+    # every checkpoint this run keeps; a run from random weights has none.
+    hold = {}
     if args.init and not (args.resume and latest.exists()):
         # Weights only. The optimiser, the iteration and the game counter are
         # this run's own and start where a fresh run's do; a supervised
@@ -787,6 +791,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         # the rounds a supervised trunk was trained with, say -- fails here,
         # loudly, rather than training a half-initialised net.
         seed_state = torch.load(args.init, map_location=args.device, weights_only=False)
+        hold = carried_hold(seed_state)
         if config.contract in CONTRACTS9 and policy.net.config.double_turn == "parts":
             # A contract-9 BC checkpoint carries the joint double-turn heads;
             # this net plays the snake seat a setup turn at a time and has none.
@@ -843,10 +848,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "args": vars(args),
                 "config": asdict(config),
                 **model_record(policy),
+                **hold,
             },
         )
     elif args.resume:
         state = torch.load(latest, map_location=args.device, weights_only=False)
+        hold = carried_hold(state)
         policy.net.load_state_dict(state["net"])
         optimiser = bind_optimiser(policy.net, optimiser, args)
         optimiser.load_state_dict(state["optimiser"])
@@ -1320,6 +1327,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "config": asdict(config),
                 **model_record(policy),
                 **({"scaler": scaler.state_dict()} if scaler is not None else {}),
+                **hold,
             }
             save(latest, state)
             # The step file was this iteration's update; latest.pt holds it now.

@@ -743,6 +743,7 @@ def main(argv: list[str] | None = None) -> int:
             simulations=args.simulations,
             wave=args.wave,
             exploration=args.exploration,
+            hold=loaded.hold,
             rng=random.Random(args.seed + 9001),
         )
         if args.simulations

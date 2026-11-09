@@ -440,3 +440,27 @@ def test_a_two_seat_checkpoint_plays_whole_duels_at_a_table_dealt_four(tmp_path,
     assert result.games == 4
     assert sum(s.wins for s in result.standings) + result.unfinished == 4
     assert len([line for line in (tmp_path / "duels.games.jsonl").read_text().splitlines() if '"kind":"game"' in line]) == 4
+
+
+def test_a_declared_hold_model_reaches_the_torch_seat_the_export_and_the_onnx_seat(tmp_path):
+    """A checkpoint's `hold` entry (`hexn.hold`) is read by the torch loader,
+    written into the exported file's metadata and read back by HexSet's
+    loader; a checkpoint without one declares none in every form."""
+    from hexn.hold import carried, declared, stamp
+    from hexn.netbot import load as torch_load
+    from hexset.holding import HoldModel
+
+    hold = HoldModel(shape=1.0, scale=(0.5, 1.0, 0.6, 0.6, 0.7))
+    board = _deal(0, 0)._state.board
+    plain = a_checkpoint(tmp_path / "plain.pt", PARTS)
+    held = tmp_path / "held.pt"
+    assert stamp(plain, hold, held) == hashlib.sha256(held.read_bytes()).hexdigest()
+    assert declared(torch.load(held, weights_only=False)) == hold
+    assert carried(torch.load(plain, weights_only=False)) == {}
+    assert stamp(held, hold) == hashlib.sha256(held.read_bytes()).hexdigest()   # again: the same model
+    with pytest.raises(ValueError):
+        stamp(held, HoldModel(shape=2.0, scale=(0.9,) * 5))
+    for source, expected in ((plain, None), (held, hold)):
+        assert torch_load(str(source), board.topology).hold == expected
+        out = export9(str(source), tmp_path / f"{source.stem}.onnx")
+        assert load(str(out), board.topology).hold == expected
