@@ -2,6 +2,70 @@
 
 All notable changes to the `hexn` package are recorded here.
 
+## 0.55.0
+
+### Breaking
+
+- **`hexn.netbot.load` plays a contract-9 checkpoint through ONNX.** On
+  the CPU, a contract-9 `.pt` is exported once (`onnx_of`, the export's
+  parity check on) into `HEXN_ONNX_CACHE` (default `~/.cache/hexn/onnx`),
+  keyed by the checkpoint's sha256 and the exporter's and model's source,
+  and returned as `hexset.clients.onnxbot.load` returns it: the same
+  decisions as the torch net. Every entrant the arena seats (`network:`, `mcts:`,
+  `rollout:`) loads this way. `hexn.netbot.load_torch` returns the torch
+  net (`Loaded`, its `policy.net`) for training and for code that reads
+  inside the net, and takes `compile_mode`, which `load` no longer does. An
+  older contract's `.pt`, or a net on another device, `load` still rebuilds
+  in torch.
+
+### Added
+
+- **`hexn.ppo` takes a bf16 update (`--amp bf16`, `PPOConfig.amp="bf16"`).**
+  The update's forward and backward run under bf16 autocast and the
+  optimiser steps without a gradient scaler, so no step is skipped for a
+  gradient outside half precision's range. It requires `decoupled`: the
+  clip is centred on proximal log-probs `attach_proximal` computes under the
+  same autocast. Observations stay float32 in the batch.
+
+- **`hexn.export_onnx --robber-hits`** writes `robber_hits=1`
+  (`serving_props(robber_hits=True)`): the served file's robber moves stay
+  on other seats' hexes where one is legal.
+
+- **`hexn.netbot.load` seats an ONNX export.** A path ending `.onnx` loads
+  through `hexset.clients.onnxbot.load` on one onnxruntime thread, so a
+  process that registered HexN's loader seats an exported checkpoint under
+  `network:`, `mcts:` and `rollout:` as well as a `.pt`.
+
+### Fixed
+
+- **A contract-11d robber placement or discard has no type score.** A
+  position offering either offers that type of move alone, so its type
+  score was one number shared by every option. `robber_logits`, `discard_scores` and the flat discard
+  slots now leave it out, as `model9.UNTYPED` names; every decision's
+  log-probabilities are unchanged in fp32.
+
+- **`decision_entropy` passes a finite gradient for a decision whose
+  log-sum-exp is far below zero.** Its expectation zeroed illegal scores but
+  still took `exp(0 - total)` there, which overflows once a row's total is
+  below about -88.7; the dropped branch then sent 0 x inf = NaN back through
+  the whole update, in any precision. The exponent is now zeroed with the
+  score.
+
+- **A contract-9 decision row with no finite Road Building or discard score
+  no longer poisons the update.** `decision_scores`' per-row log-sum-exp
+  took the log of a zero sum for such a row; its 0/0 gradient reached every
+  weight through the candidates' gather, so an fp16 update skipped its step
+  and halved its loss scale. The row still scores `-inf` and now passes back
+  a zero gradient.
+
+- **A contract-11d setup move has no type score.** A setup position offers
+  setup moves alone, so the setup settlement's and setup road's type scores
+  were one number shared by every option, and under bf16 autocast a large
+  one rounded away the query-key reads that rank the options. The flat logits of
+  `SETUP_SETTLEMENT` and `SETUP_ROAD`, `setup_scores` and a joint net's
+  first turn now leave the type out. In fp32 every decision's probabilities
+  are unchanged, and existing checkpoints load as before.
+
 ## 0.54.0
 
 ### Added
@@ -673,12 +737,11 @@ All notable changes to the `hexn` package are recorded here.
 - **A "parts" contract-9 net has no joint double-turn head.** `HexNet`
   builds the first, second and pair heads only under
   `ModelConfig.double_turn="joint"` (contract-9 BC); the net PPO trains plays
-  the snake seat a setup turn at a time and carried 4,354 parameters nothing
-  read. `--init` from a BC checkpoint drops them (`model9.without_joint_head`,
-  logged), so a PPO checkpoint holds only what it plays with. The BC
-  checkpoints in the model store are unchanged and still load as "joint".
+  the snake seat a setup turn at a time. `--init` from a BC checkpoint drops
+  them (`model9.without_joint_head`, logged), so a PPO checkpoint holds only
+  what it plays with. Existing BC checkpoints still load as "joint".
 
-- **Contract-9 self-play collects for less.** `NetworkPolicy9.act` runs its
+- **Contract-9 self-play's forward does less work.** `NetworkPolicy9.act` runs its
   forward under `torch.inference_mode`; without grad, `model9.HexNet` reads
   node owners and road ends by `index_select` (`_pick`) rather than advanced
   indexing, and `decision_scores` skips the Road Building and discard heads
@@ -721,8 +784,7 @@ All notable changes to the `hexn` package are recorded here.
 ### Fixed
 
 - The contract-9 surrogate (`decision_surrogate`) caps the log-ratio it
-  exponentiates at `RATIO_LOG_CAP`, as the contract-8 path has since 0.41.0;
-  the two landed in parallel and the cap did not reach the decision path.
+  exponentiates at `RATIO_LOG_CAP`, as the contract-8 path has since 0.41.0.
   A decision moved past float32's `exp` range within an update made the
   loss NaN.
 
@@ -843,8 +905,8 @@ All notable changes to the `hexn` package are recorded here.
 
 - `--collect-trunk {reference,fused}` and `--collect-precision {fp32,bf16}`
   (`WorkerSpec.trunk`, `WorkerSpec.precision`, `NetworkPolicy.precision`):
-  the collect workers' forward. The trunk is speed only: `fused` is the
-  same numbers as dense GEMMs up to float reassociation. The precision is the
+  the collect workers' forward. `fused` computes the same numbers as dense
+  GEMMs up to float reassociation. The precision is the
   autocast `act` samples under. Under `bf16` the logits, and the recorded
   value, come back to fp32 before the softmax, so the recorded log-probability
   is the exact fp32 log-softmax of the logits the policy sampled from. That
@@ -863,9 +925,8 @@ All notable changes to the `hexn` package are recorded here.
   (`hexn.policy.keyed_gumbel`), so a game is a pure function of its index and
   the weights however collection is sharded, batched or resumed. `worker`
   keeps each collector's own generator, under which a game's sampled actions
-  depend on the worker count, the lanes and which games shared a batch; it
-  is what every earlier run used, and what `WorkerSpec` and `Collector` still
-  default to. A searched worker refuses `game`.
+  depend on the worker count, the lanes and which games shared a batch;
+  `WorkerSpec` and `Collector` still default to it. A searched worker refuses `game`.
 
 - `hexn.run.manifest.ADDED`: per mode, the parameters added after manifests
   were being frozen, each with the value that reproduces the code's
@@ -930,7 +991,7 @@ All notable changes to the `hexn` package are recorded here.
   For the common configuration the helper decodes the cohort into arrays
   (`hexn.gamefile.decode_columns`) and assembles it without a per-position
   object (`hexn.ppo.prepare.prepare_columns`), bit-identical to the object
-  path and about twice as fast. It covers GAE with or without `decided_cut`
+  path. It covers GAE with or without `decided_cut`
   and `setup_weight`, and no fast-win, per-VP, pair or coalition terms; any
   other configuration takes the object path.
 
@@ -961,7 +1022,7 @@ All notable changes to the `hexn` package are recorded here.
   before the next collection lands, and the league trainer lets go of an
   iteration's games and batch before the next collection.
 
-- The validated speed and collection settings are now the defaults; each
+- The speed and collection settings are now the defaults; each
   keeps an explicit off switch. `--fused` (now `--fused/--no-fused`) is on
   when `--device` is a GPU. `--amp` defaults to `auto`, meaning fp16 on a
   GPU and fp32 on CPU; `off` (or `''`) keeps fp32. `--async-collect`
@@ -1013,14 +1074,12 @@ All notable changes to the `hexn` package are recorded here.
   Its collectors refused to build ("a caster without opponents has nobody to
   cast"); they now run without a caster, which seats the learner everywhere,
   and the mix still deals its duel-variant games.
-- `hexn.coalition` documents what `Targeted` does without a claim about
-  how tables behave.
+- `hexn.coalition`'s docstrings describe what `Targeted` does.
 - The coalition-mix tests skip without PyTorch, like the rest of the
   torch-dependent suite, instead of failing collection.
 - The distillation test asserts that repeated updates cut the loss, and no
   longer that argmax agreement rises: the loss is a cross-entropy to the
-  search's soft visit distribution, which can fall while the argmax wanders,
-  and on HexSet 1.10.0's deal of the test's two games it does.
+  search's soft visit distribution, which can fall while the argmax wanders.
 
 ## 0.37.0
 
@@ -1069,10 +1128,8 @@ Trains against HexSet 1.2.0.
 - The `hexset` submodule moves to HexSet 1.2.0, which ships the coalition
   test opponent: `hexset.bots.Coalition` around any bot, the
   `coalition:<entrant>` spec, the `PlaysAgainst` hook, and a
-  `hexset.mcts.Search` that plays as one side against named seats. The bots
-  submodule moves to the release where `heximax` and `rehex` implement
-  `play_against` and the runtime registers the `coalition` preset
-  (`coalition:rehex`). Nothing in `hexn` changes.
+  `hexset.mcts.Search` that plays as one side against named seats. Nothing
+  in `hexn` changes.
 
 ## 0.35.0
 
@@ -1315,8 +1372,8 @@ Needs a HexSet with `hexset.bots.TradesBy` (0.91.0 or later) for `--trader`.
 
 Breaks clients: `max_trades` is `max_offers` throughout, and it is now the
 network's own offer budget rather than a table-wide trade switch. Default
-runs trade under HexSet's current rules, so they do not reproduce numbers
-from 0.24.0 and earlier.
+runs trade under HexSet's current rules, so their games differ from those of
+0.24.0 and earlier.
 
 ### Added
 
@@ -1398,7 +1455,7 @@ from 0.24.0 and earlier.
 - **`hexn.exit --resume` with no `latest.pt` refuses** instead of starting
   fresh, and `hexn.exit` and `hexn.ppo` refuse a fresh start into a
   `--checkpoint-dir` that holds a `latest.pt`.
-- **A resumed `hexn.league` heat** restores each seat's own `PPOConfig` (an
+- **A resumed `hexn.league` run** restores each seat's own `PPOConfig` (an
   entropy controller's coefficient included) and the torch RNG, sums its
   standings over the rows before the iteration it resumes at, and steps
   seats whose saves a crash split back to the iteration all of them reached.
@@ -1407,11 +1464,11 @@ from 0.24.0 and earlier.
 
 ## 0.23.6
 
-No behaviour change. The test suite is smaller and faster.
+No behaviour change. The test suite is smaller.
 
 ### Changed
 
-- **`tests/hexn` is smaller and faster.** Duplicate tests are removed, and
+- **`tests/hexn` is smaller.** Duplicate tests are removed, and
   the collection, search and training tests share module-scoped games and
   worker pools. `test_expert.py` no longer needs `torch`.
 
@@ -1420,24 +1477,19 @@ No behaviour change. The test suite is smaller and faster.
 ### Fixed
 
 - **`hexn.__version__` reports the package's version.** It was a literal
-  `"0.1.0"`, so every release since then reported the wrong number to
-  anything that asked. It is now read from `pyproject.toml`, the one place
-  the version lives, falling back to installed metadata for a wheel.
+  `"0.1.0"`. It is now read from `pyproject.toml`, falling back to installed metadata for a wheel.
   `tests/hexn/test_versions.py` checks the two agree.
 
 ## 0.23.4
 
-No behaviour change. Three comments and docstrings read as notes to the
-people who wrote them rather than to someone reading the published code.
+No behaviour change. Three comments and docstrings are reworded.
 
 ### Changed
 
 - **`export_onnx`'s contract-version comment** states the current contract
-  ("6") instead of the change request that introduced it.
-- **`league`'s usage example** names generic checkpoint and output paths
-  instead of specific local runs.
-- **`tests/hexn/_mcts_fixtures.py`'s docstring** says what the module is for
-  instead of recounting when it was trimmed.
+  ("6").
+- **`league`'s usage example** names generic checkpoint and output paths.
+- **`tests/hexn/_mcts_fixtures.py`'s docstring** says what the module is for.
 
 ## 0.23.3
 
@@ -1463,8 +1515,7 @@ people who wrote them rather than to someone reading the published code.
 
 - **`hexn.export_onnx` names the engine it serves.** Its `--help` text,
   docstrings and comments referred to `hexset-ui` and to modules under a
-  `hexset_ui` package; both were retired when that stack was renamed. They
-  now name `hexset`, `hexset.clients.onnxbot` and `hexset.clients.modelmeta`.
+  `hexset_ui` package, neither of which exists. They now name `hexset`, `hexset.clients.onnxbot` and `hexset.clients.modelmeta`.
   Comments citing `onnxbot._masked_log_softmax`, `onnxbot._board_order`,
   `onnxbot.Request` and `onnxbot.OnnxPolicy` now say that those belonged to
   the contract-1 serving path and were removed with it.
@@ -1500,28 +1551,21 @@ people who wrote them rather than to someone reading the published code.
 
 ## 0.23.1
 
-A patch repin onto the first release of the public HexSet repository.
-
-The engine now has one: `0xBrsm/HexSet` was created on 2026-09-15 as the
-published half of HexSet's private/public split, and `0.58.1` is its first
-release -- a single squashed commit whose tree is the development repository's
-`src/`, carrying none of that repository's history, branch names or commit
-messages.
+A patch repin onto HexSet 0.58.1, the first release of the public HexSet
+repository (`0xBrsm/HexSet`).
 
 ### Changed
 
 - **The engine pin names a commit that exists.** Both references -- the
   `hexset` submodule gitlink and the `hexset @ git+...` requirement in
   `pyproject.toml` -- move to `b8f63dc4`, the commit `0.58.1` tags in the
-  public engine repository. They previously named a commit that resolved only
-  in a repository since deleted, so a fresh clone could not fetch the engine
-  at all.
+  public engine repository. They previously named a commit that a fresh
+  clone could not fetch.
 
-  The requirement names the commit rather than the tag deliberately:
-  `tests/hexn/test_engine_pin.py` keeps the two pins in step by comparing the
-  requirement's SHA against the submodule gitlink, which is a SHA, and a tag
-  cannot be resolved to one without the network. The tag is the readable
-  handle; the SHA is the one a test can check offline.
+  The requirement names the commit, not the tag:
+  `tests/hexn/test_engine_pin.py` compares the requirement's SHA with the
+  submodule gitlink offline, and a tag cannot be resolved to a SHA without
+  the network.
 - **The engine moves 0.57.0 -> 0.58.1.** 0.58.0 collapsed HexSet's three game
   loops into one and gave `record.record_game` `trade_mode`/`max_trades`
   keywords whose defaults are the behaviour it had before, so nothing here
@@ -1530,8 +1574,7 @@ messages.
 
 ## 0.23.0
 
-The table pool can now seat the learner itself, plain or tempered, so a run
-can collect fully pooled without giving up self-play's position volume; the
+The table pool can now seat the learner itself, plain or tempered; the
 Catanatron bridge scripts are gone with the bridge; and the engine pin moves
 to HexSet 0.56.0, which removed that bridge and keeps the adapter.
 
@@ -1545,19 +1588,18 @@ to HexSet 0.56.0, which removed that bridge and keeps the adapter.
   self-play under another name). Pools without `self` cast exactly as
   before; the opponent id law is unchanged.
 - `self~<band>` in a table pool: the learner's pool-drawn copies play at a
-  sampling temperature drawn per seat per game from `[1 - band, 1 + band]`,
-  so the seat the table draw seated first (kept at 1.0) meets tablemates
-  that build, hold and trade a little unlike itself. Tempered seats are
+  sampling temperature drawn per seat per game from `[1 - band, 1 + band]`;
+  the seat the table draw seated first stays at 1.0. Tempered seats are
   still cast id 0 and still trained on: `NetworkPolicy.act` records the
   log-probability under the tempered distribution (`Request.temperature`),
   so the PPO ratio is exact and the clip bounds the pull. Off unless asked
   for; the band's draws come after every seat is cast, so no existing
-  cast changes. `approx_kl` will read a tempered cohort's temperature gap as
-  divergence, which is what it is.
+  cast changes. `approx_kl` counts a tempered cohort's temperature gap as
+  divergence.
 
 ### Removed
 
-- The Catanatron bridge readout scripts, which drove `DC:` entrants through
+- The Catanatron bridge scripts, which drove `DC:` entrants through
   `hexset.catanatron.duel` -- removed from HexSet itself. Read a Catanatron
   reference opponent through the adapter instead, e.g.
   `python -m hexset.bench.duel <entrant> catanatron`.
@@ -1576,8 +1618,7 @@ to HexSet 0.56.0, which removed that bridge and keeps the adapter.
 - `pyproject.toml` declares the licence (`GPL-3.0-only`) and Python
   classifiers, so the built distribution carries them in its metadata.
 - The `hexn.benchmarks` modules take relative example paths as their
-  `--checkpoint` and `--json` defaults; they previously defaulted to
-  absolute paths from one machine.
+  `--checkpoint` and `--json` defaults, where they had absolute paths.
 - `PPOConfig` rejects an unknown `reward` with "no other supported mode".
 
 
@@ -1680,11 +1721,9 @@ and `__main__.py` the runnable loop.
   are `ppo`/`league`/`exit`, `python -m hexn.run.init --mode train` and
   `--mode distill` are gone, and a frozen run's config file is named after
   its mode (`config/ppo.json`, `config/exit.json`) same as before.
-- Every tracked manifest under `runs/` is rewritten: 46 `"mode": "train"` ->
-  `"ppo"`, one `"mode": "distill"` -> `"exit"` (the only `exit` run on
-  record), their `config/train.json`/`config/distill.json` renamed
-  alongside. A script did the rewrite, kept for the next time a mode gets
-  renamed.
+- A run frozen under the old modes loads once its manifest says
+  `"mode": "ppo"` for `"train"` and `"exit"` for `"distill"`, with
+  `config/train.json` and `config/distill.json` renamed to match.
 - The launch scripts and the docs that named the old modules point at
   `hexn.ppo` and `hexn.exit` now.
 
@@ -1704,16 +1743,14 @@ exhaustive clearing house.
 - Engine pinned to HexSet 0.50.0. Trading defaults to
   `Game.trade_mode="round"` with `max_trades=1`: the acting seat puts one
   offer to the table a turn, every other seat answers once, the actor picks.
-  The exhaustive clearing house (`trade_mode="auto"`) remains available for
-  reproducing studies recorded under it. `Game.max_trades` is an `int`:
+  The exhaustive clearing house (`trade_mode="auto"`) remains available. `Game.max_trades` is an `int`:
   `0` disables trading, `-1` leaves a turn's rounds uncapped. Version
   0.20.0 → 0.21.0.
 - `--max-trades` on `hexn.train`, `hexn.distill_train`, `hexn.league` and the
   benchmark drivers: omitted now means the engine's default of one round a
   turn, not an unbounded table; `-1` is the uncapped form. Help text says so.
 - `hexn.migrate`'s win-temperature fit sets `trade_mode="auto"` and
-  `max_trades=-1` explicitly, reproducing the contract-5 protocol it was
-  measured under.
+  `max_trades=-1` explicitly.
 - Heximax is one policy on this engine: the `heximax-notrade`,
   `heximax-balanced` and adaptive presets are gone, `heximax` and
   `heximax:pin-weights=1` remain. Docstrings and the table-pool test name
@@ -1755,25 +1792,16 @@ It is a minor bump: the `greedy` ladder rung and mix name are gone, and
   deleted `search2`, and `hexset.bots.greedy` was its depth-1 bot. No name is
   re-pointed at another bot -- a mix name that silently changed which opponent
   a run trained against is exactly what `RESERVED_MIX` exists to prevent -- so
-  `--mix greedy=...` is an unknown name now, and a recipe that wants a
-  handcrafted opponent says `heximax` and means it. `parent` is the only rung
-  a run still gets automatically; `--search-rung heximax` is the handcrafted
-  one, opt-in. Every ladder reading before this release was against a bot that
-  no longer exists, so the discontinuity is named rather than papered over.
+  `--mix greedy=...` is an unknown name now; name `heximax` for a
+  handcrafted opponent. `parent` is the only rung a run still gets
+  automatically; `--search-rung heximax` adds the handcrafted one.
 - `hexn.collect.greedy_opponent`, with the bot it built.
 - **`hexn.duel`, the module.** Its versus backend (`_via_versus`, `side`,
   `entrant_seed`) went with the removed
-  `hexset.bench.duel.register_versus_backend` -- `hexset.bench.duel` has one
-  path now, `arena.compete` -- and what that left was a 39-line module whose
-  two lines of code imported `hexn.netbot` and called HexSet's `main`. HexSet
-  0.48.0's `--runtime <module>` is that import, made where the entrant is
-  resolved, so there is nothing left for a wrapper to do.
-
-  It is also strictly better placed than the wrapper was. Entrants are spawned
-  inside the pool, and `--runtime` reaches it as `arena.compete`'s
-  `worker_initializer`; the wrapper only ever covered a worker because fork is
-  the Linux default, and would not have covered one under spawn or forkserver
-  at all.
+  `hexset.bench.duel.register_versus_backend`. Run
+  `python -m hexset.bench.duel --runtime hexn.netbot` instead: `--runtime`
+  imports `hexn.netbot` in every pool worker through `arena.compete`'s
+  `worker_initializer`, under any start method.
 - The `hexn.netbot` re-exports of `NetworkEvaluator` and `evaluator_for`, and
   the `evaluator_max_trades=0` it passed `register_entrants`. Both were the
   network *evaluator* adapting a value head to `search2`'s leaves; the
@@ -1789,8 +1817,8 @@ It is a minor bump: the `greedy` ladder rung and mix name are gone, and
 
 ### Changed
 
-- A network duellist is `hexset.bench.versus.PolicyPolicy` now (`train._Gated` over a `train._Checkpoint`), gated by the run's own trade budget through `compete_batched`'s three-argument gate form rather than a value bound in `train.duellist` at construction. `train.duellist` takes no `max_trades` parameter any more. `_Gated` also seats the gate itself, working around a HexSet gap where `PolicyPolicy.gate` built its checkpoint's `NetworkBot` without seating it, pricing every candidate at -1.0; fixed upstream in 0.19.10.
-- `hexn.replay.replay_to_ply` is `hexset.record.replay_to(episode.record, ply)`: `hexn.selfplay.Collector` deals every game with `records=True`, so an `Episode` already carries the engine's own `hexset.record.Record` of the whole game, and re-deriving a position from `(seed, index)` plus a hand-rolled walk of `episode.stream()` and `hexset.record.advance` was a second derivation of that one replay path. The refusal for an episode whose `cast` seats an opponent is unchanged.
+- A network duellist is `hexset.bench.versus.PolicyPolicy` now (`train._Gated` over a `train._Checkpoint`), gated by the run's own trade budget through `compete_batched`'s three-argument gate form rather than a value bound in `train.duellist` at construction. `train.duellist` takes no `max_trades` parameter any more. `_Gated` also seats the gate, which `PolicyPolicy.gate` did not (see 0.19.10).
+- `hexn.replay.replay_to_ply` is `hexset.record.replay_to(episode.record, ply)`: `hexn.selfplay.Collector` deals every game with `records=True`, so an `Episode` already carries the engine's own `hexset.record.Record` of the whole game. The refusal for an episode whose `cast` seats an opponent is unchanged.
 
 ### Added
 
@@ -1814,12 +1842,12 @@ It is a minor bump: the `greedy` ladder rung and mix name are gone, and
 - `hexn.train.versus`, `ladder` and `duel` run on `hexset.bench.versus.compete_batched`: HexSet owns the cohorts, the board pairing, the seat complement, `arena.wilson` and `arena.mean_interval`, and hexn supplies the lineup, the cast and the cohort size. The reported dict is `Verdict.metrics()`, key for key what `versus` returned, plus `truncated` (a game the action cap stopped, which `exhausted` was never folded with) and, on the unpaired path, `boards`/`antithetic`.
 - Duel casts are unchanged: `versus` still passes `hexset.casting.alternating`, whose antithetic complement `swapped(alternating(n))` is `alternating(n, flip=True)`, so the boards played and the games played match exactly what a duel produced before. The paired-VP interval moves in the fifth decimal, and only there: `arena.mean_interval` uses the arena's `Z_95 = 1.959964` where hexn had written `1.96`.
 - `hexn.train.duel` plays `hexset.bots.RandomBot` behind a `BotPolicy` instead of `hexn.selfplay.RandomPolicy`. Same uniform choice and the same refusal to trade, and one bot per board rather than one stream shared across lanes, so the reading no longer depends on how the lanes were scheduled. It keeps `decided`, `expected_share` and `mean_relative_points` alongside the verdict's own keys.
-- `hexn.duel`'s `--workers 1` backend and the in-loop ladder are now the same measurement made from the same code, since both are `train.versus`.
+- `hexn.duel`'s `--workers 1` backend and the in-loop ladder both run `train.versus`.
 - `hexn.train.duellist` is the one adapter: a `hexset.gym.lanes.BoardBots` bench becomes HexSet's `BotPolicy` from the bench's own spawn law, and a network is asked for `hexset.clients.policy.Policy.act_rows` -- the seam the engine's bot, search and trade gate already share -- at one forward per tick.
 
 ### Removed
 
-- `hexn.train._antithetic`, `_paired` and `MixedPolicy`, and with them hexn's own two-cohort harness, per-board averaging, seat-complement caster, win counting, Wilson call and normal interval. Every one of those was a second derivation of a law HexSet already states, which is how two evaluations of the same pair come to disagree about what they measured.
+- `hexn.train._antithetic`, `_paired` and `MixedPolicy`, and with them hexn's own two-cohort harness, per-board averaging, seat-complement caster, win counting, Wilson call and normal interval: HexSet provides each of them.
 
 ## 0.19.6
 
@@ -1834,13 +1862,13 @@ It is a minor bump: the `greedy` ladder rung and mix name are gone, and
 
 ### Removed
 
-- `hexn.selfplay.new_game`, `_Lane`, `BotPolicy`, `action_mask`, the lane refill, the action cap, the `Stuck` guard, the per-turn trade census and the outcome construction -- all of them the engine's, and every one of them a copy that could drift from what it mirrored.
+- `hexn.selfplay.new_game`, `_Lane`, `BotPolicy`, `action_mask`, the lane refill, the action cap, the `Stuck` guard, the per-turn trade census and the outcome construction: the engine provides each of them.
 
 ## 0.19.5
 
 ### Changed
 
-- Engine pinned to HexSet 0.44.3: a trade event ends at a revisited position instead of asserting, which self-play against a network checkpoint tripped on the distillation test. Version 0.19.4 → 0.19.5; nothing in hexn changes.
+- Engine pinned to HexSet 0.44.3: a trade event ends at a revisited position instead of asserting. Version 0.19.4 → 0.19.5; nothing in hexn changes.
 
 ## 0.19.4
 
@@ -1901,7 +1929,7 @@ It is a minor bump: the `greedy` ladder rung and mix name are gone, and
 
 ### Changed
 
-- Engine pinned to HexSet 0.41.0: `hexset.clients.policy.Policy` and the runtime-free `hexset.clients.netbot`, `hexset.gym.lanes` with the one game law `arena.deal_game`, `encoding.to_frame`/`from_frame`, `encoding.global_columns`, `hexset.casting` -- the HexSet half of the boundary audit. Version 0.18.1 → 0.18.2; nothing in hexn changes yet.
+- Engine pinned to HexSet 0.41.0: `hexset.clients.policy.Policy` and the runtime-free `hexset.clients.netbot`, `hexset.gym.lanes` with the one game law `arena.deal_game`, `encoding.to_frame`/`from_frame`, `encoding.global_columns`, `hexset.casting`. Version 0.18.1 → 0.18.2; nothing in hexn changes yet.
 
 ## 0.18.1
 
@@ -1932,7 +1960,7 @@ It is a minor bump: the `greedy` ladder rung and mix name are gone, and
 
 ### Changed
 
-- Engine pinned to HexSet 0.37.0 plus its unreleased changes: heximax's `omniscient` mode and the `heximax-omni` preset are gone (`heximax.MODES` is `("honest", "notrade")`); `default_offer` requires both floors so a bot offers only what it would take; the trade round is one collapsed log line over discrete journal notes; passes are answers; closed seats are fixed at the first move (`POST /api/open`); a checkpoint served with `search: mcts` trades through its own value-head gate (`GatedSearch`). Here: the `heximax-omni` mode's readout scripts are retired, one of them (an omni readout) deleted outright; version 0.17.2 → 0.17.3.
+- Engine pinned to HexSet 0.37.0 plus its unreleased changes: heximax's `omniscient` mode and the `heximax-omni` preset are gone (`heximax.MODES` is `("honest", "notrade")`); `default_offer` requires both floors so a bot offers only what it would take; the trade round is one collapsed log line over discrete journal notes; passes are answers; closed seats are fixed at the first move (`POST /api/open`); a checkpoint served with `search: mcts` trades through its own value-head gate (`GatedSearch`). Version 0.17.2 → 0.17.3.
 
 ## 0.17.2
 
@@ -1944,20 +1972,20 @@ It is a minor bump: the `greedy` ladder rung and mix name are gone, and
 
 ### Changed
 
-- Engine pinned to HexSet 0.36.0: the trade round end to end on the served table — multi-card offers, counters, held bot turns — with the redesigned trade modal (state-named titles, one 44px icon button size, the acceptance pane in seat order). `hexn` itself is unchanged.
+- Engine pinned to HexSet 0.36.0: the trade round end to end on the served table (multi-card offers, counters, held bot turns), with the redesigned trade modal (state-named titles, one 44px icon button size, the acceptance pane in seat order). `hexn` itself is unchanged.
 
 ## 0.17.0
 
 ### Changed
 
 - The package is renamed `hexn` (was `hexnet`); version 0.16.1 → 0.17.0.
-  `import hexnet` is gone — no alias, no shim.
+  `import hexnet` is gone, with no alias.
 
 ## 0.16.1
 
 ### Changed
 
-- Engine pinned to HexSet 0.35.1: the public repo's research readouts, dated design drafts and one-off bench instruments moved into this repository; the simultaneous discard round (records carry `actors`). `hexn` itself is unchanged.
+- Engine pinned to HexSet 0.35.1: the simultaneous discard round (records carry `actors`). `hexn` itself is unchanged.
 
 ## 0.16.0
 
@@ -2001,13 +2029,11 @@ It is a minor bump: the `greedy` ladder rung and mix name are gone, and
   unimplemented stances are refused rather than silently scored.
 - `hexn.ppo.update` and `hexn.distill.update` no longer convert a
   minibatch's policy/value/entropy/KL/clip/grad-norm scalars to Python floats
-  inside the minibatch loop -- each `float(...)` call was a blocking
-  device->host sync (`hipMemcpyWithStream`). `hexn.ppo.Terms`'s scalar fields
+  inside the minibatch loop. `hexn.ppo.Terms`'s scalar fields
   are device tensors now, accumulated across an update and read back once;
   the update reads its statistics back once per epoch (or once per update)
   instead of once per minibatch. `hexn.ddp`'s workers convert `Terms` to
-  floats the same way they always did -- a worker is a single CPU process,
-  so that read was never the sync this was about.
+  floats as before.
 
 ## 0.15.1
 
@@ -2021,8 +2047,7 @@ It is a minor bump: the `greedy` ladder rung and mix name are gone, and
   against `Prediction.value_logits`, matching `hexn.ppo` term for term,
   including its quantile-head branch. `hexn.distill.Stats` gains
   `value_mse`, the squared error of `Prediction.value` against the target,
-  logged next to the cross-entropy loss for comparison across value-head
-  shapes. `hexn.policy.NetworkPolicy.distributions` now also returns
+  logged next to the cross-entropy loss. `hexn.policy.NetworkPolicy.distributions` now also returns
   `value_logits` and `quantiles` alongside the win probability and the
   policy log-probs.
 
@@ -2033,23 +2058,22 @@ It is a minor bump: the `greedy` ladder rung and mix name are gone, and
 - `hexn.store.EpisodeStore`: a disk-backed replay store for
   `hexn.distill_train`, one shard (`<checkpoint-dir>/replay/iter-
   NNNNN.pkl`) per iteration, retaining the last `--replay-positions`
-  positions (default `300000`) and evicting whole iterations oldest-first —
+  positions (default `300000`) and evicting whole iterations oldest-first;
   the freshest iteration is never evicted on its own arrival. `--resume`
   reloads it from disk. Replaces the in-memory `deque[Batch]` window.
 - `hexn.reanalyse.reanalyse`: re-searches a sample of stored positions
   (`--reanalyse-samples`, default `3656`) over the *current* net every
-  iteration and replaces their stale visit target before assembly, so a row's label keeps
-  improving instead of ageing with the net that first searched it. Logged
+  iteration and replaces their visit target before assembly. Logged
   per iteration as `reanalysed_positions` and `reanalyse_kl`.
 - `hexn.replay.replay_to_ply(episode, ply)`: rebuilds an episode's live
   `Game` at any ply from its `(seed, index)` and its recorded action and
-  trade streams — the reconstruction `hexn.reanalyse` searches over.
+  trade streams, the reconstruction `hexn.reanalyse` searches over.
 - `hexn.expert.target_for(search, root, options, visits)`: the `Target`
   construction factored out of `SearchPolicy._choice` so a freshly searched
   root (a collector's own decision, or `hexn.reanalyse`'s re-search of a
   stored one) builds the same object either way.
 - `hexn.selfplay.Episode.trades`: every exchange the table's trade event
-  cleared over the whole game, `(step, a, b, received)` — the shape
+  cleared over the whole game, `(step, a, b, received)`, the shape
   `hexset.record.Record.trades` already uses. Needed to replay a game
   bit-exactly: the engine's own trade event depends on `game.gates`, which a
   replay never seats, so the recorded exchanges are re-applied explicitly
@@ -2065,9 +2089,7 @@ It is a minor bump: the `greedy` ladder rung and mix name are gone, and
 
 ## 0.14.4
 
-Cut with an engine repin (a trade moves at most three cards a side); that
-work's entry was reworded afterwards and is filed under the release that
-carried the rewording.
+An engine repin: a trade moves at most three cards a side (see 0.14.2).
 
 ## 0.14.3
 
@@ -2088,14 +2110,12 @@ carried the rewording.
   both private gains exceed `hexset.trading.TRADE_FLOOR`, now `0.0197` win
   probability; the trade event fires once a turn, on the transition into MAIN, no longer
   after every MAIN action; and a trade moves at most three cards a side
-  (`hexset.trading.MAX_TRADE_CARDS`). Self-play games trade rarely and
-  `trades_per_turn` is read on that cadence.
+  (`hexset.trading.MAX_TRADE_CARDS`). `trades_per_turn` counts on that
+  cadence.
 
 ## 0.14.1
 
-Cut with an engine repin (a clearing floor, one trade event per turn); that
-work's entry was reworded afterwards and is filed under the release that
-carried the rewording.
+An engine repin: a clearing floor and one trade event per turn (see 0.14.2).
 
 ## 0.14.0
 
@@ -2135,11 +2155,11 @@ carried the rewording.
 - `hexn.selfplay.Outcome.trades` counts the exchanges a game cleared, and
   `hexn.train` logs `trades_per_turn`.
 - `hexn.collect.mix_opponents` routes a bare `network:<path>` pool member
-  (no `@trades` override) through `frozen` — the batched `NetworkPolicy` a
-  ladder rung uses — instead of a batch-of-one `NetworkBot`; an explicit
+  (no `@trades` override) through `frozen` (the batched `NetworkPolicy` a
+  ladder rung uses) instead of a batch-of-one `NetworkBot`; an explicit
   `@trades` override still goes through `named_opponent`.
 - `hexn.migrate` migrates a contract-5 checkpoint onto contract 6: the
-  twenty public-valuation input columns are dropped (a selection — every
+  twenty public-valuation input columns are dropped (a selection: every
   contract-6 column has a contract-5 source), the knight's per-hex block on
   `heads.hexes` collapses into one `heads.globals` row initialised as the
   block's mean, the value head's weights are rescaled by `1 / T` with `T`
@@ -2158,7 +2178,7 @@ carried the rewording.
 - The pinned `hexset` engine advances to contract 6: there is no public
   trading layer (no valuation vector, no `Game.publish`), trading is one
   engine-run event per MAIN action answered by each seat's private gate,
-  and `PLAY_KNIGHT` only spends the card — the robber placement runs
+  and `PLAY_KNIGHT` only spends the card; the robber placement runs
   through `MOVE_ROBBER`, the same decision a rolled seven uses. The flat
   action space is 456 (was 550) and `hexset.encoding.global_features` is 67
   (was 87).
@@ -2205,7 +2225,7 @@ carried the rewording.
 
 - The `trade_give`/`trade_want` heads and `Prediction.give`/`.want`.
 - `hexn.policy`'s `pair_logits`, `NUM_PAIRS`, `pair_index`, `pair_mask`
-  and `trade_slot`, and `hexn.ppo`'s `_offer_slot` and `_pair_mask` — the
+  and `trade_slot`, and `hexn.ppo`'s `_offer_slot` and `_pair_mask`: the
   network no longer samples an offer, so there is no joint log-prob, no
   pair mask and no masked-pair entropy term.
 - `hexn.distill.losses`/`anchor_losses` lose their offer term, and
@@ -2236,9 +2256,9 @@ carried the rewording.
 - `--mix` accepts a table entry, `table(a|b|c)=f`: in a share `f` of
   games the learner seats once and every other seat draws independently
   from `a|b|c`.
-- `benchmarks.duel` records each verdict's seat geometry — blocked
-  (`[a, a, b, b]`) or interleaved (`[a, b, a, b]`) — previously chosen
-  silently by worker count.
+- `benchmarks.duel` records each verdict's seat geometry, blocked
+  (`[a, a, b, b]`) or interleaved (`[a, b, a, b]`), which the worker count
+  chose.
 - `--geometry {blocked,interleaved}` on the arena duel path. Default
   `blocked` reproduces old verdicts bit for bit; the versus path can
   only seat interleaved.
@@ -2262,7 +2282,7 @@ carried the rewording.
 
 ### Added
 
-- `benchmarks.human_agreement`: scores the policy against recorded human
+- `benchmarks.human_agreement`: scores the policy against recorded
   decisions one at a time, reporting top-1 agreement and log-loss
   against a matched uniform-null baseline.
 - Decisions with one legal action are excluded from the score; the
@@ -2275,8 +2295,8 @@ carried the rewording.
 
 ### Added
 
-- `--mix` now accepts any arena entrant spec — `search2-offers3`,
-  `mcts:<ckpt>@64`, `network:<ckpt>`, or any preset — via
+- `--mix` now accepts any arena entrant spec (`search2-offers3`,
+  `mcts:<ckpt>@64`, `network:<ckpt>`, or any preset) via
   `collect.named_opponent`.
 - `collect.RESERVED_MIX` reserves `greedy`/`parent`: `--mix greedy`
   still means `greedy-offers3`, not the arena's unrestricted `greedy`
@@ -2334,7 +2354,7 @@ carried the rewording.
 - The matching quantile Huber value loss in `catan.ppo.minibatch_terms`,
   at Huber width `1/30`.
 - `Stats.value_mse`/`Terms.value_mse`: the plain squared error of the
-  mean, for comparing runs across value-head shapes.
+  mean.
 - `catan.league --value-head`/`--quantiles`, and `catan.train
   --quantiles`. Warm-starting from a scalar base seeds every level from
   its output.
@@ -2434,8 +2454,8 @@ carried the rewording.
 
 ### Changed
 
-- Evaluation now gates on the matched-rival duel; `greedy` is a
-  mix-exploitation canary.
+- Evaluation now gates on the matched-rival duel; `greedy` stays a ladder
+  rung.
 
 ## 0.5.0
 
@@ -2505,14 +2525,14 @@ carried the rewording.
 - `benchmarks.training_loop`: production-shape sync/async PPO timing.
 - `catan.arena` takes `network:<path>`, `netsearch:<path>` and
   `netgreedy:<path>`; `network:<path>@<offers>` sets an offer budget.
-- `catan.train` prints its device/worker counts and warns if crippled.
+- `catan.train` prints its device and worker counts and warns when they
+  are short of the machine's.
 
 ### Changed
 
 - `catan.selfplay.Collector` encodes a worker tick as one packed NumPy
   batch for CPU inference.
-- Board-template and topology lookups are cached, cutting recursive
-  hashing cost.
+- Board-template and topology lookups are cached.
 - `catan.encoding._template`'s cache is 4096 boards deep.
 - `--async-collect` overlaps collection with the GPU update, training
   on a policy one iteration stale.
@@ -2551,8 +2571,7 @@ carried the rewording.
 ### Changed
 
 - Arena entrants can be constructed by name.
-- Every arena number recorded before this release used `scarce` at
-  zero.
+- Before this release, `scarce` was zero in every arena entrant.
 
 ## 0.2.0
 
@@ -2569,7 +2588,7 @@ carried the rewording.
 
 - Search leaves are now batched across games rather than evaluated one
   at a time.
-- Hidden deck shuffles are deferred until a draw actually needs them.
+- Hidden deck shuffles are deferred until a draw needs them.
 - Linear PUCT edge scores are now cached.
 - The MCTS wave size is a named quantity, not an inline constant.
 
@@ -2603,8 +2622,8 @@ carried the rewording.
 - `catan.robber`: robber movement, hand-weighted stealing, and seven
   discards.
 - `catan.victory`: victory points, longest road and largest army.
-- `catan.game`: the turn/phase machine — setup, rolling, discarding,
-  the robber, and win detection.
+- `catan.game`: the turn/phase machine (setup, rolling, discarding,
+  the robber, and win detection).
 - `catan.actions`: a flat, board-sized action space with legality
   masking.
 - `catan.play`: a random player for full games.

@@ -152,7 +152,7 @@ from hexn.model import (
     quantile_levels,
     unpack,
 )
-from hexn.netbot import load
+from hexn.netbot import load_torch
 from hexn.policy import NetworkPolicy
 from hexn.selfplay import Collector
 from . import add_games_dir, games_kept
@@ -431,7 +431,7 @@ def recover(
     """
     seed = int(dump["seed"])
     board = random_base_board(random.Random(seed))
-    loaded = load(checkpoint, board.topology)
+    loaded = load_torch(checkpoint, board.topology)
     if loaded.iteration != dump.get("iteration"):
         raise SystemExit(
             f"{checkpoint} is iteration {loaded.iteration} but the dump was "

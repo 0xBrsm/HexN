@@ -27,7 +27,10 @@ token, the opponent's and the board token, a score per
 move type and a query per targeted role; a board move scored as its type's
 score plus its roles' queries against the keys of what it names (vertices,
 edges, a robber's hex with its victim), a resource move as its type's score
-plus the value of the two hands it leaves. Each seat's win logit
+plus the value of the two hands it leaves. A move of a type in `UNTYPED`
+(setup, robber placement, discard) has no type score: its position offers
+moves of that type alone, so the type would be one number shared by every
+option, which no loss trains and no choice reads. Each seat's win logit
 reads its own token with mine. The decisions are asked as for every other
 contract-9 net (`flat_scores`, `setup_scores`, `road_building_scores`,
 `discard_scores`, `robber_logits`).
@@ -70,6 +73,15 @@ from hexset.state import MAX_SETTLEMENTS
 
 __all__ = ["DOUBLE_TURNS", "ModelConfig", "config_of", "HexNet", "Prediction", "Scores", "unpack9", "collate", "decision_scores",
            "chosen_scores", "decision_entropy", "decision_log_prob", "first_move_prior", "option_probs"]
+
+# The move types an 11d net scores with no type score: a position that offers
+# one of them offers moves of that type alone (setup turns, the robber's
+# placement after a seven or a knight, a discard), so the type would be one
+# number added to every option, cancelled by the softmax, trained by no loss
+# and free to drift (a drifted discard type sent a decision's log-sum-exp below
+# float32's exp range). `test_model9.py` replays random games against this set.
+UNTYPED = frozenset({ActionType.SETUP_SETTLEMENT, ActionType.SETUP_ROAD, ActionType.MOVE_ROBBER,
+                     ActionType.DISCARD})
 
 
 # `ModelConfig.double_turn`'s choices.
@@ -502,7 +514,10 @@ class HexNet(nn.Module):
             # slot's type score (the robber block a zero column: `robber_logits`
             # scores it on demand), plus each slot's term in `_emit_queries`'
             # vector of query reads and hand values (`ADDED`, in that order),
-            # or a zero column where a move adds nothing to its type.
+            # or a zero column where a move adds nothing to its type. A move in
+            # `UNTYPED` reads the zero column too: its position offers no other
+            # kind of move, so the type would be shared by every option, untrained
+            # by any loss (it cancels), and free to drift.
             T = ActionType
             sizes = {T.SETUP_SETTLEMENT: vertices, T.SETUP_ROAD: edges, T.BUILD_SETTLEMENT: vertices,
                      T.BUILD_CITY: vertices, T.BUILD_ROAD: edges, T.PLAY_MONOPOLY: NUM_RESOURCES,
@@ -514,7 +529,7 @@ class HexNet(nn.Module):
             slot_type = torch.full((space.size,), len(MOVE_TYPES), dtype=torch.long)
             slot_added = torch.full((space.size,), added, dtype=torch.long)
             for t in MOVE_TYPES:
-                if t is not T.MOVE_ROBBER:
+                if t not in UNTYPED:
                     slot_type[block(t)] = int(t)
             at = 0
             for t, n in sizes.items():
@@ -1005,15 +1020,14 @@ class HexNet(nn.Module):
         flat logits, each hex with each victim's seat token, then nobody."""
         uh = out.hexes[rows]
         s = out.seats[rows]
-        if self.two:                                  # 11d: type + q_robber . k_(hex, victim), nobody from the hex
+        if self.two:                                  # 11d: q_robber . k_(hex, victim), nobody from the hex; no type (UNTYPED)
             keys = _unit(torch.cat([self.robber_key(torch.cat([
                 uh.unsqueeze(2).expand(-1, -1, self.players, -1),
                 s.unsqueeze(1).expand(-1, uh.shape[1], -1, -1)], -1)), self.nobody_key(uh).unsqueeze(2)], 2),
                 self.key_gain[2])
             query = out.robber_query[rows].to(keys.dtype)
             scores = (keys @ query[:, None, :, None]).squeeze(-1)                 # (R, H, P + 1)
-            kind = out.types[rows, int(ActionType.MOVE_ROBBER)].to(scores.dtype)
-            return (scores + kind[:, None, None]).reshape(rows.shape[0], -1)
+            return scores.reshape(rows.shape[0], -1)
         victims = self.robber_head(torch.cat([
             uh.unsqueeze(2).expand(-1, -1, self.players, -1),
             s.unsqueeze(1).expand(-1, uh.shape[1], -1, -1)], -1)).squeeze(-1)     # (R, H, P)
@@ -1031,17 +1045,15 @@ class HexNet(nn.Module):
         the double turn's first and second (paying) turn's, and per settlement
         pair `(V, V)` the double turn's pair term. A "parts" net has none of the three.
 
-        A contract-11d "joint" net: the first turn is the setup type plus
+        A contract-11d "joint" net: the first turn is
         q_setup_settlement . k_v + q_setup_road . k_e (it does not pay), the
         second q_setup_settlement_paying . k_v + q_setup_road . k_e, and the
         pair k_first' P k_second over sqrt(KEY_WIDTH), on the normalised vertex keys."""
         if self.two:
             if self.pair_matrix is None:
                 raise ValueError(f"a {self.config.double_turn!r} net has no joint double-turn head")
-            kind = (out.types[rows, int(ActionType.SETUP_SETTLEMENT)]
-                    + out.types[rows, int(ActionType.SETUP_ROAD)]).unsqueeze(1)
             reads, road = out.setup_reads[rows], out.setup_road_read[rows][:, self.inc_edge]
-            first = kind + reads[:, 0][:, self.inc_vertex] + road
+            first = reads[:, 0][:, self.inc_vertex] + road
             second = reads[:, 1][:, self.inc_vertex] + road
             keys = out.vertex_keys[rows]
             pair = keys @ self.pair_matrix.to(keys.dtype) @ keys.transpose(1, 2) / KEY_WIDTH ** 0.5
@@ -1078,8 +1090,8 @@ class HexNet(nn.Module):
     def setup_scores(self, out: Prediction, rows: Tensor) -> Tensor:
         """For `rows`, per (settlement, road) incidence the setup turn's score
         alone: `setup_heads`' first output, without the double turn's heads.
-        A contract-11d net scores the turn as its two moves' flat scores summed: each
-        type, q_setup_settlement . k_v and q_setup_road . k_e."""
+        A contract-11d net scores the turn as its two moves' flat scores summed,
+        q_setup_settlement . k_v and q_setup_road . k_e, with no type score."""
         if self.two:
             logits = out.logits[rows]
             return logits[:, self.inc_setup_settlement] + logits[:, self.inc_setup_road]
@@ -1089,13 +1101,12 @@ class HexNet(nn.Module):
     def discard_scores(self, out: Prediction, rows: Tensor, candidates: Tensor) -> Tensor:
         """One score per discard candidate: `candidates` `(K, 10)` (kept, then
         given, card counts), `rows` `(K,)` the batch row each belongs to. A
-        contract-11d net scores the discard type plus the value of the hand it
-        keeps, beside the opponent's (`_hand_values`)."""
+        contract-11d net scores the value of the hand it keeps, beside the
+        opponent's (`_hand_values`), with no type score (`UNTYPED`)."""
         if self.two:
             hands = out.hands[rows]
             kept = candidates[:, :NUM_RESOURCES].to(hands.dtype) / CARD_SCALE
-            kind = out.types[:, int(ActionType.DISCARD)]
-            return kind[rows] + self._hand_values(out.hand_context[rows], kept, hands[:, 1]).to(kind.dtype)
+            return self._hand_values(out.hand_context[rows], kept, hands[:, 1]).to(out.types.dtype)
         counts = candidates.to(out.me.dtype) / 10.0
         if self.config.discard == "linear":
             weights = self.discard_head(torch.cat([out.me, out.table], -1))[rows]       # (K, 10)
@@ -1141,14 +1152,18 @@ _GLOBAL_KINDS = tuple(
 
 def _segment_logsumexp(scores: Tensor, rows: Tensor, batch: int) -> Tensor:
     """Per batch row, the log-sum-exp of the `scores` whose `rows` it is
-    (`-inf` for a row with none)."""
+    (`-inf` for a row with none, or with none finite). The log is taken of
+    1 where the sum is 0, so such a row passes back a zero gradient: the log
+    of 0 would pass back 0/0, which `index_add`'s backward gathers into the
+    row's scores and the whole backward."""
     out = scores.new_full((batch,), float("-inf"))
     if scores.numel() == 0:
         return out
     top = out.scatter_reduce(0, rows, scores, reduce="amax", include_self=True)
     safe = torch.where(torch.isfinite(top), top, torch.zeros_like(top))
     total = scores.new_zeros(batch).index_add(0, rows, torch.exp(scores - safe[rows]))
-    return torch.where(total > 0, safe + torch.log(total), out)
+    filled = total > 0
+    return torch.where(filled, safe + torch.log(torch.where(filled, total, torch.ones_like(total))), out)
 
 
 @dataclass
@@ -1280,11 +1295,14 @@ def decision_entropy(scores: Scores) -> Tensor:
     total = scores.total
 
     def expected(s: Tensor, at: Tensor) -> Tensor:              # p * s, 0 where illegal
-        # Illegal entries are zeroed before anything reads them: a -inf in
-        # the branch `where` drops still sends NaN back through its gradient.
+        # Illegal entries are zeroed before anything reads them, exponent
+        # included: a -inf in the branch `where` drops still sends NaN back
+        # through its gradient, and so does an exponent that overflows there
+        # (0 - at for a row whose log-sum-exp is below about -88.7).
         legal = torch.isfinite(s)
         safe = torch.where(legal, s, torch.zeros_like(s))
-        return torch.where(legal, torch.exp(safe - at), torch.zeros_like(s)) * safe
+        gap = torch.where(legal, s - at, torch.zeros_like(s))
+        return torch.where(legal, torch.exp(gap), torch.zeros_like(s)) * safe
 
     mean = expected(scores.flat, total[:, None]).sum(1) + expected(scores.setup, total[:, None]).sum(1)
     for s, row in ((scores.rb, scores.rb_row), (scores.disc, scores.disc_row)):

@@ -80,7 +80,7 @@ is exactly the situation being investigated. The measurement is:
     python -m hexn.benchmarks.sibling --checkpoint runs/heads/mlp.pt --games 64
 
 The checkpoint written carries `width`, `rounds`, `players` and `value_head` in
-its `args`, which is what `hexn.netbot.load` rebuilds the config from, and the
+its `args`, which is what `hexn.netbot.load_torch` rebuilds the config from, and the
 run ends by loading its own output through that path so a shape mismatch is
 caught here rather than in the benchmark that was supposed to answer the
 question.
@@ -458,7 +458,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # `eval`, not `train`: there is no dropout or batch norm in this model, so
     # this changes no arithmetic — it pins the trunk to the same mode
-    # `hexn.netbot.load` will score the result under.
+    # `hexn.netbot.load_torch` will score the result under.
     net.to(device).eval()
     parameters = freeze(net, prefix)
     before = fingerprint(net, prefix)
@@ -571,15 +571,15 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     # The output exists to be handed to `benchmarks.sibling`, which reaches it
-    # through `hexn.netbot.load`. Loading it here turns a config that cannot be
+    # through `hexn.netbot.load_torch`. Loading it here turns a config that cannot be
     # rebuilt from `args` into a failure of the run that wrote it.
-    from hexn.netbot import load
+    from hexn.netbot import load_torch
 
     try:
-        load(str(Path(args.out)), topology, str(device))
+        load_torch(str(Path(args.out)), topology, str(device))
     except Exception as error:  # noqa: BLE001 - the message is the whole point
         print(
-            f"wrote {args.out} but hexn.netbot.load cannot read it back: {error}",
+            f"wrote {args.out} but hexn.netbot.load_torch cannot read it back: {error}",
             file=sys.stderr,
         )
         return 1

@@ -26,7 +26,7 @@ source) so the registration can bound it.
 What the checkpoint carries. The parent's `iteration`, `games_started` and
 `torch_rng`, so `hexn.ppo --resume` continues the count and the game index
 exactly as a same-width continuation would; `args` with the new `width`, which
-is what `hexn.netbot.load` and every benchmark rebuild the shape from; a
+is what `hexn.netbot.load_torch` and every benchmark rebuild the shape from; a
 *fresh* Adam state over the new parameters (the parent's moments have the old
 shapes and no meaning for the copies); and a `widen` block naming the source
 by path and sha256, both widths, the noise and the seed.

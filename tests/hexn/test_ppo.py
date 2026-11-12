@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import math
 import random
 
 import numpy as np
@@ -932,10 +933,13 @@ def test_out_of_range_stakes_settings_are_refused(fields):
         PPOConfig(**fields)
 
 
-def test_only_fp16_is_an_amp_dtype():
+def test_fp16_and_a_decoupled_bf16_are_the_amp_dtypes():
     PPOConfig(amp="fp16")
+    PPOConfig(amp="bf16", decoupled=True)
     with pytest.raises(ValueError):
         PPOConfig(amp="bf16")
+    with pytest.raises(ValueError):
+        PPOConfig(amp="fp32")
 
 
 def test_amp_and_a_gradient_scaler_come_together(collected):
@@ -947,6 +951,9 @@ def test_amp_and_a_gradient_scaler_come_together(collected):
         update(student, optimiser, batch, PPOConfig(amp="fp16"))
     with pytest.raises(ValueError):
         update(student, optimiser, batch, PPOConfig(), scaler=torch.amp.GradScaler("cpu"))
+    bf16 = ppo.attach_proximal(batch, student, chunk=64, amp="bf16")
+    with pytest.raises(ValueError):
+        update(student, optimiser, bf16, PPOConfig(amp="bf16", decoupled=True), scaler=torch.amp.GradScaler("cpu"))
 
 
 def test_evaluate_hands_back_fp32_under_half_autocast(collected):
@@ -986,6 +993,34 @@ def test_an_fp16_update_tracks_the_fp32_update_it_stands_in_for(collected):
     assert half.value_loss == pytest.approx(full.value_loss, rel=1e-2)
     assert half.amp_scale > 0
     assert full.amp_skipped == 0 and full.amp_scale == 0.0
+
+
+def test_a_decoupled_bf16_update_tracks_the_fp32_update_without_a_scaler(collected):
+    # The proximal log-probs come from the same autocast as the update's, so
+    # the first minibatch's KL is the update's own rounding, not bf16 against
+    # fp32; no scaler, so no step is skipped and no scale is kept.
+    policy, episodes = collected
+    batch = assemble(episodes, policy.layout, PPOConfig())
+    config = PPOConfig(epochs=1, minibatch=256, decoupled=True)
+    runs = {}
+    for amp in ("", "bf16"):
+        student = a_student(policy)
+        optimiser = torch.optim.Adam(student.net.parameters(), lr=1e-4)
+        attached = ppo.attach_proximal(batch, student, chunk=64, amp=amp)
+        runs[amp] = update(
+            student,
+            optimiser,
+            attached,
+            dataclasses.replace(config, amp=amp),
+            generator=torch.Generator().manual_seed(0),
+        )
+        assert all(torch.isfinite(p).all() for p in student.net.parameters())
+    half, full = runs["bf16"], runs[""]
+    assert half.approx_kl_first_minibatch < 1e-4
+    assert half.policy_loss == pytest.approx(full.policy_loss, abs=1e-2)
+    assert half.value_loss == pytest.approx(full.value_loss, rel=2e-2)
+    assert half.amp_skipped == 0 and half.amp_scale == 0.0
+    assert math.isfinite(half.grad_norm)
 
 
 def test_an_fp16_batch_trains_to_the_bit_of_a_float32_batch_under_fp16_autocast(collected):

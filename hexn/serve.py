@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-only
 """One process on the box runs every network forward for many workers.
 
-`Server` loads each net once on its device (`hexn.netbot.load`) and answers
+`Server` loads each net once on its device (`hexn.netbot.load_torch`) and answers
 the forwards its clients send over `multiprocessing` connections. Each round
 it takes every request waiting on any connection, joins the rows asked of one
 net across all of them into one forward, and sends each client its own rows
@@ -116,7 +116,7 @@ def _serve(paths: Sequence[str], topology, connections, device: str, precision: 
     if device.startswith("cuda"):
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
-    policies = [None if _kind(path) == "onnx" else netbot.load(path, topology, device).policy for path in paths]
+    policies = [None if _kind(path) == "onnx" else netbot.load_torch(path, topology, device).policy for path in paths]
     kinds = [None if policy is None else "heads9" if hasattr(policy, "score_feed") and hasattr(policy, "_heads")
              else "score8" for policy in policies]
     autocast = (torch.autocast(torch.device(device).type, dtype=torch.bfloat16) if precision == "bf16"
@@ -228,7 +228,7 @@ class Panel:
             else:
                 # Loaded on this CPU for its encoder and its reading of the
                 # answer; the forward runs on the server.
-                self.served[k] = netbot.load(path, topology, "cpu").policy
+                self.served[k] = netbot.load_torch(path, topology, "cpu").policy
         self.size = len(paths)
         self.round_trips = 0
 

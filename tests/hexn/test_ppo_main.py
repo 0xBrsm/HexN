@@ -1008,7 +1008,7 @@ def test_rule_conditioned_manifests_collect_update_save_and_resume(tmp_path, par
     assert len({line["batch_fingerprint"] for line in trained}) == 3
     state = torch.load(tmp_path / "latest.pt", weights_only=False)
     assert state["model_config"]["contract"] == "9.1" and state["args"]["rules_mix"] == law
-    loaded = netbot.load(str(tmp_path / "latest.pt"), deal_game(0, 0, 4)._state.board.topology)
+    loaded = netbot.load_torch(str(tmp_path / "latest.pt"), deal_game(0, 0, 4)._state.board.topology)
     assert loaded.policy.net.CONTRACT == "9.1" and loaded.iteration == 3
 
 
@@ -1046,7 +1046,7 @@ def test_a_two_seat_run_on_contract_9d_collects_updates_saves_and_resumes(tmp_pa
     assert (any(key.startswith("pair_matrix") for key in state["net"])) == (double_turn == "joint")
     assert state["model_config"]["points"] is False and state["args"]["players"] == 2
     topology = deal_game(0, 0, 2, game_type=DUEL_VARIANT_GAME)._state.board.topology
-    loaded = netbot.load(str(tmp_path / "latest.pt"), topology)
+    loaded = netbot.load_torch(str(tmp_path / "latest.pt"), topology)
     assert loaded.policy.net.CONTRACT == contract and loaded.policy.net.players == 2 and loaded.iteration == 3
     assert loaded.players == 2 and loaded.policy.layout.width == width
     with pytest.raises(SystemExit):
@@ -1159,7 +1159,7 @@ def test_a_contract_9_run_trains_its_points_head_and_saves_what_netbot_loads(tmp
     from hexn.policy9 import Policy9
 
     game = deal_game(0, 0, 4)
-    loaded = netbot.load(str(tmp_path / "latest.pt"), game._state.board.topology)
+    loaded = netbot.load_torch(str(tmp_path / "latest.pt"), game._state.board.topology)
     assert isinstance(loaded.policy, Policy9) and loaded.iteration == 2
     assert loaded.policy.net.config.double_turn == "parts"
     trained = loaded.policy.net.state_dict()

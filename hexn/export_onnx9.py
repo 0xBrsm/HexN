@@ -237,6 +237,7 @@ def serving_props(
     gate_own_frame: bool | None = None,
     gate_plies: int | None = None,
     robber_tip: float | None = None,
+    robber_hits: bool = False,
 ) -> dict[str, str]:
     """The serving keys `hexset.clients._modelmeta` reads, for what is asked:
     nothing for an argument left at its default. A `trader_veto` needs a
@@ -263,6 +264,8 @@ def serving_props(
         props["gate_plies"] = str(int(gate_plies))
     if robber_tip is not None:
         props["robber_tip"] = repr(float(robber_tip))
+    if robber_hits:
+        props["robber_hits"] = "1"
     return props
 
 

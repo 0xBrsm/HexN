@@ -30,12 +30,25 @@ of the thrash.
 
 *The policy is greedy.* Sampling is the behaviour distribution PPO needed, not
 the policy worth scoring; `NetworkPolicy(greedy=True)` takes the argmax.
+
+*`load` plays a net through ONNX.* A file ending `.onnx` goes to
+`hexset.clients.onnxbot.load` (one onnxruntime thread, its own cache keyed on
+the file's mtime), and so does a contract-9 `.pt` on the CPU, through its
+export (`onnx_of`, made once per checkpoint): the same decisions as the torch
+net, about three times faster at a batch of one on one CPU thread. Every
+entrant the arena seats (`network:`, `mcts:`, `rollout:`) loads this way.
+`load_torch` is the torch net itself, for training and for code that reads
+inside the net; `load` gives it too for an older contract or another device.
 """
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
+import os
 from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import Path
 
 import torch
 
@@ -68,6 +81,8 @@ __all__ = [
     "NetworkBot",
     "bot_for",
     "load",
+    "load_torch",
+    "onnx_of",
     "searcher_for",
 ]
 
@@ -97,14 +112,39 @@ class Loaded:
         return _trade_params(self.max_offers)
 
 
+def load(path: str, topology: Topology, device: str = "cpu"):
+    """The network at `path` as a seat plays it, on boards of this topology:
+    an `.onnx` file, or a contract-9 `.pt` on the CPU through its export
+    (`onnx_of`), in `hexset.clients.onnxbot` on one thread; any other `.pt`
+    as `load_torch` rebuilds it (module docstring). The export's parity check
+    holds it to `hexn.policy9.Policy9`'s decisions on the torch net."""
+    from hexset.clients import onnxbot
+
+    if str(path).endswith(".onnx"):
+        return onnxbot.load(str(path), topology, device, 1)
+    if device == "cpu" and _contract(str(path)) in CONTRACTS9:
+        return onnxbot.load(str(onnx_of(str(path))), topology, "cpu", 1)
+    return _load_pt(path, topology, device, "none")
+
+
+def load_torch(path: str, topology: Topology, device: str = "cpu", compile_mode: str = "none") -> "Loaded":
+    """The `.pt` checkpoint at `path` rebuilt as its torch net (`_load_pt`),
+    for training and for code that reads inside the net (`Loaded.policy.net`,
+    `_heads`, hooks); `compile_mode` other than `"none"` runs it under
+    `torch.compile`. An `.onnx` file has no torch net and is refused."""
+    if str(path).endswith(".onnx"):
+        raise ValueError(f"{path} is an ONNX file: it has no torch net (`load` plays it)")
+    return _load_pt(path, topology, device, compile_mode)
+
+
 @lru_cache(maxsize=4)
-def load(
+def _load_pt(
     path: str,
     topology: Topology,
     device: str = "cpu",
     compile_mode: str = "none",
 ) -> Loaded:
-    """The network at `path`, ready to act on boards of this topology.
+    """The `.pt` checkpoint at `path`, ready to act on boards of this topology.
 
     Cached per process: a worker plays hundreds of games and every one of them
     would otherwise pay for the same `torch.load`.
@@ -164,11 +204,57 @@ def _load9(state: dict, args: dict, topology: Topology, players: int, device: st
                   max_offers=0, iteration=int(state.get("iteration", 0)), hold=declared_hold(state))
 
 
+load_torch.cache_clear = _load_pt.cache_clear  # the `.pt` cache; onnxbot keeps its own
+
+
+@lru_cache(maxsize=16)
+def _contract(path: str) -> str:
+    """The contract a `.pt` checkpoint's run recorded, `""` for none."""
+    return str(torch.load(path, map_location="cpu", weights_only=False).get("args", {}).get("contract", ""))
+
+
+def _digest(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+@lru_cache(maxsize=16)
+def onnx_of(path: str) -> Path:
+    """The contract-9 checkpoint at `path` exported to ONNX
+    (`hexn.export_onnx9.export9`, its parity check on), once per checkpoint
+    and exporter: kept in `HEXN_ONNX_CACHE` (default
+    `~/.cache/hexn/onnx`) under the checkpoint's sha256 and the exporter's
+    and model's source, and written under a lock so the workers of one run
+    export it once between them."""
+    from . import export_onnx9, model9
+    from .export_onnx9 import export9
+
+    source = Path(path)
+    code = hashlib.sha256(b"".join(Path(m.__file__).read_bytes() for m in (export_onnx9, model9))).hexdigest()
+    cache = Path(os.environ.get("HEXN_ONNX_CACHE") or Path.home() / ".cache" / "hexn" / "onnx")
+    cache.mkdir(parents=True, exist_ok=True)
+    out = cache / f"{_digest(source)[:24]}-{code[:12]}.onnx"
+    if out.is_file():
+        return out
+    with open(cache / f"{out.name}.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not out.is_file():
+            export9(str(source), out, verify=True)
+    return out
+
+
+load.cache_clear = lambda: (_contract.cache_clear(), onnx_of.cache_clear(), _load_pt.cache_clear())
+
+
 # Registered at import, so importing this module is the whole of naming the
 # runtime: any process that does -- directly, via `hexn.ppo`/`hexn.league`/
 # `hexn.collect`, or through `hexset.bench.duel --runtime hexn.netbot`, which
 # hands this module's name to each worker as `arena.compete`'s initializer --
 # can spawn a network-backed entrant through `hexset.arena.spawn` without
 # `hexset.arena` ever importing torch or this module.
-# `hexset.clients.netbot` owns every factory behind it.
+# `hexset.clients.netbot` owns every factory behind it; a seat plays its net
+# as `load` gives it.
 register_entrants(load)

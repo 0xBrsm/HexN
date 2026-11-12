@@ -435,3 +435,28 @@ def test_record_encoder_matches_encode_where_the_contract_8_blocks_carry_informa
     got = run_encoder(encoder, record)
     for i, obs in enumerate(encode_batch([g for g, _ in pairs], [s for _, s in pairs])):
         assert_exact(tuple(g[i] for g in got), obs)
+
+
+def test_the_loader_seats_an_onnx_export_and_searches_it_as_the_checkpoint(tmp_path):
+    """`hexn.netbot.load` hands an `.onnx` path to HexSet's runtime, so `mcts:<file>.onnx` works in a process that
+    registered this loader, and the export's search picks the checkpoint's moves at the same seeds."""
+    from hexset.clients import onnxbot
+    from hexset.clients.netbot import searcher_for
+    from hexset.actions import apply, legal_actions
+    from hexn.netbot import load
+
+    checkpoint = tmp_path / "latest.pt"
+    board = a_checkpoint(checkpoint, players=2)
+    out = export(str(checkpoint), tmp_path / "latest.onnx", topology=board.topology)
+    exported = load(str(out), board.topology)
+    assert type(exported) is onnxbot.Loaded
+    native = load(str(checkpoint), board.topology)
+    agree = 0
+    for seed in range(6):
+        game = start(board, 2, random.Random(seed))
+        while len(legal_actions(game)) < 2:
+            apply(game, legal_actions(game)[0])
+        picks = [searcher_for(c, simulations=32, rng=random.Random(seed)).decide(game).chosen
+                 for c in (native, exported)]
+        agree += picks[0] == picks[1]
+    assert agree == 6

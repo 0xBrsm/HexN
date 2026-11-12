@@ -12,7 +12,8 @@ from hexset import contract9, decisions as D  # noqa: E402
 from hexset.actions import space_for  # noqa: E402
 from hexset.board.board import random_base_board  # noqa: E402
 from hexset.game import Phase, is_over, players_owing_discards, start, to_move  # noqa: E402
-from hexn.model9 import HexNet, decision_log_prob, unpack9  # noqa: E402
+from hexn import model9  # noqa: E402
+from hexn.model9 import HexNet, _segment_logsumexp, decision_log_prob, unpack9  # noqa: E402
 
 
 def _positions(count=60, seed=0):
@@ -649,7 +650,8 @@ def _query_reference(net, out, seats, game):
     for index in range(space.size):
         action = space.decode(index)
         t, a, b = action.type, action.a, action.b
-        base = types[:, int(t)]
+        # A setup move has no type score: its position offers nothing else.
+        base = torch.zeros(rows) if t in model9.UNTYPED else types[:, int(t)]
         if t in resource:
             continue
         if t in (T.ROLL, T.END_TURN, T.BUY_DEV_CARD, T.PLAY_KNIGHT, T.PLAY_ROAD_BUILDING):
@@ -691,7 +693,7 @@ def _query_reference(net, out, seats, game):
         t, a, b = action.type, action.a, action.b
         if t not in resource:
             continue
-        base = types[:, int(t)]
+        base = torch.zeros(rows) if t in model9.UNTYPED else types[:, int(t)]
         if t is T.BANK_TRADE:
             given = torch.zeros(rows, 5)
             given[:, a] = rate[:, a] / 10
@@ -756,11 +758,11 @@ def test_every_flat_option_of_the_two_seat_space_is_scored_by_one_11d_formula():
         torch.testing.assert_close(lone, (types[row0, int(T.PLAY_ROAD_BUILDING)]
                                           + (q["road_building"][row0] * k_edge(e1)[row0]).sum()).reshape(1),
                                    atol=1e-5, rtol=1e-5)
-        # A whole discard: the discard type and the value of the hand it keeps.
+        # A whole discard: the value of the hand it keeps, no type (UNTYPED).
         disc = net.discard_scores(out, batch["disc_row"], batch["disc"])
         row = batch["disc_row"]
         kept = batch["disc"][:, :5].float() / 10
-        want_disc = types[row, int(T.DISCARD)] + value(kept, theirs[row], row)
+        want_disc = value(kept, theirs[row], row)
         torch.testing.assert_close(disc, want_disc, atol=1e-5, rtol=1e-5)
         # A kept hand that is the hand before less what is given.
         np.testing.assert_allclose(kept.numpy(), (out.hands[row, 0] - batch["disc"][:, 5:].float() / 10).numpy(),
@@ -795,10 +797,131 @@ def test_11d_query_key_scores_are_bounded_by_the_role_scale():
         space = net.space
         bound = 4 * net.role_scales().max() * net.query_gain.abs().max() * net.key_gain.abs().max()
         for t in (T.BUILD_SETTLEMENT, T.BUILD_CITY, T.BUILD_ROAD, T.SETUP_SETTLEMENT, T.SETUP_ROAD, T.MOVE_ROBBER):
-            block = flat[:, space.offsets[t]:space.offsets[t] + space.sizes[t]] - out.types[:, int(t), None]
+            block = flat[:, space.offsets[t]:space.offsets[t] + space.sizes[t]]
+            if t not in model9.UNTYPED:
+                block = block - out.types[:, int(t), None]
             assert block.abs().max() <= bound * 1.001, t
             assert block.abs().max() > 0.1 * bound, t       # the bound is the scale, not a vanishing score
         assert out.rb_road.abs().max() <= bound * 1.001
+
+
+def test_a_setup_moves_type_score_is_left_out_and_no_choice_changes():
+    """A setup position offers setup moves alone, so their type score would
+    be shared by every option: an 11d net leaves it out. Put back, at any
+    size, it changes no decision's log-probability, setup turns asked whole
+    or a move at a time included."""
+    import copy
+
+    from hexset.actions import ActionType as T
+
+    rows = []
+    for seed in range(3):                            # each game's setup, then some of its play
+        rows += _duel_decisions(count=12, seed=seed, every=1)[0]
+    more, game = _duel_decisions(count=40, seed=5, every=3)
+    rows += more
+    net = _two_seat_net(game, 6)
+    space = net.space
+    setup_slots = torch.zeros(space.size, dtype=torch.bool)
+    for t in (T.SETUP_SETTLEMENT, T.SETUP_ROAD):
+        setup_slots[space.offsets[t]:space.offsets[t] + space.sizes[t]] = True
+    batch = _batch(rows)
+    del batch["double"]                              # a "parts" net asks no double turn
+    is_setup = batch["setup"].any(1) | (batch["mask"] & setup_slots).any(1)
+    assert is_setup.sum() >= 12 and (~is_setup).sum() >= 12
+    # The premise: a position with a setup move legal has no other kind legal.
+    assert not (batch["mask"][is_setup] & ~setup_slots).any()
+    with_type = copy.deepcopy(net)
+    for t in (T.SETUP_SETTLEMENT, T.SETUP_ROAD):
+        with_type.slot_type[space.offsets[t]:space.offsets[t] + space.sizes[t]] = int(t)
+    inputs = unpack9(contract9.layout(2, 19, 54, 72, "11d"), batch["x"])
+    with torch.no_grad():
+        with_type.move_head[2].bias[[int(T.SETUP_SETTLEMENT), int(T.SETUP_ROAD)]] += 50.0
+        out, out_typed = net(**inputs), with_type(**inputs)
+        assert (out.logits[:, setup_slots] - out_typed.logits[:, setup_slots]).abs().max() > 40
+        torch.testing.assert_close(decision_log_prob(net, out, batch),
+                                   decision_log_prob(with_type, out_typed, batch), atol=1e-4, rtol=0)
+
+
+def test_the_robbers_and_a_discards_type_score_is_left_out_and_no_choice_changes():
+    """Robber placement and a discard, like a setup turn, are offered alone,
+    so an 11d net gives them no type score (`model9.UNTYPED`). Put back, at
+    any size, the type changes no decision's log-probability."""
+    import copy
+    from unittest import mock
+
+    from hexset.actions import ActionType as T
+    from hexn import model9
+
+    rows = []
+    for seed in range(6):
+        rows += _duel_decisions(count=60, seed=seed, every=40)[0]
+    more, game = _duel_decisions(count=60, seed=11, every=40)
+    rows += more
+    net = _two_seat_net(game, 6)
+    space = net.space
+    slots = {t: torch.zeros(space.size, dtype=torch.bool) for t in (T.MOVE_ROBBER, T.DISCARD)}
+    for t, mask in slots.items():
+        mask[space.offsets[t]:space.offsets[t] + space.sizes[t]] = True
+    batch = _batch(rows)
+    del batch["double"]
+    robber = (batch["mask"] & slots[T.MOVE_ROBBER]).any(1)
+    discard = torch.zeros(len(robber), dtype=torch.bool)
+    discard[batch["disc_row"]] = True
+    discard |= (batch["mask"] & slots[T.DISCARD]).any(1)
+    assert robber.sum() >= 3 and discard.sum() >= 3 and (~(robber | discard)).sum() >= 12
+    # The premise: where either is legal, nothing else is.
+    assert not (batch["mask"][robber] & ~slots[T.MOVE_ROBBER]).any()
+    assert not (batch["mask"][discard] & ~slots[T.DISCARD]).any() and not batch["setup"][robber | discard].any()
+    with_type = copy.deepcopy(net)
+    with_type.slot_type[slots[T.DISCARD]] = int(T.DISCARD)
+    robber_logits, discard_scores = model9.HexNet.robber_logits, model9.HexNet.discard_scores
+
+    def typed_robber(self, out, rows):
+        got = robber_logits(self, out, rows)
+        return got + out.types[rows, int(T.MOVE_ROBBER)].to(got.dtype)[:, None] if self is with_type else got
+
+    def typed_discard(self, out, rows, candidates):
+        got = discard_scores(self, out, rows, candidates)
+        return got + out.types[rows, int(T.DISCARD)].to(got.dtype) if self is with_type else got
+
+    inputs = unpack9(contract9.layout(2, 19, 54, 72, "11d"), batch["x"])
+    with torch.no_grad(), mock.patch.object(model9.HexNet, "robber_logits", typed_robber), \
+            mock.patch.object(model9.HexNet, "discard_scores", typed_discard):
+        with_type.move_head[2].bias[[int(T.MOVE_ROBBER), int(T.DISCARD)]] += 50.0
+        out, out_typed = net(**inputs), with_type(**inputs)
+        rows_all = torch.arange(len(robber))
+        assert (net.robber_logits(out, rows_all) - with_type.robber_logits(out_typed, rows_all)).abs().max() > 40
+        torch.testing.assert_close(decision_log_prob(net, out, batch)[0],
+                                   decision_log_prob(with_type, out_typed, batch)[0], atol=1e-4, rtol=0)
+
+
+def test_untyped_is_every_move_type_a_position_offers_alone():
+    """`model9.UNTYPED` against random duel-variant play, a move at a time:
+    every type in it is the only type legal wherever it is legal, and every
+    other type is legal beside another type somewhere, so its score trains.
+    A type missing from UNTYPED would drift as the discard type did."""
+    from hexset.actions import options_for
+    from hexset.play import step_randomly
+    from hexset.rules import DUEL_VARIANT_GAME
+    from hexn import model9
+
+    seen, mixed = set(), set()
+    for seed in range(40):
+        rng = random.Random(seed)
+        game = start(random_base_board(random.Random(seed)), 2, random.Random(seed), game_type=DUEL_VARIANT_GAME)
+        moves = 0
+        while not is_over(game) and moves < 3000:
+            legal = options_for(game)
+            if len(legal) > 1:
+                types = {a.type for a in legal}
+                seen |= types
+                if len(types) > 1:
+                    mixed |= types
+            step_randomly(game, rng)
+            moves += 1
+    assert model9.UNTYPED <= seen
+    assert not (model9.UNTYPED & mixed), model9.UNTYPED & mixed
+    assert seen - mixed <= model9.UNTYPED, seen - mixed
 
 
 def test_the_paying_setup_settlement_is_the_seats_second_by_its_settlements_left():
@@ -828,9 +951,9 @@ def test_the_paying_setup_settlement_is_the_seats_second_by_its_settlements_left
 
 
 def test_an_11d_joint_net_scores_the_double_turn_with_a_paying_second_and_an_ordered_pair():
-    """A "joint" 11d net's double turn, first by second, is the setup types,
-    the first turn's plain query and the second's paying one against their
-    vertex keys, the setup-road query against both edges, and the pair
+    """A "joint" 11d net's double turn, first by second, is the first turn's
+    plain query and the second's paying one against their vertex keys, the
+    setup-road query against both edges, and the pair
     k_first' P k_second, which reads the order. Asked in parts the same net
     scores each setup turn by its own query and no pair term."""
     from hexset.actions import ActionType as T
@@ -851,8 +974,7 @@ def test_an_11d_joint_net_scores_the_double_turn_with_a_paying_second_and_an_ord
         for n, row in enumerate(double):
             kv = torch.stack([k_vertex(v)[row] for v, _ in pairs])
             ke = torch.stack([k_edge(e)[row] for _, e in pairs])
-            first = (types[row, int(T.SETUP_SETTLEMENT)] + types[row, int(T.SETUP_ROAD)]
-                     + kv @ q["setup_settlement"][row] + ke @ q["setup_road"][row])
+            first = kv @ q["setup_settlement"][row] + ke @ q["setup_road"][row]
             second = kv @ q["setup_settlement_paying"][row] + ke @ q["setup_road"][row]
             want = first[:, None] + second[None, :] + kv @ P @ kv.T / 4
             torch.testing.assert_close(got[n], want, atol=1e-4, rtol=1e-4)
@@ -947,3 +1069,39 @@ def test_a_11d_batch_trains():
         optimiser.step()
         losses.append(float(loss.detach()))
     assert losses[-1] < 0.75 * losses[0]
+
+
+def test_segment_logsumexp_passes_a_finite_gradient_through_a_row_with_no_finite_score():
+    import torch
+
+    scores = torch.tensor([1.0, 2.0, float("-inf"), float("-inf"), 0.5], requires_grad=True)
+    rows = torch.tensor([0, 0, 1, 1, 3])
+    got = _segment_logsumexp(scores, rows, 4)
+    assert torch.equal(torch.isinf(got), torch.tensor([False, True, True, False]))
+    assert torch.allclose(got[[0, 3]], torch.stack([torch.logsumexp(scores[:2], 0), scores[4]]))
+    # Downstream, as decision_scores combines it, a -inf part takes no weight.
+    torch.logsumexp(torch.stack([got, torch.zeros(4)]), 0).sum().backward()
+    assert torch.isfinite(scores.grad).all()
+    assert torch.equal(scores.grad[2:4], torch.zeros(2))
+    want = torch.softmax(torch.stack([got[0], torch.tensor(0.0)]), 0)[0] * torch.softmax(scores[:2].detach(), 0)
+    assert torch.allclose(scores.grad[:2], want)
+
+
+def test_decision_entropy_passes_a_finite_gradient_when_a_rows_total_is_far_below_zero():
+    # A decision of discard candidates alone whose log-sum-exp is below
+    # log(float32 max) negated: exp(0 - total) at the illegal flat and setup
+    # entries overflows, and 0 * inf in the dropped branch would be NaN.
+    import torch
+    from hexn import model9
+
+    disc = torch.tensor([-94.0, -100.0, -106.0], requires_grad=True)
+    flat, setup = torch.full((1, 5), float("-inf")), torch.full((1, 4), float("-inf"))
+    total = torch.logsumexp(disc, 0).reshape(1)
+    scores = model9.Scores(flat=flat, setup=setup, rb=torch.zeros(0), rb_row=torch.zeros(0, dtype=torch.long),
+                           disc=disc, disc_row=torch.zeros(3, dtype=torch.long),
+                           double_rows=torch.zeros(0, dtype=torch.long), double=torch.zeros(0, 16), total=total)
+    entropy = model9.decision_entropy(scores)
+    p = torch.softmax(disc.detach(), 0)
+    assert torch.allclose(entropy, -(p * p.log()).sum().reshape(1), atol=1e-3)  # total - E[s] at -100: fp32 cancellation
+    entropy.sum().backward()
+    assert torch.isfinite(disc.grad).all()

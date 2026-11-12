@@ -19,7 +19,7 @@ pytestmark = pytest.mark.skipif(not available(), reason="optional native extensi
 
 
 def play(paths, topology, kind):
-    nets = [netbot.load(path, topology).policy for path in paths]
+    nets = [netbot.load_torch(path, topology).policy for path in paths]
     seat = PolicySeat(nets, {0: Play(members=(0, 1), temperature=0.5), 1: Play(members=(1,), temperature=1.0)},
                       record=True)
     env = LaneEnv(4, SEED, 3, deal=5, action_cap=400, discard_order="random", caster=lambda i: (0, 1, 0, 1))

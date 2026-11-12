@@ -37,7 +37,7 @@ import torch
 
 from hexset import seeds
 from hexset.bench.throughput import environment
-from hexn.netbot import load
+from hexn.netbot import load_torch
 from hexn.policy import NetworkPolicy
 from hexset.encoding import to_frame
 from hexn.rewards import reward
@@ -139,7 +139,7 @@ def main(argv: list[str] | None = None) -> int:
     seeds.hold(args, args.players, use="eval")
 
     board = random_base_board(random.Random(args.seed))
-    loaded = load(args.checkpoint, board.topology)
+    loaded = load_torch(args.checkpoint, board.topology)
     # Sampled, not greedy: the head was trained on the distribution the
     # behaviour policy visits, and scoring it on the argmax policy's positions
     # would be measuring it somewhere it never saw.

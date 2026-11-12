@@ -373,7 +373,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     # The shape the seats actually carry, not the base's, or the checkpoints
     # this heat writes would record a head they were not trained with and
-    # `hexn.netbot.load` would rebuild the wrong module. `stored` is what
+    # `hexn.netbot.load_torch` would rebuild the wrong module. `stored` is what
     # every payload below copies forward.
     stored = {
         **stored,

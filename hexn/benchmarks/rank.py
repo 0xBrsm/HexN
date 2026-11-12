@@ -697,7 +697,7 @@ def main(argv: list[str] | None = None) -> int:
                              "than the teacher one")
     parser.add_argument("--wave", type=int, default=16)
     parser.add_argument("--exploration", type=float, default=1.25)
-    # `netbot.load` pins torch to one thread, which is right for the 30-process
+    # `netbot.load_torch` pins torch to one thread, which is right for the 30-process
     # CPU sharding it was built for and crippling for this single process. The
     # rollouts batch every lane per tick, which is what the iGPU is for.
     parser.add_argument("--device", default="cpu")
@@ -717,11 +717,11 @@ def main(argv: list[str] | None = None) -> int:
     import torch
 
     from hexset.mcts import Search
-    from hexn.netbot import LeafEvaluator, load
+    from hexn.netbot import LeafEvaluator, load_torch
     from hexn.policy import NetworkPolicy
 
     board = random_base_board(random.Random(args.seed))
-    loaded = load(args.checkpoint, board.topology, device=args.device)
+    loaded = load_torch(args.checkpoint, board.topology, device=args.device)
     torch.set_num_threads(args.threads)  # after `load`, which sets it to 1
     # `torch.multinomial` wants a generator on the sampled tensor's device,
     # which only bites once the policy is not on the CPU.

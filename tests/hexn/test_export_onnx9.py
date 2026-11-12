@@ -40,7 +40,9 @@ JOINT = ModelConfig(width=16, rounds=2, messages="separate", attention=True, poi
 
 
 @pytest.fixture(autouse=True)
-def _fresh_sessions():
+def _fresh_sessions(tmp_path, monkeypatch):
+    # A seat's ONNX exports (`hexn.netbot.onnx_of`) go in the test's own directory.
+    monkeypatch.setenv("HEXN_ONNX_CACHE", str(tmp_path / "onnx-cache"))
     yield
     _load_cached.cache_clear()
 
@@ -269,7 +271,7 @@ def test_the_metadata_names_contract_9_and_no_offers_unless_asked(tmp_path):
     assert meta["iteration"] == "42" and meta["players"] == "4"
     assert (meta["num_hexes"], meta["num_vertices"], meta["num_edges"]) == ("19", "54", "72")
     assert meta["checkpoint_sha256"] == hashlib.sha256(source.read_bytes()).hexdigest()
-    assert not {"trader", "trader_veto", "trade_floor", "gate_own_frame", "robber_tip", "search"} & set(meta)
+    assert not {"trader", "trader_veto", "trade_floor", "gate_own_frame", "robber_tip", "robber_hits", "search"} & set(meta)
 
 
 @needs("mybot")
@@ -279,17 +281,18 @@ def test_the_served_shape_is_written_by_the_command_line_in_the_keys_hexset_read
     source = a_checkpoint(tmp_path / "net.pt", PARTS)
     out = tmp_path / "served.onnx"
     export_main(["--checkpoint", str(source), "--out", str(out), "--trader", "mybot", "--trader-veto",
-                 "--trade-floor", "0.03", "--max-offers", "1", "--gate-own-frame", "1"])
+                 "--trade-floor", "0.03", "--max-offers", "1", "--gate-own-frame", "1", "--robber-hits"])
     meta = read_metadata(out.read_bytes())
-    assert {k: meta[k] for k in ("contract", "trader", "trader_veto", "trade_floor", "max_offers", "gate_own_frame")} \
+    keys = ("contract", "trader", "trader_veto", "trade_floor", "max_offers", "gate_own_frame", "robber_hits")
+    assert {k: meta[k] for k in keys} \
         == {"contract": "9", "trader": "mybot", "trader_veto": "1", "trade_floor": "0.03", "max_offers": "1",
-            "gate_own_frame": "1"}
+            "gate_own_frame": "1", "robber_hits": "1"}
     from hexset.clients.netbot import declared_trader
 
     game = deal_game(0, 0, 4)
     loaded = load(str(out), game._state.board.topology)
     assert loaded.trader == "mybot" and loaded.trader_veto and loaded.trade_floor == pytest.approx(0.03)
-    assert loaded.gate.max_offers == 1 and loaded.gate.gate_own_frame
+    assert loaded.gate.max_offers == 1 and loaded.gate.gate_own_frame and loaded.robber_hits
     assert declared_trader(loaded, str(out)) == "mybot"
 
 
@@ -326,7 +329,7 @@ def test_a_real_contract_9_checkpoint_exports_and_plays_as_its_torch_net(path, t
     game = deal_game(0, 0, 4)
     from hexn import netbot
 
-    reference = netbot.load(path, game._state.board.topology).policy
+    reference = netbot.load_torch(path, game._state.board.topology).policy
     served = load(str(out), game._state.board.topology).policy
     for game, seat in positions(5, 300):
         options = tuple(options_for(game))
@@ -447,7 +450,7 @@ def test_a_declared_hold_model_reaches_the_torch_seat_the_export_and_the_onnx_se
     written into the exported file's metadata and read back by HexSet's
     loader; a checkpoint without one declares none in every form."""
     from hexn.hold import carried, declared, stamp
-    from hexn.netbot import load as torch_load
+    from hexn.netbot import load_torch as torch_load
     from hexset.holding import HoldModel
 
     hold = HoldModel(shape=1.0, scale=(0.5, 1.0, 0.6, 0.6, 0.7))
@@ -464,3 +467,33 @@ def test_a_declared_hold_model_reaches_the_torch_seat_the_export_and_the_onnx_se
         assert torch_load(str(source), board.topology).hold == expected
         out = export9(str(source), tmp_path / f"{source.stem}.onnx")
         assert load(str(out), board.topology).hold == expected
+
+
+@pytest.mark.parametrize("contract", ["9d.1", "11d"])
+def test_a_seat_plays_a_contract_9_checkpoint_through_its_cached_onnx_export(tmp_path, monkeypatch, contract):
+    """`hexn.netbot.load` (what the arena's entrants load through) plays a
+    contract-9 `.pt` on the CPU as its ONNX export, which chooses every move
+    the torch net chooses; the export is made once and found again by the
+    checkpoint's sha256; `load_torch` gives the torch net and refuses an
+    `.onnx` file."""
+    from hexn import netbot
+
+    netbot.load.cache_clear()
+    config = replace(PARTS, contract=contract, others=True, points=False, global_seat=contract == "9d.1")
+    source = a_checkpoint(tmp_path / "duel.pt", config, players=2)
+    game = _deal(0, 0, 2)
+    topology = game._state.board.topology
+    played = netbot.load(str(source), topology)
+    assert isinstance(played.policy, DecisionPolicy) and played.players == 2
+    assert isinstance(netbot.load_torch(str(source), topology).policy, Policy9)
+    reference = _torch_policy(source, config, players=2)
+    for game, seat in positions(5, 60, players=2):
+        options = tuple(options_for(game))
+        assert played.policy.act_rows([(game, seat, options)]) == reference.act_rows([(game, seat, options)])
+    exported = sorted((tmp_path / "onnx-cache").glob("*.onnx"))
+    assert len(exported) == 1
+    with pytest.raises(ValueError, match="no torch net"):
+        netbot.load_torch(str(exported[0]), topology)
+    netbot.load.cache_clear()
+    monkeypatch.setattr("hexn.export_onnx9.export9", lambda *a, **k: pytest.fail("exported twice"))
+    assert netbot.onnx_of(str(source)) == exported[0]

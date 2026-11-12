@@ -3,7 +3,7 @@
 
 `hexn.netbot` loads a checkpoint straight into PyTorch: fine for the training
 box, but heavier than a browser game on borrowed hardware needs. This script
-runs the exact reconstruction path `netbot.load()` already trusts (same
+runs the exact reconstruction path `netbot.load_torch()` already trusts (same
 shapes, same `state_dict` keys), traces it once with `torch.onnx.export`, and
 embeds the handful of facts hexset's `hexset.clients.onnxbot.load()` needs at
 runtime as ONNX metadata props.
@@ -127,7 +127,7 @@ Needs `torch` (not a declared dependency of this package -- see
 
 The serving keys a served file carries -- `--max-offers`, `--trade-floor`,
 `--trader`, `--trader-veto`, `--gate-own-frame`, `--gate-plies`,
-`--robber-tip` -- are written as asked, for either contract
+`--robber-tip`, `--robber-hits` -- are written as asked, for either contract
 (`hexn.export_onnx9.serving_props`).
 
 Then drop the file into hexset's `models/`; its stem is the name in the
@@ -481,7 +481,7 @@ class _ExportWrapper(nn.Module):
 def _load_checkpoint(
     checkpoint: str, topology: Topology
 ) -> tuple[HexNet, ActionSpace, dict]:
-    """The same reconstruction path `netbot.load` already trusts — so export
+    """The same reconstruction path `netbot.load_torch` already trusts — so export
     uses the exact model-building logic the torch bot relies on, not a second
     implementation that could drift from it."""
     state = torch.load(checkpoint, map_location="cpu", weights_only=False)
@@ -926,6 +926,8 @@ def main(argv: list[str] | None = None) -> None:
                         help="Price another seat's turn from the file's own frame (1) or the mover's (0).")
     parser.add_argument("--robber-tip", type=float, default=None,
                         help="How far its robber moves lean to the leader its value head names, in [0, 1].")
+    parser.add_argument("--robber-hits", action="store_true",
+                        help="Its robber moves always land on a hex with another seat's building where one is legal.")
     runtime.add_argument(parser)
     args = parser.parse_args(argv)
     runtime.load(args.runtime)
@@ -937,7 +939,7 @@ def main(argv: list[str] | None = None) -> None:
         serving = serving_props(
             max_offers=args.max_offers, trader_veto=args.trader_veto, trade_floor=args.trade_floor,
             gate_own_frame=None if args.gate_own_frame is None else bool(args.gate_own_frame),
-            robber_tip=args.robber_tip,
+            robber_tip=args.robber_tip, robber_hits=args.robber_hits,
             # Checked here with the trader it vetoes; written by `export` as `--trader`.
             **({"trader": args.trader} if args.trader_veto else {}),
         )

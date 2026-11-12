@@ -255,13 +255,17 @@ class PPOConfig:
     # batch this many times, so the opening carries that many times its weight
     # in every loss term. 1, the default, enters it once.
     setup_weight: int = 1
-    # The update's forward and backward under autocast in this dtype, with a
-    # gradient scaler stepping the optimiser (`update`'s `scaler`). "" (the
-    # default) is fp32 throughout. "fp16" is the only other value: the network's
+    # The update's forward and backward under autocast in this dtype. "" (the
+    # default) is fp32 throughout. Under "fp16" or "bf16" the network's
     # outputs are cast back to fp32 before the log-softmax and every loss term
     # (`NetworkPolicy.evaluate`), so only the trunk and heads run in half.
-    # bfloat16 is refused: its 7-bit mantissa moves the recomputed log-probs
-    # far enough from the recorded ones to clip positions before any step.
+    # "fp16" steps the optimiser through a gradient scaler (`update`'s
+    # `scaler`), which skips a step whose scaled gradients overflow; "bf16"
+    # has float32's range and steps it directly, with no scaler. Its 7-bit
+    # mantissa moves log-probs away from ones computed in another precision,
+    # so a bf16 update is for a decoupled update (`decoupled`), whose clip is
+    # centred on proximal log-probs `attach_proximal` computes under the same
+    # autocast.
     amp: str = ""
     # Decoupled PPO (Hilton, Cobbe & Schulman 2021): the clip is centred on
     # the policy as it stands when the update starts (`Batch.prox_log_prob`,
@@ -288,8 +292,10 @@ class PPOConfig:
     c9_clip: str = "per-decision"
 
     def __post_init__(self) -> None:
-        if self.amp not in ("", "fp16"):
-            raise ValueError(f"amp must be '' or 'fp16', got {self.amp!r}")
+        if self.amp not in ("", "fp16", "bf16"):
+            raise ValueError(f"amp must be '', 'fp16' or 'bf16', got {self.amp!r}")
+        if self.amp == "bf16" and not self.decoupled:
+            raise ValueError("a bf16 update needs decoupled: its clip is centred on bf16 proximal log-probs")
         if not 0.0 <= self.decided_cut < 0.5:
             raise ValueError(f"decided_cut must lie in [0, 0.5), got {self.decided_cut}")
         if self.decided_cut and (self.vp_reward or self.fast_win):
@@ -654,10 +660,11 @@ def decision_rows(batch: Batch, rows: Tensor, device: torch.device | str) -> dic
 
 
 def autocast(device: torch.device | str, amp: str):
-    """The update's autocast context for `PPOConfig.amp`: fp16 on `device`'s
-    type, or a disabled context that leaves fp32 untouched."""
+    """The update's autocast context for `PPOConfig.amp`: fp16 or bf16 on
+    `device`'s type, or a disabled context that leaves fp32 untouched."""
     kind = torch.device(device).type
-    return torch.autocast(kind, dtype=torch.float16, enabled=amp == "fp16")
+    dtype = torch.bfloat16 if amp == "bf16" else torch.float16
+    return torch.autocast(kind, dtype=dtype, enabled=amp in ("fp16", "bf16"))
 
 
 def attach_prior(
@@ -727,7 +734,7 @@ def staleness(batch: Batch) -> float:
 
 def observation_dtype(config: PPOConfig) -> type:
     """What a batch holds its observations in: float16 under fp16 autocast,
-    else float32.
+    else float32 (bf16 autocast included: numpy has no bfloat16).
 
     Exact, not an approximation. Every forward that reads `Batch.buffer` --
     the update's, `attach_proximal`'s and `attach_prior`'s -- runs under
@@ -1602,13 +1609,13 @@ def update(
     its optimiser steps, and an update `steps` was opened to resume carries
     on from the step it holds.
 
-    Under `config.amp` the losses are scaled by `scaler`, which the caller
+    Under `config.amp == "fp16"` the losses are scaled by `scaler`, which the caller
     keeps for the whole run (its scale carries from update to update), and the
     gradients are unscaled before they are clipped; a step whose scaled
     gradients overflowed is skipped and counted in `Stats.amp_skipped`.
     """
-    if bool(config.amp) != (scaler is not None):
-        raise ValueError("amp and a gradient scaler must come together")
+    if (config.amp == "fp16") != (scaler is not None):
+        raise ValueError("an fp16 update and a gradient scaler must come together")
     from ..steps import Cursor
 
     if bool(config.fast_win) != (batch.fast_target is not None):

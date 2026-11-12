@@ -276,11 +276,11 @@ def main(argv: list[str] | None = None) -> int:
 
     import torch
 
-    from hexn.netbot import LeafEvaluator, load
+    from hexn.netbot import LeafEvaluator, load_torch
     from hexn.policy import NetworkPolicy
 
     board = random_base_board(random.Random(args.seed))
-    loaded = load(args.checkpoint, board.topology)
+    loaded = load_torch(args.checkpoint, board.topology)
     generator = torch.Generator().manual_seed(args.seed)
     policy = NetworkPolicy(
         loaded.policy.net,

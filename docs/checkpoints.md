@@ -235,8 +235,19 @@ source path, its sha256, both widths, the noise, and the seed.
 
 ## Loading a checkpoint at runtime (`hexn.netbot`)
 
-`hexn.netbot.load(path, topology, device, compile_mode)` rebuilds the net
-from the checkpoint. A contract-8 checkpoint is rebuilt from its recorded
+`hexn.netbot.load(path, topology, device)` returns a checkpoint as a seat
+plays it. An `.onnx` file, and a contract-9 `.pt` on the CPU, are played by
+`hexset.clients.onnxbot`: the `.pt` through its ONNX export
+(`hexn.netbot.onnx_of`), made once with the exporter's parity check and kept
+in `HEXN_ONNX_CACHE` (default `~/.cache/hexn/onnx`) under the checkpoint's
+sha256 and the exporter's and model's source, the workers of one run
+exporting it once between them under a file lock. The export makes the
+torch net's decisions and scores a decision about three times faster at a
+batch of one on one CPU thread. Any other `.pt` is rebuilt in torch.
+
+`hexn.netbot.load_torch(path, topology, device, compile_mode)` rebuilds the
+torch net from the checkpoint, for training and for code that reads inside
+the net (`Loaded.policy.net`); it refuses an `.onnx` file. A contract-8 checkpoint is rebuilt from its recorded
 `args` (width, rounds, and head shapes all default to what a checkpoint
 predating those fields was trained with) and wrapped in a greedy
 `NetworkPolicy` (`greedy=True`, taking the argmax). A contract-9 checkpoint
@@ -272,8 +283,8 @@ carries no parameters of its own for it.
 
 How a loaded checkpoint is played (the bot, leaf evaluation, search, and
 trade gate) is runtime-agnostic and lives in `hexset.clients.netbot`, over
-the `hexset.clients.policy.Policy` protocol. `hexn.netbot` only supplies
-the torch-specific half: finding the file and rebuilding the net.
+the `hexset.clients.policy.Policy` protocol. `hexn.netbot` supplies the
+rest: finding the file, rebuilding the net, and exporting it to play.
 
 ## Exporting to ONNX (`hexn.export_onnx`)
 
@@ -290,7 +301,7 @@ Needs `torch` (not a declared dependency; see below) plus `onnx` and
 `pyproject.toml`. Install them separately (`pip install onnx onnxruntime`)
 before running this module.
 
-Traces the reconstruction path `hexn.netbot.load()` uses (same shapes,
+Traces the reconstruction path `hexn.netbot.load_torch()` uses (same shapes,
 same `state_dict` keys) once with `torch.onnx.export`, and
 embeds the facts HexSet's `hexset.clients.onnxbot.load()` reads as ONNX
 metadata. `python -m hexn.export_onnx` dispatches on the checkpoint's own
@@ -373,6 +384,7 @@ The serving flags, written as HexSet's metadata keys of the same names
 | `--trader-veto` | `trader_veto`: the file's own gate vetoes its trader. Needs `--trader` and `--max-offers` above 0 |
 | `--gate-own-frame 0\|1` | `gate_own_frame` |
 | `--robber-tip F` | `robber_tip`, in [0, 1] |
+| `--robber-hits` | `robber_hits`: the file's robber moves stay on other seats' hexes where one is legal |
 
 A numerical parity check runs after every export, on real seeded
 positions, and a mismatch raises (a nonzero exit): an export bug that

@@ -15,7 +15,7 @@ from hexset.encoding import encode, static_graph  # noqa: E402
 from hexset.game import start, to_move  # noqa: E402
 from hexset.clients.netbot import bot_for, searcher_for  # noqa: E402
 from hexn.model import HexNet, ModelConfig  # noqa: E402
-from hexn.netbot import load  # noqa: E402
+from hexn.netbot import load, load_torch  # noqa: E402
 from hexn.trade import trade_params  # noqa: E402
 from hexset.play import step_randomly  # noqa: E402
 
@@ -89,7 +89,7 @@ def test_a_checkpoint_that_predates_the_head_flags_still_loads_as_the_old_shape(
     unloadable by a flag nobody passed.
     """
     path, board = checkpoint
-    config = load(path, board.topology, "cpu").policy.net.config
+    config = load_torch(path, board.topology, "cpu").policy.net.config
 
     assert (config.value_head, config.policy_head) == ("linear", "linear")
 
@@ -107,7 +107,7 @@ def test_a_head_shape_round_trips_through_the_checkpoints_args_dict(tmp_path):
     board = a_checkpoint(path, shape=shape)
     load.cache_clear()
 
-    loaded = load(str(path), board.topology, "cpu")
+    loaded = load_torch(str(path), board.topology, "cpu")
 
     config = loaded.policy.net.config
     for field, value in shape.items():

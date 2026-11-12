@@ -297,11 +297,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--amp",
-        choices=("auto", "fp16", "off", ""),
+        choices=("auto", "fp16", "bf16", "off", ""),
         default="auto",
         help="run the update's (and the prior's) forward and backward under "
-        "fp16 autocast with a gradient scaler. Default 'auto': fp16 when "
-        "--device is a GPU, fp32 on CPU; 'off' (or '') keeps fp32. See PPOConfig",
+        "fp16 autocast with a gradient scaler, or bf16 autocast with none "
+        "(needs --decoupled). Default 'auto': fp16 when --device is a GPU, "
+        "fp32 on CPU; 'off' (or '') keeps fp32. See PPOConfig",
     )
     parser.add_argument(
         "--batch-on-device",
@@ -750,7 +751,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     policy, optimiser, _ = build(args)
     # One scaler for the whole run, so the scale it has found carries from
     # update to update (and across a resume, through the checkpoint).
-    scaler = torch.amp.GradScaler(torch.device(args.device).type) if config.amp else None
+    scaler = torch.amp.GradScaler(torch.device(args.device).type) if config.amp == "fp16" else None
     directory = Path(args.checkpoint_dir)
     latest = directory / "latest.pt"
     log = directory / "log.jsonl"

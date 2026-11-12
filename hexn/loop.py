@@ -442,7 +442,7 @@ def add_head_flags(parser: argparse.ArgumentParser) -> None:
     """The readout shapes, on every trainer that writes a checkpoint.
 
     Shared rather than repeated because the shape has to reach the checkpoint's
-    `args` under exactly these names: `hexn.netbot.load` rebuilds the config
+    `args` under exactly these names: `hexn.netbot.load_torch` rebuilds the config
     from that dict, and a run whose shape is not recorded there is a run whose
     checkpoint cannot be loaded back. Both default to the shape every run on
     record used, so adding these changes nothing until one is passed.
@@ -536,7 +536,7 @@ def net9_config(args) -> dict:
     two setup turns, and a net is built with no joint double-turn heads
     (`double_turn="parts"`) unless `--double-turn joint` (contract 11d) asks
     for them, so a checkpoint it saves is read the same way by
-    `hexn.netbot.load`."""
+    `hexn.netbot.load_torch`."""
     return {"contract": str(getattr(args, "contract", "9")), "heads": args.heads,
             "discard": args.discard_head, "norm": bool(args.norm),
             "messages": args.messages, "attention": bool(args.attention), "others": bool(getattr(args, "others", False)),
@@ -545,7 +545,7 @@ def net9_config(args) -> dict:
 
 
 def model_record(policy) -> dict:
-    """What a checkpoint carries beside `args` for `hexn.netbot.load` to
+    """What a checkpoint carries beside `args` for `hexn.netbot.load_torch` to
     rebuild its net: a contract-9 net's `model_config`, nothing for contract 8
     (whose shape `args` records)."""
     if getattr(policy.net, "CONTRACT", "8") not in CONTRACTS9:

@@ -38,7 +38,7 @@ from hexset.bench.throughput import environment
 from hexset.board.board import random_base_board
 from hexn.expert import SearchPolicy
 from hexn.trade import trade_params
-from hexn.netbot import load, searcher_for
+from hexn.netbot import load_torch, searcher_for
 from hexn.selfplay import Collector
 from . import add_games_dir, games_kept
 
@@ -105,7 +105,7 @@ def measure(
     rng = random.Random(seed)
     board = random_base_board(rng)
     search = searcher_for(
-        load(checkpoint, board.topology, device, compile_mode),
+        load_torch(checkpoint, board.topology, device, compile_mode),
         simulations=simulations,
         wave=wave,
         # `None` is the budget the checkpoint trained under, which `Loaded`

@@ -69,7 +69,7 @@ def same(a, b):
 
 def test_joined_arrays_and_split_heads_are_their_parts(tmp_path):
     paths, topology = checkpoints(tmp_path)
-    policy = netbot.load(paths[0], topology).policy
+    policy = netbot.load_torch(paths[0], topology).policy
     rows = positions()
     parts = [rows[:7], rows[7:8], rows[8:25], rows[25:]]
     feeds = [policy.score_feed(part) for part in parts]
@@ -89,7 +89,7 @@ def test_joined_arrays_and_split_heads_are_their_parts(tmp_path):
 def test_a_lone_client_reads_every_net_as_it_reads_in_process(tmp_path, gather):
     paths, topology = checkpoints(tmp_path)
     rows = positions()
-    local = [netbot.load(path, topology).policy for path in paths]
+    local = [netbot.load_torch(path, topology).policy for path in paths]
     server = Server.start(paths, topology, clients=2, device="cpu", gather=gather)
     try:
         panel, other = Panel(server.connection(0), paths, topology), Panel(server.connection(1), paths, topology)

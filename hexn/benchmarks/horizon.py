@@ -255,12 +255,12 @@ def main(argv: list[str] | None = None) -> int:
 
     import torch
 
-    from hexn.netbot import load
+    from hexn.netbot import load_torch
     from hexn.policy import NetworkPolicy
 
     lambdas = [float(x) for x in args.lambdas.split(",") if x.strip()]
     board = random_base_board(random.Random(args.seed))
-    loaded = load(args.checkpoint, board.topology)
+    loaded = load_torch(args.checkpoint, board.topology)
     generator = torch.Generator().manual_seed(args.seed)
     policy = NetworkPolicy(
         loaded.policy.net,
