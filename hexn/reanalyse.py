@@ -18,8 +18,8 @@ only `visits`/`prior` are recomputed.
 
 Sampling is uniform over every retained position, not only the freshest
 iteration's: staleness is worst for the *oldest* rows, collected under the
-earliest, weakest net still in the window, so weighting toward them (rather
-than away) is the point.
+earliest net still in the window, so sampling them as often as the newest is
+the point.
 """
 
 from __future__ import annotations

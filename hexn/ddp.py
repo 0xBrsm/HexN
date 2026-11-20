@@ -1,15 +1,9 @@
 # SPDX-License-Identifier: GPL-3.0-only
 """The PPO update, data-parallel across CPU worker processes.
 
-Why CPU processes rather than a single-device GPU update: at this model's
-size, the forward+backward pass is too small an op for the usual
-single-device speedups (compile, larger minibatches, lower precision) to
-move much, and CPU *threads* don't scale either, because the ops are too
-small for intra-op parallelism to pay for itself. What that does not rule
-out is *data* parallelism: many independent single-threaded CPU processes,
-each running the whole fwd+bwd on its own shard of the batch, are worth more
-together than one device — provided the gradients can be combined cheaply,
-which at this model's parameter count they can.
+Data parallelism: many independent single-threaded CPU processes, each
+running the whole fwd+bwd on its own shard of the batch, with the gradients
+combined on the learner.
 
 The shape mirrors `hexn.collect`: spawned workers behind pipes, specs not
 objects, torch's shared-memory tensor transport doing the heavy lifting. Each
@@ -28,7 +22,7 @@ normalisation (the learner computes the minibatch's mean and std, because a
 worker only sees its slice), same loss arithmetic by construction. The
 equivalence is pinned by test rather than argued.
 
-Two deployment requirements, both learned by hitting them. The tensor
+Two deployment requirements. The tensor
 transport goes through /dev/shm, and docker's 64 MB default SIGBUSes on the
 first shard — run the container with `--ipc host` (what the training recipe
 already uses) or an `--shm-size` sized to the batch. And any script that
@@ -150,8 +144,7 @@ def _serve(spec: UpdateSpec, connection) -> None:
                 # `minibatch_terms`'s scalar fields are device tensors now (see
                 # `hexn.ppo.Terms`), read back here rather than left that way:
                 # a worker is a single CPU process, so `float(...)` on one of
-                # its own tensors is a plain read, not the cross-device sync
-                # the GPU update was paying it 112 times a minibatch to avoid.
+                # its own tensors is a plain read, not a cross-device sync.
                 # `pieces_sum` downstream is a plain numpy accumulation and
                 # wants Python floats, not tensors, to add into it.
                 pieces = (

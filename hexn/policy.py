@@ -10,38 +10,24 @@ once; this module answers the whole batch with a single `forward`, a single
 host-to-device copy and a single read-back. Everything else here exists to
 keep it to one.
 
-## Every action is one flat index again
+## Every action is one flat index
 
-Under contract 4 the flat categorical had one slot, `PROPOSE_TRADE`, that did
-not name what it had chosen — an offer is ten numbers — so the policy carried
-`give`/`want` heads, a masked pair distribution, a joint log-prob and a pair
-mask riding along in `Choice.aux` for PPO to reuse. Contract 5 deletes the
-trade actions outright (`hexset.trading`): trades clear once a turn from the
-seats' published valuation vectors, which are *observation*, never action. So
+Trades are not actions (`hexset.trading`): they clear as an engine event. So
 `ActionSpace.decode` turns every sampled index back into exactly the `Action`
-`legal_actions` emitted, the log-prob is the flat categorical's and nothing
-else, and none of that apparatus has a successor.
+`legal_actions` emitted, and the log-prob is the flat categorical's and
+nothing else.
 
-## What the network brings to a trade instead
+## What the network brings to a trade
 
-Contract 6's trading redesign (`hexset.trading`) deletes the public layer
-outright — there is no published valuation vector any more, nothing is
-advertised, and the mechanic's whole observation surface is each seat's
-private gate. That gate is
-`hexset.clients.netbot.NetworkBot`, and it is the engine's, not this
-package's: it builds the post-trade position (both hands moved, the
+The trade gate is `hexset.clients.netbot.NetworkBot`, and it is the engine's,
+not this package's: it builds the post-trade position (both hands moved, the
 counterparty's ledger row certified) and asks a `hexset.clients.policy.
 Policy` what it is worth. `NetworkPolicy` is that `Policy` for torch, and
-`trader` below seats it behind the engine's gate. There is still no new
-parameter and no policy-gradient path through trading — the verdict is read
-off the value head the run already trains, exactly as reading (A) always
-was.
+`trader` below seats it behind the engine's gate. Trading has no parameter of
+its own and no policy-gradient path: the verdict is read off the value head
+the run already trains.
 
-A torch copy of the gate lived here until 0.19.0 (`DerivedTrader`,
-`after_exchange`) and drifted from the ONNX one three ways before anybody
-noticed: the copy is gone, and what is left is the runtime.
-
-## What is not optimised here, and why
+## What is not optimised here
 
 The rollout is plumbing-bound rather than compute-bound: engine stepping,
 encoding and legal-action enumeration in plain Python cost comparably to the
@@ -402,10 +388,9 @@ class NetworkPolicy:
         """`hexset.clients.policy.Policy.score_rows`: `(prior, value)` per
         position, as `hexset.mcts` wants a leaf scored.
 
-        Every option has its own flat slot — the trade actions, and with them
-        the one slot that stood for many offers, are gone (`hexset.trading`)
-        — so the prior over a leaf's options is a plain gather from the
-        masked row.
+        Every option has its own flat slot (trades are not actions,
+        `hexset.trading`), so the prior over a leaf's options is a plain
+        gather from the masked row.
         """
         if not rows:
             return []
@@ -449,8 +434,7 @@ class NetworkPolicy:
         """What this policy brings to `game`'s trade event at `seat`.
 
         A driver seats one of these per seat on `game.gates`; the engine asks
-        it for a private-gate verdict (`hexset.trading.valued_many` — there
-        is no public layer left for a gate to publish anything to). The gate
+        it for a private-gate verdict (`hexset.trading.valued_many`). The gate
         is the engine's own (`hexset.clients.netbot.NetworkBot`), seated at
         this position exactly as `NetworkBot.choose` seats itself: it builds
         the post-trade positions and this policy only says what they are

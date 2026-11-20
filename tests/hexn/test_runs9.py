@@ -145,8 +145,7 @@ def test_the_two_clips_by_hand():
 def test_a_runaway_decision_ratio_stays_finite():
     """A decision the update has moved 200 nats above its anchor, whose
     behaviour weight has underflowed to zero: `e**200` overflows float32,
-    and the uncapped surrogate was `inf * 0`, NaN (the contract-8 path's cap,
-    `RATIO_LOG_CAP`, did not reach `decision_surrogate`). Both clips."""
+    and the uncapped surrogate would be `inf * 0`, NaN. Both clips."""
     log_prob = torch.tensor([100.0, 100.0, 200.0])
     anchor = torch.zeros(3)
     old = torch.full((3,), 200.0)

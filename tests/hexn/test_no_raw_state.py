@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: GPL-3.0-only
 """HexNet must never touch the engine's private state field.
 
-`Game.state` is a method now (`game.state(seat, *, hidden=True)`), not a
-field: reads go through it and the only sanctioned write is
-`game.set_state(...)`. This guards against a regression back to the raw
+`Game.state` is a method (`game.state(seat, *, hidden=True)`), not a
+field: reads go through it and the only permitted write is
+`game.set_state(...)`. This guards against reads or writes of the raw
 `_state` field, which would bypass the engine's information-set boundary
 silently. (An attribute-style `game.state = ...` shadows the method, so the
 next `game.state(seat)` fails loudly on its own.)

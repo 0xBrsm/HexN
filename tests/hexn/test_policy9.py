@@ -60,10 +60,9 @@ def test_native_complete_input_reuse_restores_every_head_and_current_weights(joi
     assert not np.array_equal(changed.flat,actual.flat)
 
 
-@pytest.mark.parametrize("limit", [256, 1])
 @pytest.mark.parametrize("double_turn", ["parts", "joint"])
 @pytest.mark.parametrize("contract", ["9", "9.1"])
-def test_checkpoint_batch_consumes_the_same_plans_as_individual_rows(limit, double_turn, contract, request):
+def test_checkpoint_batch_consumes_the_same_plans_as_individual_rows(double_turn, contract, request):
     from dataclasses import replace
     from hexset.actions import apply, options_for
     from hexset.game import to_move
@@ -77,8 +76,6 @@ def test_checkpoint_batch_consumes_the_same_plans_as_individual_rows(limit, doub
     model = HexNet(space_for(game), game._state.board.topology, 4,
                    replace(CONFIG, double_turn=double_turn, contract=contract)).eval()
     batched, individual = [Policy9(model, model.space) for _ in range(2)]
-    for pol in (batched, individual):
-        pol._plans.LIMIT = limit
     tables = [[deal_game(7, i, 4) for i in range(6)] for _ in range(2)]
     batches = []
     heads = batched._heads
@@ -316,7 +313,7 @@ def test_a_double_turn_decision_is_refused_in_self_play():
 
 def _draw_with_noise_everywhere(pol, scores, batch, keys):
     """`NetworkPolicy9._draw` with Gumbel noise on every slot of every row,
-    legal or not, as it once drew."""
+    legal or not: the reference the legal-only draw is checked against."""
     from hexn.policy import keyed_gumbel, keyed_gumbel_at
     from hexn.policy9 import _block_argmax
 

@@ -3,7 +3,7 @@
 
 Checkpointing, the duel/versus/ladder evaluation stack and the network
 builder are common to every trainer, so they live here rather than in
-`hexn.ppo` (PPO's own loop) once a second and third trainer needed them too.
+`hexn.ppo` (PPO's own loop).
 
 ## Checkpointing is for crashes, so it is written to survive one
 
@@ -63,12 +63,10 @@ class Progress:
     truncated: float
     mean_actions: float
     mean_turns: float
-    # The trading canary, and the registration's readout (d): how many
-    # exchanges the engine's one trade event a turn actually cleared
-    # (`hexset.trading`). It replaces the accept/propose pair, which counted
-    # actions that no longer exist. There is no cap, so over-trading from a
+    # The trading canary: how many exchanges the engine's one trade event a
+    # turn cleared (`hexset.trading`). There is no cap, so over-trading from a
     # miscalibrated value head shows up here rather than being silently
-    # clipped; the shipped heuristic lineup reads a mean of 0.151.
+    # clipped.
     trades_per_turn: float = 0.0
     # Every game the run has trained on through this iteration, resumes
     # included; None when the run resumed from a checkpoint that predates the
@@ -101,7 +99,7 @@ class _Checkpoint:
 
     `trade_params` is how this network bargains, read by name by
     `hexset.clients.netbot.bot_for` (`hexset.trading.params_of`): the run's own
-    offer budget (`hexn.trade.trade_params`). A table no longer caps trading;
+    offer budget (`hexn.trade.trade_params`). A table does not cap trading;
     each seat declares its own, and this is the network declaring its own.
     """
 
@@ -186,8 +184,7 @@ def duel(
     `max_offers` is the network's own offer budget, passed in rather than
     defaulted, because a network that trades where the run did not is
     measuring a different game. The random seats never trade at all
-    (`hexset.bots.RandomBot`), exactly as the `RandomPolicy` this replaced
-    never did.
+    (`hexset.bots.RandomBot`).
     """
     seats = frozenset(network_seats)
     cast = tuple(0 if seat in seats else 1 for seat in range(players))
@@ -256,10 +253,9 @@ def versus(
     disagree about what they measured — one pairing law, not two independent
     derivations of it.
 
-    The cast stays `hexset.casting.alternating` rather than `compete`'s own
-    adjacent lineup, for continuity with every existing reading under it.
-    `swapped(alternating(n))` is `alternating(n, flip=True)`, so the
-    antithetic complement is the same lineup this loop has always played.
+    The cast is `hexset.casting.alternating` rather than `compete`'s own
+    adjacent lineup. `swapped(alternating(n))` is `alternating(n, flip=True)`,
+    so the antithetic complement is the same lineup.
 
     The board and the dice cancel; **the seats do not**, unless `antithetic`.
     `alternating` keys the cast to the game index and the board is keyed to the
@@ -444,19 +440,15 @@ def add_head_flags(parser: argparse.ArgumentParser) -> None:
     Shared rather than repeated because the shape has to reach the checkpoint's
     `args` under exactly these names: `hexn.netbot.load_torch` rebuilds the config
     from that dict, and a run whose shape is not recorded there is a run whose
-    checkpoint cannot be loaded back. Both default to the shape every run on
-    record used, so adding these changes nothing until one is passed.
+    checkpoint cannot be loaded back. Both default to `linear`, so adding
+    these changes nothing until one is passed.
     """
     parser.add_argument(
         "--value-head",
         default="linear",
         choices=VALUE_HEADS,
         help="what the value head reads and how deeply. 'linear' is the "
-        "default; the other shapes exist to test whether reading more of "
-        "the trunk changes what the value head is good at, since being "
-        "well-calibrated in expectation and being good at ranking siblings "
-        "are different properties and a shape can have one without the "
-        "other",
+        "default; the other shapes read more of the trunk",
     )
     parser.add_argument(
         "--quantiles",
@@ -470,8 +462,7 @@ def add_head_flags(parser: argparse.ArgumentParser) -> None:
         "--policy-head",
         default="linear",
         choices=POLICY_HEADS,
-        help="per-node-type policy readout depth; holds capacity comparable "
-        "across a --value-head ablation",
+        help="per-node-type policy readout depth",
     )
     parser.add_argument(
         "--detach-value",
@@ -483,10 +474,9 @@ def add_head_flags(parser: argparse.ArgumentParser) -> None:
         "--fused",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="the learner's forward runs the fused GEMM trunk — same math, "
-        "fewer kernels. Default: on when --device is a GPU, off on CPU (where "
-        "it measured slower); the collect workers choose theirs with "
-        "--collect-trunk",
+        help="the learner's forward runs the fused GEMM trunk: same math, "
+        "fewer kernels. Default: on when --device is a GPU, off on CPU; the "
+        "collect workers choose theirs with --collect-trunk",
     )
 
 

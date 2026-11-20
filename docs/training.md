@@ -128,8 +128,8 @@ toward the eventual winner exactly as `hexn.ppo` does (`--value-horizon`
 opts into bootstrapping off the search's own backed-up value instead, at
 that many decisions' remove).
 
-Each iteration searches over a slightly better base than the last, since
-the search improves along with the policy it is rooted on. `--init` names
+Each iteration's search is rooted on the policy the iteration before it
+trained. `--init` names
 the starting checkpoint (ignored when `--resume`ing); there is no teacher.
 
 **The trade budget is the network's own.** `--max-offers` is how many
@@ -154,8 +154,8 @@ terminal winner by default, which does not go stale the way a search prior
 does.
 
 `--corpus <file>` collects once and replays that fixed file every iteration
-instead of growing a store, for comparing two losses on identical collected
-data, off-policy with respect to whichever net wrote the file.
+instead of growing a store, so every iteration trains on the same data,
+off-policy with respect to whichever net wrote the file.
 
 `--contested-only`, `--anchor`, `--contested-margin`, `--stake-scale` gate
 which rows the policy term trains on: only where the search overruled the
@@ -168,17 +168,16 @@ particular).
 ## The learner league (`hexn.league`)
 
 ```bash
-python -m hexn.run.init --mode league --name my-heat \
+python -m hexn.run.init --mode league --name my-league \
     --parent runs/my-run/latest.pt \
     -- --base runs/my-run/latest.pt \
        --learner "" --learner "lr=1.5e-4" --learner "entropy=0.03" \
-       --iterations 60 --checkpoint-dir runs/heats/my-heat
-python -m hexn.league runs/heats/my-heat
+       --iterations 60 --checkpoint-dir runs/my-league
+python -m hexn.league runs/my-league
 ```
 
 N learners warm-start from one `--base` checkpoint and share every game, one
-seat each, so a four-arm comparison costs collection once plus four
-quarter-sized updates. `--learner` is
+seat each: one collection feeds every learner's update. `--learner` is
 repeated once per learner; each occurrence is `""` (the base config
 unchanged) or a comma-separated list of `key=value` overrides (`lr`,
 `entropy`, `clip`, `c_v`, `value_lam`, `epochs`, `minibatch`, `kl_break`,
@@ -276,11 +275,8 @@ and dice cancel) plus a Wilson interval on the win rate. `hexn.loop.ladder`
 runs the current weights, argmax'd, against every configured rung: the
 run's own `--parent` checkpoint, an optional `--search-rung` (a named arena
 entrant, e.g. `searchbot`), and, if `--rival <directory>` names another run,
-that run's checkpoint at the *matched* iteration, which gives the ladder a
-recipe-vs-recipe column beside a common-opponent one. Rungs are fixed
-points: a duel against a fixed weak opponent saturates once the policy is
-reliably stronger, and a flat ladder reading means the policy stopped
-improving.
+that run's checkpoint at the *matched* iteration. Every rung but the rival
+is the same opponent at every evaluation of a run.
 
 **The network builder** (`hexn.loop.build`, `hexn.loop.add_head_flags`,
 `hexn.loop.add_net9_flags`) constructs the network and its policy from a

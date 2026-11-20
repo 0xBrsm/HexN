@@ -104,6 +104,23 @@ def test_the_object_path_and_the_columns_assemble_the_same_batch(cohort):
         assert (a is None and b is None) or torch.equal(a, b), field
 
 
+@pytest.mark.parametrize("amp,dtype", [("", np.float32), ("fp16", np.float16)])
+def test_prepared_game_archives_preserve_the_complete_original_records(cohort, tmp_path, amp, dtype):
+    import gzip
+    from dataclasses import replace
+
+    _, _, games = cohort
+    held = durable.Partial(tmp_path / "partial")
+    for game in games:
+        held.write(game)
+    original, prepared = tmp_path / "original.gz", tmp_path / "prepared.gz"
+    durable.archive(held, original)
+    _, _, stripped = prepare_games(games, dtype, None, replace(CONFIG, amp=amp), 4)
+    assert all(episode.trajectories == () for episode in stripped)
+    durable.archive(held, prepared, episodes=stripped)
+    assert gzip.decompress(original.read_bytes()) == gzip.decompress(prepared.read_bytes())
+
+
 def test_a_half_precision_batch_is_the_columns_rounded():
     """Under fp16 the observations, owner pointers and reach included, are
     held in half: the pointers exactly."""

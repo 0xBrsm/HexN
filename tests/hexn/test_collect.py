@@ -18,8 +18,7 @@ def spec(worker: int, workers: int, **overrides) -> WorkerSpec:
     # Trade-free by default (`max_offers=0`): nothing below is about trading,
     # and a network's gate prices every coverable candidate after every MAIN
     # action (`hexset.trading.trade_event`, `hexn.policy.NetworkPolicy.trader`)
-    # -- at a nonzero budget that made a worker's cohort cost tens of seconds
-    # to a couple of minutes for plumbing tests that never look at a trade.
+    # -- a cost plumbing tests that never look at a trade need not pay.
     # Same trade `some_episodes` (`test_ppo.py`) and `searched_episodes`
     # (`test_exit.py`) already make. A test that needs trades overrides it.
     # Truncated games are as good as finished ones for every claim here.
@@ -245,9 +244,8 @@ def test_a_league_worker_records_every_seat_and_loads_a_weight_list():
 def test_the_league_caster_balances_seats_and_fixes_adjacency():
     """The property that made a permutation option necessary.
 
-    Rotation alone balances every learner over every board seat -- which is why
-    board position was excluded as the cause of the noise heats' two tight pairs
-    -- but it leaves the cyclic order round the table invariant, so learner 0's
+    Rotation alone balances every learner over every board seat, but it
+    leaves the cyclic order round the table invariant, so learner 0's
     turn-order successor is learner 1 in every game ever played.
     """
     from hexn.collect import league_caster
@@ -296,9 +294,8 @@ def test_a_paired_worker_wraps_its_caster_and_deals_paired_boards():
 # The compatibility claim these pin: `parent` must resolve to exactly what it
 # resolved to before any entrant spec was accepted, because recorded runs were
 # collected against it and its numbers cannot be allowed to change meaning
-# without their configuration changing. `greedy` was the other reserved name;
-# HexSet 0.47.0 deleted the bot behind it with `search2`, and it is now an
-# unknown mix name rather than a name quietly pointing at a different bot.
+# without their configuration changing. `greedy` is an unknown mix name, not
+# a name quietly pointing at a different bot.
 
 
 def _a_checkpoint(path, *, players: int = 4):

@@ -9,32 +9,25 @@ finds that the raw policy does not already have.
 ## The loss is one cross-entropy over the flat slots
 
 The search's target is a distribution over *concrete options*; the policy's is
-one row over flat action slots. Under contract 4 those were different shapes —
-`PROPOSE_TRADE` was a single slot standing for many offers, so the target had
-to be factored into a slot row and an offer row and the two cross-entropies
-weighted back together. Contract 5 deletes the trade actions
-(`hexset.trading`), so every option now has its own slot, several options can
-still share one (`space.index` is many-to-one nowhere else), and the
-projection is a plain sum of each option's mass onto its own slot.
+one row over flat action slots. The action space has no trade actions
+(`hexset.trading`), so every option maps to a slot through `space.index`, and
+the projection is a plain sum of each option's mass onto its slot (options
+that share a slot add).
 
 ## Temperature is applied over options, before the projection
 
 `visit_policy` sharpens the distribution the search actually chose among, so it
 belongs at option level rather than after aggregation.
 
-## The value head is still trained on terminal outcomes
+## The value head is trained on terminal outcomes
 
-Not on the search's backed-up root value, which is the tempting alternative and
-is deliberately not taken here by default (`--value-horizon` opts into it). So
+Not on the search's backed-up root value, which is not the default
+(`--value-horizon` opts into it). So
 the value half is exactly what `hexn.ppo` does, `to_frame` and `win_loss`
 reused unchanged: the target is the one-hot eventual winner, and the loss is
 cross-entropy against `Prediction.value_logits`, mirroring `ppo.minibatch_terms`
 term for term (including its quantile-head branch, `test_ppo`'s coverage of
-which this module's own tests reuse the shape of). This module used to train
-the value head on `hexn.rewards.reward` — relative terminal points, a margin
-— by squared error; contract 6 made `Prediction.value` a win-probability
-softmax over seats, and `hexn.ppo` moved first, so this module was left
-mismatched (a probability minus a margin, squared) until now.
+which this module's own tests reuse the shape of).
 
 ## `--value-horizon`'s bootstrap target is not a proper probability vector
 
@@ -100,8 +93,8 @@ from ..selfplay import Episode, Transition
 # shuffling, explained variance and the once-per-update stat reduction are
 # short functions that mean the same thing in both trainers, and a
 # `hexn.training` holding only those would be more indirection than it
-# saves. The reward rotation is not among them any more: it is
-# `hexset.encoding.to_frame`, the encoder's own.
+# saves. The reward rotation is `hexset.encoding.to_frame`, the encoder's
+# own.
 from hexset.encoding import to_frame
 from ..ppo import _explained_variance, _stack_mean, _stack_median
 from ..steps import Cursor
@@ -114,15 +107,12 @@ if TYPE_CHECKING:
 class DistillConfig:
     temperature: float = 1.0
     # Train the policy only where the search overruled it, and on a hard argmax
-    # rather than the visit distribution. Both default off, so existing
-    # behaviour is unchanged.
+    # rather than the visit distribution. Both default off.
     #
-    # Why. Handing back the visit *distribution* everywhere is worse than
-    # handing back nothing where the search agreed with the policy: the
-    # distribution's entropy is set by the search's own exploration settings
-    # -- `exploration`, `simulations`, branching -- not by the position. Play
-    # reads the argmax; training read the distribution. These two flags close
-    # that gap.
+    # Why. The visit *distribution*'s entropy is set by the search's own
+    # exploration settings (`exploration`, `simulations`, branching), not by
+    # the position. Play reads the argmax; training reads the distribution.
+    # These two flags close that gap.
     contested_only: bool = False
     hard_target: bool = False
     # Visit share the search's pick must lead the policy's by before the row
@@ -171,10 +161,8 @@ class DistillConfig:
     #
     # Retaining more than the newest iteration's rows is safe here in a way it
     # is not for PPO (`hexn.store.EpisodeStore`, `--replay-positions`): a
-    # policy-gradient batch that runs several generations off-policy costs
-    # strength and caps the learning rate -- but that is a *policy gradient*,
-    # an estimator that needs an importance correction to stay valid
-    # off-policy. Distillation is a supervised cross-entropy against a fixed
+    # policy gradient is an estimator that needs an importance correction to
+    # stay valid off-policy. Distillation is a supervised cross-entropy against a fixed
     # label: no ratio, no correction, nothing to break. And the label is
     # local -- a visit count is what the search measured at that position, so
     # it inherits none of the game-level terminal noise that makes the *game*
@@ -223,9 +211,9 @@ class Stats:
     # against the one-hot target -- `hexn.ppo.Stats`'s own field, reused
     # here for the same reason: `value_loss` above is cross-entropy (or, under
     # a quantile head, the pinball loss), and the two are on different scales,
-    # so a run compared against a value-head ablation needs one column both
-    # configurations compute identically. Equal to `value_loss` under no head
-    # shape any more, now that the win head's loss is categorical.
+    # so this is one column every value-head configuration computes
+    # identically. It differs from `value_loss` under every head shape, since
+    # the win head's loss is categorical.
     value_mse: float = 0.0
     anchor_loss: float = 0.0
     # Mean policy entropy over the batch, useful for diagnosing whether the
@@ -239,8 +227,7 @@ class Stats:
     # makes true of `agreement_settled` by construction.
     agreement_contested: float = 0.0
     agreement_settled: float = 0.0
-    # How many rows actually carried policy gradient. Derived from the split
-    # gauges before, which needed algebra and an assumption; logged now.
+    # How many rows carried policy gradient.
     contested_positions: int = 0
     # The tether's divergence, averaged over the update's minibatches (0.0
     # with the tether off), and the median pre-clip gradient norm.
@@ -259,7 +246,7 @@ class Batch:
     # 1 where the policy should learn from this row, 0 where it should not.
     # A weight rather than a filter so the *value* head still sees every
     # position: restricting it to contested rows would train it on a biased
-    # slice of the state distribution, which is a different experiment.
+    # slice of the state distribution.
     policy_weight: Tensor
     # The anchor's target and its weight: the recorded prior on the same two
     # rows, and `1 - policy_weight` wherever a prior was actually recorded. Zero
@@ -519,8 +506,7 @@ def _value_targets(
     `horizon` 0 gives every decision the terminal target — `terminal` itself,
     `win_loss(episode.outcome)` rotated into this seat's frame by the caller:
     the one-hot eventual winner, or all-zero for an unfinished game, exactly
-    `hexn.ppo`'s own value target. That is what AlphaZero does and what this
-    trainer has always done.
+    `hexn.ppo`'s own value target. That is what AlphaZero does.
 
     A bootstrapped target refuses to look that far. Counting `horizon` of the
     seat's *own* decisions ahead — not game steps, since three other seats move
@@ -545,23 +531,21 @@ def _value_targets(
     ends. `hexset.mcts` is this project's read-only engine, so that mismatch is
     not fixed here: the horizon target is exactly this seat's own backed-up
     component, with the rest of the vector carried through unrenormalised, on
-    whatever scale the search actually produced it — the same pass-through
-    this function has always done, now on a vector whose own-seat component
+    whatever scale the search produced it, so the own-seat component
     approximates a win probability rather than being one by construction.
 
     **`Transition.value` is in board order here, and the target is in the
     seat's frame.** `SearchPolicy._value` returns `Node.totals`, whose columns
     are board seats, while `to_frame` puts the seat itself first to match what the
     encoder fed the network. The two policies that fill this field disagree on
-    frame — `NetworkPolicy` emits the mover's frame — which nothing caught
-    because until now nothing read it. Rotating is not optional; skipping it
-    trains without complaint and plays nonsense.
+    frame (`NetworkPolicy` emits the mover's frame). Rotating is not
+    optional; skipping it trains without complaint and plays nonsense.
 
     Falls back to the terminal target at the end of a trajectory, and wherever
-    no estimate was recorded. A forced move records one: since HexSet 1.1 the
-    search evaluates a root with one legal move and returns the evaluator's
-    value for it, where it used to return none, so a horizon that lands on a
-    forced move now bootstraps from that value instead of falling back.
+    no estimate was recorded. A forced move records one: the search (HexSet
+    1.1 and later) evaluates a root with one legal move and returns the
+    evaluator's value for it, so a horizon that lands on a forced move
+    bootstraps from that value.
     """
     if horizon <= 0:
         return [terminal] * len(trajectory)
@@ -625,11 +609,8 @@ def refresh(
 
     Nothing here has a gradient. It runs once per iteration, not per epoch.
 
-    **The comparison is over options, and under contract 5 that is the same
-    thing as over slots.** It was not under contract 4, where the trade slot
-    was a *sum* over every offer on the row and the two definitions disagreed
-    on about a third of rows; the offer row and the option-space argmax it
-    needed both retired with the trade actions (`hexset.trading`).
+    **The comparison is over options, and with no trade actions in the action
+    space (`hexset.trading`) that is the same thing as over slots.**
     """
     rows = len(batch)
     device = policy.device
@@ -750,8 +731,9 @@ def _backward(
             loss = loss + config.value_coefficient * share * value_loss
             add("value_loss", share * value_loss)
             with torch.no_grad():
-                # Logged, never differentiated: the column comparable across a
-                # value-head ablation, whatever the loss actually differentiated.
+                # Logged, never differentiated: the column every value-head
+                # configuration computes the same way, whatever the loss
+                # differentiated.
                 add("value_mse", share * (value - target).pow(2).mean())
             values.append(value.detach())
         if with_policy:
@@ -814,7 +796,7 @@ def update(
 
     Two shapes, chosen by `pack_contested`.
 
-    Unpacked is the original: one pass, every term on the same minibatch. The
+    Unpacked is one pass, every term on the same minibatch. The
     policy term then rides the value term's sampling, so it sees relatively
     few contested rows a step -- a small-sample gradient estimate taken
     often.
@@ -887,8 +869,8 @@ def update(
 
     for _ in range(config.epochs):
         # The value pass. Every row, unbiased -- restricting it to contested rows
-        # would train the value head on a biased slice of the state distribution,
-        # which is a different experiment.
+        # would train the value head on a biased slice of the state
+        # distribution.
         for rows in cursor.passes(size, config.minibatch):
             rows = rows.to(home)
             sums = step(rows, with_value=True, with_policy=not packed)

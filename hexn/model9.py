@@ -63,7 +63,7 @@ from torch import Tensor, nn
 from hexset.actions import YEAR_OF_PLENTY_PAIRS, Action, ActionSpace, ActionType
 from hexset.board.terrain import NUM_RESOURCES
 from hexset.contract9 import (
-    CARD_SCALE, CONTRACTS, HEX_FEATURES, MY_COLUMNS_11D, MY_FEATURES_11D, OTHER_COLUMNS_11D, OTHER_FEATURES_11D,
+    BOARD_COLUMNS_11D, CARD_SCALE, CONTRACTS, HEX_FEATURES, MY_COLUMNS_11D, MY_FEATURES_11D, OTHER_COLUMNS_11D, OTHER_FEATURES_11D,
     PIECE_SCALE, SEAT_FEATURES, SEAT_FEATURES_9D, TABLE_FEATURES, VERTEX_FEATURES, Layout9, features, hex_features,
     incidences,
 )
@@ -134,8 +134,8 @@ class ModelConfig:
     width: int = 64
     rounds: int = 3
     # "linear" (c8's): every head one linear layer. "mlp": each head with a
-    # hidden layer of `width`, as c9-bc's first run trained (its model config
-    # predates this field and loads as "mlp", `config_of`).
+    # hidden layer of `width` (a model config written before this field
+    # loads as "mlp", `config_of`).
     heads: str = "linear"
     # The discard head's shape apart from the others: "mlp" scores a kept hand
     # with a hidden layer, so cards can count together (brick with wood), which
@@ -178,6 +178,31 @@ class ModelConfig:
     # "joint" checkpoint initialises one through `without_joint_head`.
     double_turn: str = "joint"
     contract: str = "9"
+    # A setup branch: in setup positions (before the game's first roll: every
+    # setup decision and the finished setup), the trunk's tokens take
+    # `setup_rounds` more rounds and then
+    # `setup_attend` pre-norm transformer layers over every hex, vertex, seat
+    # and table token before the heads; every other position reads the trunk
+    # alone, as a net without the branch. 0 and 0: no branch, no parameters.
+    # Contract 11d and pooled messages only. Checkpoints written before the
+    # fields had none.
+    setup_rounds: int = 0
+    setup_attend: int = 0
+    # A setup value head beside the win head: a hidden layer of `width` over
+    # the win head's read, each seat's win chance (`Prediction.setup_value_logits`),
+    # meant for finished setups and fitted on its own; it feeds nothing else, so
+    # the policy and the win head read exactly as without it. Contract 11d.
+    setup_value: bool = False
+    # A branch of its own under the setup value head: in setup positions the
+    # trunk's tokens, as they are before the setup branch, take
+    # `setup_value_rounds` more rounds and `setup_value_attend` transformer
+    # layers (the setup branch's shapes, other weights) and a norm, and the
+    # head reads those seat tokens in place of the win head's read. Every
+    # other position gives the head the trunk's seat tokens through that norm.
+    # 0 and 0: no branch. Only the head reads it, so the policy and the win
+    # head read exactly as without it. Needs `setup_value` and pooled messages.
+    setup_value_rounds: int = 0
+    setup_value_attend: int = 0
 
     def __post_init__(self) -> None:
         if self.contract not in CONTRACTS:
@@ -187,6 +212,21 @@ class ModelConfig:
                 raise ValueError(f"unknown head shape {shape!r}")
         if self.messages not in ("separate", "pooled"):
             raise ValueError(f"unknown message layout {self.messages!r}")
+        if self.setup_rounds < 0 or self.setup_attend < 0:
+            raise ValueError("setup_rounds and setup_attend count layers: 0 or more")
+        if (self.setup_rounds or self.setup_attend) and self.messages != "pooled":
+            raise ValueError("the setup branch runs pooled rounds: messages must be \"pooled\"")
+        if self.setup_value and self.contract != "11d":
+            raise ValueError("the setup value head is contract 11d's")
+        if self.setup_value_rounds < 0 or self.setup_value_attend < 0:
+            raise ValueError("setup_value_rounds and setup_value_attend count layers: 0 or more")
+        if self.setup_value_rounds or self.setup_value_attend:
+            if not self.setup_value:
+                raise ValueError("the setup value branch feeds the setup value head: setup_value must be on")
+            if self.messages != "pooled":
+                raise ValueError("the setup value branch runs pooled rounds: messages must be \"pooled\"")
+        if (self.setup_rounds or self.setup_attend) and self.contract != "11d":
+            raise ValueError("the setup branch reads contract 11d's board block (turn, rolled): contract must be 11d")
         if self.double_turn not in DOUBLE_TURNS:
             raise ValueError(f"unknown double turn {self.double_turn!r}: {DOUBLE_TURNS}")
         if self.contract == "11d":
@@ -207,7 +247,12 @@ def config_of(model_config: dict) -> ModelConfig:
                          norm=model_config.get("norm", False), messages=model_config.get("messages", "separate"),
                          attention=model_config.get("attention", True), others=model_config.get("others", False),
                          global_seat=model_config.get("global_seat", False), points=model_config.get("points", False),
-                         double_turn=model_config.get("double_turn", "joint"))
+                         double_turn=model_config.get("double_turn", "joint"),
+                         setup_rounds=model_config.get("setup_rounds", 0),
+                         setup_attend=model_config.get("setup_attend", 0),
+                         setup_value=model_config.get("setup_value", False),
+                         setup_value_rounds=model_config.get("setup_value_rounds", 0),
+                         setup_value_attend=model_config.get("setup_value_attend", 0))
 
 
 JOINT_HEADS = ("first_head.", "second_head.", "pair_head.", "pair_matrix")
@@ -236,6 +281,7 @@ class Prediction:
     value: Tensor
     value_logits: Tensor
     points: Tensor | None = None                # the points head, per seat, the perspective first
+    setup_value_logits: Tensor | None = None    # the setup value head's logits, per seat, the perspective first
     logits: Tensor | None = None
     road: Tensor | None = None
     me: Tensor | None = None
@@ -353,6 +399,29 @@ class _Round(nn.Module):
         super()._load_from_state_dict(state_dict, prefix, *args)
 
 
+class _SetupBlock(nn.Module):
+    """One pre-norm transformer layer of the setup branch (as
+    `nn.TransformerEncoderLayer` with `norm_first`, GELU and no dropout),
+    written out: the library layer's inference fast path is one fused
+    operator that the ONNX exporter cannot export."""
+
+    def __init__(self, width: int, heads: int = 4) -> None:
+        super().__init__()
+        self.heads = heads
+        self.norm1 = nn.LayerNorm(width)
+        self.qkv = nn.Linear(width, 3 * width)
+        self.out = nn.Linear(width, width)
+        self.norm2 = nn.LayerNorm(width)
+        self.ff = nn.Sequential(nn.Linear(width, 4 * width), nn.GELU(), nn.Linear(4 * width, width))
+
+    def forward(self, x: Tensor) -> Tensor:
+        b, n, w = x.shape
+        q, k, v = self.qkv(self.norm1(x)).view(b, n, 3, self.heads, w // self.heads).permute(2, 0, 3, 1, 4)
+        a = nn.functional.scaled_dot_product_attention(q, k, v)                   # (B, heads, N, W / heads)
+        x = x + self.out(a.transpose(1, 2).reshape(b, n, w))
+        return x + self.ff(self.norm2(x))
+
+
 def _others(sn: Tensor, dim: int, players: int) -> Tensor:
     """Each seat's mean of the other seats' tokens, the `players` seats along
     `dim`: at two seats, the one opponent's token. `players` is the net's
@@ -452,6 +521,7 @@ class HexNet(nn.Module):
                                  else _mlp(2 * width + 10, width, 1))
             self.road_building = nn.Linear(2 * width, 1)    # playing the card at all
         self._initialise()
+        self._setup_branch_modules(width)
 
         hex_vertex = np.asarray([(h, v) for h, vs in enumerate(topology.hex_vertices) for v in vs]).T
         ends = np.asarray(topology.edges, dtype=np.int64)           # (edges, 2)
@@ -602,6 +672,114 @@ class HexNet(nn.Module):
                 state_dict[key] = nn.functional.pad(weight, (0, self.config.width))
         super()._load_from_state_dict(state_dict, prefix, *args)
 
+    def _setup_branch_modules(self, width: int) -> None:
+        """The setup branch (`ModelConfig.setup_rounds`, `setup_attend`), built
+        after `_initialise` so the rest of the net draws the same initial
+        weights as a net without it. Its rounds take the trunk's scheme
+        (orthogonal, gain sqrt 2, zero bias); its transformer layers
+        (`_SetupBlock`) torch's defaults, with a learned embedding per kind of token (hex, vertex,
+        seat, table) and no position: they know the board only through what
+        the rounds wrote into each token."""
+        c = self.config
+        self.setup_rounds = None
+        self.setup_attend = None
+        if c.setup_rounds:
+            self.setup_rounds = self._branch_rounds(width, c.setup_rounds)
+        if c.setup_attend:
+            self.setup_kind = nn.Parameter(0.02 * torch.randn(4, width))
+            self.setup_attend = nn.Sequential(*(_SetupBlock(width) for _ in range(c.setup_attend)))
+        # Built after the branch, so nothing above draws other initial weights for it.
+        self.setup_value_head = _mlp(2 * width, width, 1) if c.setup_value else None
+        # The setup value head's own branch, built last for the same reason.
+        self.setup_value_rounds = None
+        self.setup_value_kind = None
+        self.setup_value_attend = None
+        self.setup_value_out = None
+        if c.setup_value_rounds or c.setup_value_attend:
+            if c.setup_value_rounds:
+                self.setup_value_rounds = self._branch_rounds(width, c.setup_value_rounds)
+            if c.setup_value_attend:
+                self.setup_value_kind = nn.Parameter(0.02 * torch.randn(4, width))
+                self.setup_value_attend = nn.Sequential(*(_SetupBlock(width) for _ in range(c.setup_value_attend)))
+            self.setup_value_out = _norm(width, c.norm)
+
+    def _branch_rounds(self, width: int, count: int) -> nn.ModuleList:
+        """`count` pooled rounds for a branch, initialised by the trunk's
+        scheme (orthogonal, gain sqrt 2, zero bias)."""
+        c = self.config
+        rounds = nn.ModuleList(_Round(width, c.norm, True, c.attention, c.others, board=self.two) for _ in range(count))
+        for module in rounds.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.orthogonal_(module.weight, gain=2**0.5)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+        return rounds
+
+    def _setup_branch(self, h: Tensor, v: Tensor, s: Tensor, t: Tensor | None, seats: Tensor, table: Tensor,
+                      vertex_owner: Tensor, road_owner: Tensor, reach: Tensor):
+        """The trunk's batch-first tokens with the setup branch applied to the
+        setup rows; every other row unchanged (`_branch`)."""
+        return self._branch(self.setup_rounds, self.setup_kind if self.setup_attend is not None else None,
+                            self.setup_attend, h, v, s, t, seats, table, vertex_owner, road_owner, reach)
+
+    def _branch(self, rounds: nn.ModuleList | None, kind: Tensor | None, attend: nn.Module | None,
+                h: Tensor, v: Tensor, s: Tensor, t: Tensor | None, seats: Tensor, table: Tensor,
+                vertex_owner: Tensor, road_owner: Tensor, reach: Tensor):
+        """The trunk's batch-first tokens with a branch (`rounds`, then
+        `attend` over every token with its `kind` embedding added) applied to
+        the setup rows (the board block's turn count 0 and dice not yet thrown:
+        every setup decision and the finished setup before the first roll, and
+        no position after it), gathered, run and written back; every other row
+        unchanged."""
+        setup = (table[:, BOARD_COLUMNS_11D["turn"].start] == 0) & (table[:, BOARD_COLUMNS_11D["rolled"].start] == 0)
+        exporting = torch.onnx.is_in_onnx_export()
+        if exporting:
+            # Traced, every row runs the branch and only setup rows keep it: no
+            # shape depends on how many rows are setup rows. Each row is its own
+            # computation, so the numbers are the gathered path's.
+            hh, vv, ss, tt, vo, ro, rc = h, v, s, t, vertex_owner, road_owner, reach
+        else:
+            if not bool(setup.any()):
+                return h, v, s, t
+            at = setup.nonzero().squeeze(1)
+            hh, vv, ss = h.index_select(0, at), v.index_select(0, at), s.index_select(0, at)
+            tt = None if t is None else t.index_select(0, at)
+            vo, ro, rc = vertex_owner.index_select(0, at), road_owner.index_select(0, at), reach.index_select(0, at)
+        if rounds is not None:
+            rows = torch.arange(self.players, device=seats.device)
+            owns_v = (vo.unsqueeze(-1) == rows).to(seats.dtype)                  # (b, V, P)
+            owns_e = (ro.unsqueeze(-1) == rows).to(seats.dtype)                  # (b, E, P)
+            road = owns_e.sum(-1)
+            built = owns_v.sum(1).clamp(min=1.0).unsqueeze(-1)
+            roads_held = owns_e.sum(1).clamp(min=1.0).unsqueeze(-1)
+            reached = rc.sum(-1).clamp(min=1e-3).unsqueeze(-1)
+            scale = ss.shape[-1] ** 0.5
+            for r in rounds:
+                hh, vv, ss, tt = self._pooled_round(r, hh, vv, ss, tt, owns_v, owns_e, road, built, roads_held, rc,
+                                                    reached, scale)
+        if attend is not None:
+            parts = [hh + kind[0], vv + kind[1], ss + kind[2]]
+            if tt is not None:
+                parts.append(tt.unsqueeze(1) + kind[3])
+            tokens = attend(torch.cat(parts, 1))
+            sizes = [hh.shape[1], vv.shape[1], ss.shape[1]] + ([1] if tt is not None else [])
+            split = tokens.split(sizes, 1)
+            hh, vv, ss = split[0], split[1], split[2]
+            tt = split[3].squeeze(1) if tt is not None else None
+        if exporting:
+            keep = setup.view(-1, 1, 1)
+            h, v, s = torch.where(keep, hh.to(h.dtype), h), torch.where(keep, vv.to(v.dtype), v), torch.where(
+                keep, ss.to(s.dtype), s)
+            if t is not None:
+                t = torch.where(setup.view(-1, 1), tt.to(t.dtype), t)
+            return h, v, s, t
+        h = h.index_copy(0, at, hh.to(h.dtype))
+        v = v.index_copy(0, at, vv.to(v.dtype))
+        s = s.index_copy(0, at, ss.to(s.dtype))
+        if t is not None:
+            t = t.index_copy(0, at, tt.to(t.dtype))
+        return h, v, s, t
+
     def _initialise(self) -> None:
         """`hexn.model.HexNet._initialise`'s scheme: orthogonal √2 through the
         trunk, 0.01 on every layer that emits a logit, 1.0 on the win head."""
@@ -632,13 +810,39 @@ class HexNet(nn.Module):
                 vertex_owner: Tensor, road_owner: Tensor, reach: Tensor, *, policy: bool = True) -> Prediction:
         """The win head, and with `policy` the policy's outputs: a value-only
         row (another seat's view of a decision) skips every policy head."""
+        h, v, s, t = self._trunk(seats, table, hexes, vertices, vertex_owner, road_owner, reach)
+        sv = self._setup_value_seats(h, v, s, t, seats, table, vertex_owner, road_owner, reach)
+        if self.setup_rounds is not None or self.setup_attend is not None:
+            h, v, s, t = self._setup_branch(h, v, s, t, seats, table, vertex_owner, road_owner, reach)
+        h, v, s, t = self.out_hex(h), self.out_vertex(v), self.out_seat(s), self._out_table(t)
+        value_logits, value, points = self._value(s, t, seats)
+        if not policy:
+            return self._with_setup_value(Prediction(value=value, value_logits=value_logits, points=points), s, sv)
+        return self._with_setup_value(self._emit(s, t, h, v, value, value_logits, points, seats), s, sv)
+
+    def setup_value(self, seats: Tensor, table: Tensor, hexes: Tensor, vertices: Tensor,
+                    vertex_owner: Tensor, road_owner: Tensor, reach: Tensor) -> Tensor:
+        """The setup value head's logits alone, per seat, the perspective
+        first: the numbers `forward` gives as `Prediction.setup_value_logits`.
+        Where the head has a branch of its own this runs the trunk, that
+        branch and the head, and neither the setup branch nor any other head."""
+        if self.setup_value_head is None:
+            raise ValueError("the net has no setup value head")
+        if self.setup_value_out is None:
+            return self.forward(seats, table, hexes, vertices, vertex_owner, road_owner, reach,
+                                policy=False).setup_value_logits
+        h, v, s, t = self._trunk(seats, table, hexes, vertices, vertex_owner, road_owner, reach)
+        sv = self._setup_value_seats(h, v, s, t, seats, table, vertex_owner, road_owner, reach)
+        return self._setup_value_read(sv)
+
+    def _trunk(self, seats: Tensor, table: Tensor, hexes: Tensor, vertices: Tensor,
+               vertex_owner: Tensor, road_owner: Tensor, reach: Tensor):
+        """The trunk's batch-first tokens `(h, v, s, t)` after its rounds, by
+        the fused path (`_fused_trunk`) or, with `fused` off, the reference
+        loop below."""
         if self.fused:
             s, t, h, v = self._fused_trunk(seats, table, hexes, vertices, vertex_owner, road_owner, reach)
-            h, v, s, t = self.out_hex(h), self.out_vertex(v), self.out_seat(s), self._out_table(t)
-            value_logits, value, points = self._value(s, t, seats)
-            if not policy:
-                return Prediction(value=value, value_logits=value_logits, points=points)
-            return self._emit(s, t, h, v, value, value_logits, points, seats)
+            return h, v, s, t
         # Ownership as one comparison each: a pointer of -1 matches no seat.
         rows = torch.arange(self.players, device=seats.device)
         owns_v = (vertex_owner.unsqueeze(-1) == rows).to(seats.dtype)            # (B, V, P)
@@ -690,11 +894,7 @@ class HexNet(nn.Module):
             else:
                 t = t + r.table(torch.cat([tn, r.norm_seat(s.mean(1)), r.norm_hex(h.mean(1)),
                                            r.norm_vertex(v.mean(1))], -1))
-        h, v, s, t = self.out_hex(h), self.out_vertex(v), self.out_seat(s), self._out_table(t)
-        value_logits, value, points = self._value(s, t, seats)
-        if not policy:
-            return Prediction(value=value, value_logits=value_logits, points=points)
-        return self._emit(s, t, h, v, value, value_logits, points, seats)
+        return h, v, s, t
 
     def _embed_seats(self, seats: Tensor, table: Tensor, dim: int) -> tuple[Tensor, Tensor | None]:
         """The seat tokens, stacked along `dim` (1 batch-first, 0 seat-major),
@@ -855,6 +1055,29 @@ class HexNet(nn.Module):
         else:
             t = t + r.table(torch.cat([tn, r.norm_seat(s.mean(1)), r.norm_hex(h.mean(1)), r.norm_vertex(v.mean(1))], -1))
         return h, v, s, t
+
+    def _setup_value_seats(self, h: Tensor, v: Tensor, s: Tensor, t: Tensor | None, seats: Tensor, table: Tensor,
+                           vertex_owner: Tensor, road_owner: Tensor, reach: Tensor) -> Tensor | None:
+        """The seat tokens the setup value head reads where it has a branch
+        of its own: the trunk's tokens (before the setup branch) through that
+        branch on the setup rows, then its norm. `None` without one."""
+        if self.setup_value_out is None:
+            return None
+        _, _, sv, _ = self._branch(self.setup_value_rounds, self.setup_value_kind, self.setup_value_attend,
+                                   h, v, s, t, seats, table, vertex_owner, road_owner, reach)
+        return self.setup_value_out(sv)
+
+    def _with_setup_value(self, out: Prediction, s: Tensor, sv: Tensor | None) -> Prediction:
+        """`out` with the setup value head's logits where the net has one: the
+        head over each seat token with my token, the win head's read `s` or,
+        where the head has a branch of its own, that branch's seat tokens `sv`."""
+        if self.setup_value_head is not None:
+            out.setup_value_logits = self._setup_value_read(s if sv is None else sv)
+        return out
+
+    def _setup_value_read(self, tokens: Tensor) -> Tensor:
+        """The setup value head over each seat token with my token."""
+        return self.setup_value_head(torch.cat([tokens, tokens[:, :1].expand_as(tokens)], -1)).squeeze(-1)
 
     def _value(self, s: Tensor, t: Tensor | None, seats: Tensor) -> tuple[Tensor, Tensor, Tensor | None]:
         """The win head's logits and softmax over seats, and the points head's

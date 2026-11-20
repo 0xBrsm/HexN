@@ -19,24 +19,17 @@ steered is roughly quadratic in step size, so additive nudges are the wrong
 shape; a dead zone because a controller with no dead zone oscillates on
 sampling noise alone.
 
-The clamp is not a formality here. In parts of this landscape, `approx_kl`
-barely responds to the learning rate at all — doubling the rate can leave the
-reading almost unchanged. A band controller with no clamp reads a KL like
-that as "far too cold" and multiplies the rate every iteration looking for a
-response the rate alone will not produce in that regime. Whatever is actually
-setting the step size there, `max_lr` is what stops the controller from
-running away while looking for it, and `AdaptiveLR.deaf` is how a run notices
-it is happening rather than discovering it in the wreckage.
+The clamp guards against an `approx_kl` that barely responds to the learning
+rate. A band controller with no clamp reads such a KL as "far too cold" and
+multiplies the rate every iteration looking for a response the rate alone will
+not produce. `max_lr` stops the controller from running away, and
+`AdaptiveLR.deaf` is how a run notices it is happening.
 
 `linear_anneal` is kept alongside because it is the other standard answer and
 the two compose: anneal the *ceiling* over a run while the controller works
 underneath it. `warmup` ramps a constant or annealed rate in over a run's first
 iterations, for a run that starts a fresh optimiser at a rate its checkpoint
-was not trained at. What this module deliberately does **not** do is touch the
-entropy coefficient. Exploration here is steered by the trading canary
-(`trades_per_turn`), a gauge on a different timescale with a different
-failure mode, and moving two controllers at once would make a regression
-unattributable to either one.
+was not trained at. This module does **not** touch the entropy coefficient.
 """
 
 from __future__ import annotations
@@ -49,8 +42,7 @@ class HasParamGroups(Protocol):
     """Just the surface of an optimiser this module needs.
 
     A Protocol rather than `torch.optim.Optimizer` so the controller and its
-    tests stay importable where torch is not — the dev container has no torch,
-    and a scheduling rule is exactly the kind of thing that should be testable
+    tests stay importable where torch is not: a scheduling rule is testable
     without a GPU image.
     """
 
@@ -65,7 +57,7 @@ def current_lr(optimiser: HasParamGroups) -> float:
 def set_lr(optimiser: HasParamGroups, lr: float) -> None:
     """Mutate every group in place — the same thing a torch LRScheduler does.
 
-    Adam's moment estimates are deliberately left alone. They are statistics of
+    Adam's moment estimates are left alone. They are statistics of
     the gradient, not of the step size, so a rate change should ride the warm
     state rather than restart it; resetting them would make every controller
     move also a momentum reset, and the two effects would be inseparable.

@@ -94,7 +94,7 @@ def test_the_schedule_warms_the_constant_and_the_linear_rate():
 
     assert [scheduled_lr(args("constant", 0), i) for i in (0, 9)] == [6e-4, 6e-4]
     assert [scheduled_lr(args("constant", 2), i) for i in (0, 1, 2)] == pytest.approx([3e-4, 6e-4, 6e-4])
-    # Without a warm-up, linear is the anneal the loop always set; with one, the anneal ramped in.
+    # Without a warm-up, linear is the plain anneal; with one, the anneal ramps in.
     assert [scheduled_lr(args("linear", 0), i) for i in range(10)] == pytest.approx(
         [linear_anneal(6e-4, i, 10, 0.5) for i in range(10)])
     assert scheduled_lr(args("linear", 2), 0) == pytest.approx(linear_anneal(6e-4, 0, 10, 0.5) / 2)

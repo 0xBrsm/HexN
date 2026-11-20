@@ -16,12 +16,12 @@ reference and the fused forward.
 
 Why the copies get noise. Two exactly identical units receive exactly
 identical gradients and stay identical for the rest of training: a wide net
-built at `--noise 0` is a narrow net with a bigger bill, and a capacity probe
-run on it would measure nothing. `--noise σ` adds Gaussian noise of `σ` times
+built at `--noise 0` computes what the narrow net does at a larger cost, and
+keeps doing so. `--noise σ` adds Gaussian noise of `σ` times
 each copied row's RMS to the copies' incoming weights — the sources are left
 untouched — which separates the copies while moving the function by an amount
 the tool reports (max |Δ| of the outputs and the mean policy KL against the
-source) so the registration can bound it.
+source) so the caller can bound it.
 
 What the checkpoint carries. The parent's `iteration`, `games_started` and
 `torch_rng`, so `hexn.ppo --resume` continues the count and the game index

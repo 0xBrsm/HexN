@@ -232,8 +232,7 @@ class _Contract7Inputs(nn.Module):
         parts.append((deck_size.to(torch.float32) / DECK_SIZE).unsqueeze(-1))
         parts.append(torch.clamp(turns.to(torch.float32) / TURN_SCALE, max=1.0).unsqueeze(-1))
 
-        # There is no public valuation block here any more: contract 6
-        # deleted trading's whole public layer (`hexset.trading`), so
+        # Contract 7 has no public valuation block (`hexset.trading`), so
         # `encoding._encode_globals` goes straight from the three scalars
         # above to the ledger tail below, and so does this trace.
 

@@ -10,7 +10,7 @@ can score well on the first and still fail badly on the second, and when its
 own-child spread sits far below its own error, PUCT ranks children on noise
 and does it confidently.
 
-The architectural suspicion is the readout, and it is specific. `self.value` is
+The question this module asks is about the readout. `self.value` is
 `nn.Linear(width, players)` reading the global token alone, and the global
 token's only view of the board is `h.mean(1), v.mean(1), e.mean(1)`. One
 settlement moved between two siblings is a 1/54th change in one of those means,
@@ -19,7 +19,7 @@ a head that was trained badly.
 
 ## Refit, don't retrain
 
-Answering this properly is a fresh PPO run per shape, which is days. This is
+The full answer is a fresh PPO run per shape. This is
 the cheap form of the same question: freeze the trunk the run already produced,
 throw away the head, fit a new one of a different shape on the same value
 targets, and hand the result to `benchmarks.sibling`. What that can show is
@@ -65,15 +65,15 @@ episodes.
 
 The targets themselves are `hexn.rewards.reward` rotated by
 `hexset.encoding.to_frame`, the same two calls PPO's `assemble` makes, reused rather than rewritten because
-the frame is a documented past bug: `to_frame` puts the seat itself in slot 0 to
+the frame is easy to get wrong: `to_frame` puts the seat itself in slot 0 to
 match what the encoder fed the network, and getting it backwards trains
 without complaint and plays nonsense.
 
-## This does not measure the thing we care about
+## Value loss is not the sibling question
 
-It measures value loss, which is the quantity already known to be a poor guide
-here — a head can fit the outcome well and still be flat across siblings, which
-is exactly the situation being investigated. The measurement is:
+It measures value loss, which does not settle the sibling question: a head
+can fit the outcome well and still be flat across siblings. This module fits
+the head, and `benchmarks.sibling` then scores the refit head on that question:
 
     python -m hexn.benchmarks.head_shape --checkpoint runs/example/latest.pt \\
         --corpus tmp/valued.corpus --shape mlp --out runs/heads/mlp.pt --json
@@ -217,8 +217,7 @@ def owned_by_head(net) -> tuple[str, ...]:
     which pools the vertex embeddings the head then reads. That is part of the
     readout, so it has to be fitted with it — and, more sharply, it exists in no
     checkpoint written before the shape did. Counting it as trunk makes the
-    parent's state dict look incomplete and aborts the run, which is exactly
-    how the first sweep lost `attn`.
+    parent's state dict look incomplete and aborts the run.
     """
     import torch
 

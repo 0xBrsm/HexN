@@ -33,7 +33,7 @@ floor.
 
 `--dump-returns PATH` additionally writes every position's raw rollout returns
 to disk. This module keeps only the two scalars `split` produces because that
-is all a floor/bias readout needs; the dump exists for `benchmarks.return_shape`,
+is all the floor/bias split needs; the dump exists for `benchmarks.return_shape`,
 which asks a different question of the same samples -- the *shape* of each
 position's conditional return distribution, not just its variance -- and needs
 the samples themselves to do it. Absent the flag, nothing is written and every
@@ -43,8 +43,7 @@ Every position is one line of `--rows` (a JSONL journal, named from the
 settings when not given) the moment its rollouts are in, and a rerun with the
 same settings probes only the positions the journal does not hold yet. Each
 position draws its rollouts from streams keyed by its own index, so it reads
-the same whichever positions came before it; the shared streams it used to
-draw from made it depend on all of them. `--dump-returns` is written from the
+the same whichever positions came before it. `--dump-returns` is written from the
 journal once every position is in.
 """
 
@@ -113,9 +112,8 @@ class Sampling:
 class Branching(Collector):
     """A collector whose every lane starts from one given position.
 
-    Subclassed rather than parameterised because `hexn.selfplay` is on the path
-    of every result this project has recorded, and a benchmark should not be
-    the reason it grows an argument.
+    Subclassed rather than parameterised, so `hexn.selfplay`'s collector
+    takes no argument that only a benchmark uses.
     """
 
     def __init__(self, policy, position, *, rng, **kwargs) -> None:
@@ -315,8 +313,7 @@ def main(argv: list[str] | None = None) -> int:
     # filesystem paths with no bearing on what the run measured, and this dict
     # is what bit-identical-off-path is checked against, so a CLI flag that
     # defaults off must not be visible here at all -- present or absent -- or
-    # every recorded floor.py output would stop matching a fresh run bit for
-    # bit.
+    # an earlier floor.py output would stop matching a fresh run bit for bit.
     recorded_args = {
         k: v for k, v in vars(args).items() if k not in ("dump_returns", "rows")
     }

@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: GPL-3.0-only
 """Is a Catan seat's conditional terminal return actually Gaussian?
 
-The case for a distributional value head rests entirely on the target being
-non-Gaussian, and nothing on this project has ever measured that directly --
-it was inherited motivation, and an earlier pass withdrew the borrowed
-sentence it rested on. `benchmarks.floor` already produces the thing this
-needs. It snapshots a position, replays it many times with
+A distributional value head has something to fit only if the target is
+non-Gaussian; this module measures that. `benchmarks.floor` produces the
+input it needs. It snapshots a position, replays it many times with
 `hexset.game.imagine`, and keeps only two scalars from the resulting return
 sample: its variance (the floor) and the
 squared gap between its mean and the head's prediction (bias^2). Everything

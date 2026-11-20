@@ -107,9 +107,9 @@ from ..trade import check_trader
 from .prepare import Prepared, Preparer, coalition_gauges, fast_win_gauges, games_digest, learner_final_vp, prepare, prepare_games  # noqa: F401
 
 
-# Arbitrary but documented: a single in-process collector saturates around
-# 2-3 cores of concurrency, so below this many cores a lone collector is not
-# obviously wrong -- a 4-core laptop has nowhere to shard to.
+# Arbitrary but documented: a single in-process collector uses only a few
+# cores, so below this many cores a lone collector is not obviously wrong --
+# a 4-core laptop has nowhere to shard to.
 MANY_CORES = 8
 
 
@@ -233,9 +233,7 @@ def build_parser() -> argparse.ArgumentParser:
     # The value head's own horizon, separate from the advantage estimator's.
     # 1.0 is the terminal outcome, and the only value the win head accepts:
     # its target is the categorical one-hot winner, which has no continuous
-    # bootstrap to mix in (see `hexn.ppo`'s module docstring for the
-    # margin-head lambda-return this flag used to drive, before the win head
-    # superseded the margin head as the trained objective).
+    # bootstrap to mix in.
     parser.add_argument("--value-lambda", type=float, default=1.0)
     parser.add_argument("--entropy", type=float, default=0.01)
     parser.add_argument("--value-coefficient", type=float, default=0.5)
@@ -373,11 +371,10 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="run the ladder before the first update, so the trend has a baseline",
     )
-    # A duel against a weak fixed opponent (e.g. random play) saturates once
-    # the policy is reliably stronger, and measures nothing further after
-    # that. The ladder replaces it: fixed rungs whose strength never moves,
-    # so a flat reading means the policy stopped improving rather than the
-    # yardstick running out.
+    # The ladder: fixed rungs whose strength never moves, so a flat reading
+    # means the policy stopped improving rather than the yardstick running
+    # out, as a duel against one weak fixed opponent (random play) does once
+    # the policy wins it reliably.
     parser.add_argument(
         "--parent",
         default="",
@@ -386,9 +383,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--search-rung",
         default="",
-        help="an extra ladder rung by arena entrant name, e.g. 'mybot' "
-        "— the handcrafted baseline, local, and unlike catanatron it plays the "
-        "trading game. Costs search time per eval, so it is opt-in; adding it "
+        help="an extra ladder rung by arena entrant name, e.g. 'mybot', "
+        "a handcrafted bot that plays the trading game. Costs search time per "
+        "eval, so it is opt-in; adding it "
         "leaves the parent rung untouched, so the existing trend stays "
         "comparable. There is no automatic handcrafted rung: name one here or "
         "the ladder is the parent alone",
@@ -402,10 +399,9 @@ def build_parser() -> argparse.ArgumentParser:
         "'parent' or any arena entrant spec, so a held-out opponent "
         "can be collected against and not merely evaluated on",
     )
-    # The single in-process collector only uses 2-3 cores regardless of how
-    # many the box has, so on a many-core box it is the bottleneck. Sharding
-    # it across processes is the largest speedup available; see `hexn.collect`
-    # for the shape and what was rejected.
+    # The single in-process collector uses only a few cores however many the
+    # box has; sharding it across processes uses the rest. See `hexn.collect`
+    # for the shape.
     parser.add_argument(
         "--collect-workers",
         type=int,
@@ -420,7 +416,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="cohort",
         help="cohort deals exactly --games-per-iteration games and plays every "
         "one to completion, so the batch is on-policy and unbiased in game "
-        "length; stream is the old behaviour, which refills a lane the moment "
+        "length; stream refills a lane the moment "
         "its game ends and carries the unfinished ones across the weight sync",
     )
     parser.add_argument(
@@ -461,9 +457,7 @@ def build_parser() -> argparse.ArgumentParser:
         "update is not sharded; --no-async-collect for the synchronous loop",
     )
 
-    # Compile, precision, minibatch size and CPU thread count do not move the
-    # GPU update's per-position cost; data-parallel CPU processes are the
-    # lever left. See `hexn.ddp`.
+    # Data-parallel CPU processes for the update. See `hexn.ddp`.
     parser.add_argument(
         "--update-workers",
         type=int,
@@ -567,9 +561,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     A run is `runs/<...>/` holding `run.json` and a frozen `config/`, created by
     `python -m hexn.run.init`. Flags are not accepted here: the manifest is the
-    only input, so a recorded result is reproducible from the repository rather
-    than from whichever script in gitignored `tmp/` happened to survive. See
-    `hexn.run.manifest` for the three losses that motivated this.
+    only input, so a run is reproducible from the repository
+    (`hexn.run.manifest`).
     """
     from ..run import load
     from ..run.manifest import MODULES
@@ -761,13 +754,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     counted = GameCount()
     first_game = 0
     if args.resume and not latest.exists() and not args.init:
-        # `--resume` with nothing to resume used to fall through and start from
-        # iteration 0 on freshly initialised weights, silently. On a long GPU
-        # run that is hours of compute spent discarding progress, and the log
-        # gives no sign of it — it simply begins at 0 and looks healthy. A
-        # typo'd `--checkpoint-dir`, or a new directory nobody remembered to
-        # seed, is all it takes. Same failure shape as the learning rate that
-        # `--resume` used to discard: a flag that quietly does nothing.
+        # `--resume` with nothing to resume is refused rather than starting
+        # from iteration 0 on freshly initialised weights: a typo'd
+        # `--checkpoint-dir`, or a new directory nobody seeded, would
+        # otherwise discard progress silently, with a log that begins at 0
+        # and looks healthy.
         raise SystemExit(
             f"--resume was given but {latest} does not exist; "
             "seed the directory with the checkpoint to continue from, "
@@ -970,10 +961,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             observations=observation_dtype(config),
         )
     else:
-        # Note what the comprehension this replaced did with a name that was
-        # neither: it fell through to `parent`, so a third opponent would have
-        # silently been the parent checkpoint. Only the validation above kept
-        # that unreachable, and the validation now admits every entrant spec.
+        # A name that is not 'parent' is an arena entrant spec; it never
+        # falls through to the parent checkpoint.
         opponents: list[BatchPolicy] = mix_opponents(
             mix,
             seed=args.seed,
@@ -1070,7 +1059,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     next_collect_started: float | None = None
     # The workers' counters just before the cohort in flight was dealt: what a
     # checkpoint records while that cohort plays (`games_started` cannot be
-    # read then), and what the old schedule read at the same point.
+    # read then).
     counters_before_flight = 0
 
     # Async cohorts are assembled by a helper process as soon as their last
@@ -1187,8 +1176,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         # Under async collection the next cohort is already in flight: it was
         # dispatched when this one's games came home (see the priming above).
 
-        # ~3 MB a clone: cheap insurance. The brake's third firing lost its
-        # evidence because nothing held the pre-update state.
+        # The pre-update state, held for the KL brake's dump.
         net_before = {k: v.detach().cpu().clone() for k, v in policy.net.state_dict().items()}
         optimiser_before = {
             "state": {
@@ -1237,8 +1225,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             games = collector.receive()
             started, next_collect_started = next_collect_started, None
             if iteration + 2 < args.iterations:
-                # The weights are this update's result: what the old schedule
-                # shipped at the next iteration's dispatch, before its update.
+                # The weights are this update's result, the ones the next
+                # iteration's dispatch would ship before its own update.
                 next_collect_started = dispatch(iteration + 2)
             prefetched = land(games, iteration + 1)
             # Dispatch to decoded, so it spans the previous iteration's tail.
@@ -1343,7 +1331,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             # Only now is this iteration's collection held elsewhere, its games
             # archived (`durable.prune`). A prefetched next one stays: it is
             # the next iteration's.
-            durable.prune(collecting, iteration)
+            durable.prune(collecting, iteration, episodes=episodes)
 
         if args.eval_every and (iteration + 1) % args.eval_every == 0:
             evaluation: dict = {"iteration": iteration}

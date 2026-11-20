@@ -13,8 +13,7 @@ finishes, in one of three shapes:
 - `append_line` / `read_lines`: one JSON line per unit, flushed and fsynced
   before the call returns. A reader drops a torn last line -- the one a dying
   writer was part-way through -- and the next `append_line` cuts it first.
-  HexSet 0.77.0's `hexset.gamelog` keeps the same line discipline; this copy
-  goes when the engine pin reaches it.
+  `hexset.gamelog` keeps the same line discipline.
 - `Partial`: one collection in progress, a directory holding one file per
   finished game (`hexn.gamefile`'s compact, exact encoding) and, for a
   cohort, the plan of every index it deals. A resumed collection loads what
@@ -78,8 +77,8 @@ def cut_torn_tail(path: str | os.PathLike) -> None:
 def append_line(path: str | os.PathLike, entry: dict) -> str:
     """Append `entry` as one JSON line, durably, and return the line.
 
-    Serialised with `json.dumps`' defaults, as the trainers' logs always
-    were, so a row reads back exactly as it printed.
+    Serialised with `json.dumps`' defaults, as the trainers' logs are, so a
+    row reads back exactly as it printed.
     """
     line = json.dumps(entry)
     cut_torn_tail(path)
@@ -241,12 +240,21 @@ def partials(root: Path) -> dict[int, Partial]:
 GAMES = "games"
 
 
-def archive(held: Partial, path: str | os.PathLike) -> int:
+def archive(
+    held: Partial, path: str | os.PathLike, *, episodes: Iterable["Episode"] | None = None,
+) -> int:
     """Every game `held` finished, kept at `path` before the collection is
     removed: a gzipped journal (`hexset.gamelog` lines), one line per game in
     index order with its index, seed, seats, policy ids (`cast`), outcome,
     cleared trades and `hexset.record.Record`. Streamed to a temporary file,
-    fsynced and renamed into place. Returns the games kept."""
+    fsynced and renamed into place. Returns the games kept.
+
+    A trainer that still holds this collection's decoded episodes can pass
+    them, with or without trajectories, to avoid reading and inflating the
+    observation files again. They must be the same collection: exactly one
+    episode for each finished index. The caller retains the decoded records
+    unchanged from collection or preparation until the archive is written.
+    """
     import gzip
     from dataclasses import asdict, is_dataclass
 
@@ -254,14 +262,22 @@ def archive(held: Partial, path: str | os.PathLike) -> int:
 
     from . import gamefile
 
+    if episodes is None:
+        fields = (gamefile.fields(game) for game in held.games())
+    else:
+        ordered = sorted(episodes, key=lambda episode: episode.index)
+        if [episode.index for episode in ordered] != held.finished():
+            raise ValueError("archive episodes must match every finished game exactly once")
+        names = ("index", "seed", "players", "cast", "outcome", "trades", "record")
+        fields = ({name: getattr(episode, name) for name in names} for episode in ordered)
+
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
     kept = 0
     with open(temporary, "wb") as raw:
         with gzip.GzipFile(fileobj=raw, mode="wb", compresslevel=6, mtime=0) as handle:
-            for game in held.games():
-                f = gamefile.fields(game)
+            for f in fields:
                 outcome = f.get("outcome")
                 record = f.get("record")
                 handle.write((json.dumps({
@@ -284,13 +300,15 @@ def archived(root: Path, iteration: int) -> Path:
     return Path(root).parent / GAMES / f"iter-{iteration:05d}.games.jsonl.gz"
 
 
-def prune(root: Path, through: int) -> None:
+def prune(root: Path, through: int, *, episodes: Iterable["Episode"] | None = None) -> None:
     """Keep, then remove, the collections of every iteration up to `through`:
     every game each holds goes to its iteration's archive (`archived`) first,
-    and only then is the collection itself removed."""
+    and only then is the collection itself removed. `episodes`, when given,
+    are the decoded games of iteration `through`; older collections are
+    always read from their own files."""
     for iteration, held in partials(root).items():
         if iteration <= through:
-            archive(held, archived(root, iteration))
+            archive(held, archived(root, iteration), episodes=episodes if iteration == through else None)
             held.remove()
 
 

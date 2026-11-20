@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-only
-"""The two seams hexn keeps now that the checkpoint runtime is HexSet's, both
-provable without torch.
+"""The two seams hexn keeps with HexSet's checkpoint runtime, both provable
+without torch.
 
 `hexset.clients.netbot` owns the bot, the leaf evaluation, the search and the
 trade gate, and tests them against its own stub `Policy`

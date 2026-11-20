@@ -76,8 +76,7 @@ VERSION = 1
 # Version 1 is refused: its rows were credited one by one.
 VERSION9 = 2
 ZLIB = 1
-# Speed over ratio: a worker deflates every game it finishes, and level 1
-# already leaves the file a small fraction of the pickle.
+# zlib's fastest level: a worker deflates every game it finishes.
 LEVEL = 1
 
 # magic, version, compressor, game index, positions, observation width, mask
@@ -415,9 +414,9 @@ def _rows_into(buffer: np.ndarray, at: int, rows: np.ndarray) -> None:
         np.bitwise_xor.accumulate(rows, axis=0, out=buffer[at : at + n].view(np.uint32))
         return
     wide = np.bitwise_xor.accumulate(rows, axis=0).view(np.float32)
-    # torch's float16 cast rounds to nearest-even exactly as numpy's and is
-    # many times faster; only a NaN's payload could come out different, so a
-    # game holding one takes numpy's cast.
+    # torch's float16 cast rounds to nearest-even exactly as numpy's; only a
+    # NaN's payload could come out different, so a game holding one takes
+    # numpy's cast.
     narrow = torch.from_numpy(wide)
     if bool(torch.isnan(narrow).any()):
         buffer[at : at + n] = wide
@@ -574,9 +573,9 @@ def decode_columns(blobs: Sequence[bytes], dtype=np.float32) -> Columns | Column
             np.bitwise_xor.accumulate(rows, axis=0, out=buffer[cursor : cursor + n].view(np.uint32))
         else:
             wide = np.bitwise_xor.accumulate(rows, axis=0).view(np.float32)
-            # torch's float16 cast rounds to nearest-even exactly as numpy's
-            # and is many times faster; only a NaN's payload could come out
-            # different, so a game holding one takes numpy's cast.
+            # torch's float16 cast rounds to nearest-even exactly as numpy's;
+            # only a NaN's payload could come out different, so a game holding
+            # one takes numpy's cast.
             narrow = torch.from_numpy(wide)
             if bool(torch.isnan(narrow).any()):
                 buffer[cursor : cursor + n] = wide

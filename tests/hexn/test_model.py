@@ -230,7 +230,7 @@ DEFAULT_KEYS = frozenset(
         "embed_global.bias",
         "value.weight",
         "value.bias",
-        # The auxiliary VP-margin head (contract 6's win-head registration):
+        # The auxiliary VP-margin head (added with contract 6's win head):
         # always built, so every checkpoint carries it whatever
         # `--aux-margin-weight` trains under.
         "aux_margin.weight",
@@ -264,16 +264,14 @@ DEFAULT_KEYS = frozenset(
 def test_the_default_config_writes_exactly_the_state_dict_keys_it_always_has():
     """The one test that protects every checkpoint already on disk.
 
-    `ModelConfig` gained `value_head` and `policy_head`, and the obvious way to
-    implement either — wrap the head in a module and dispatch on its type —
-    renames `value.weight` to `value.out.weight` and makes every run recorded so
-    far unloadable. The default has to *be* the old network, not a new network
-    that happens to compute the same function.
+    Wrapping a head in a module and dispatching on its type (`value_head`,
+    `policy_head`) would rename `value.weight` to `value.out.weight` and make
+    every earlier checkpoint unloadable. The default has to *be* the old
+    network, not a new network that computes the same function.
 
-    `aux_margin.{weight,bias}` is the one deliberate exception: contract 6's
-    win-head registration added a genuinely new head to every checkpoint
-    from then on -- this list says what the shape *is* now, not that nothing
-    may ever be added to it again.
+    `aux_margin.{weight,bias}` is the one exception: contract 6's win head
+    added a new head to every checkpoint from then on. This list says what the
+    shape *is* now, not that nothing may ever be added to it again.
     """
     _, _, net = a_net()
 
@@ -374,12 +372,12 @@ def test_the_output_layer_of_a_deep_head_is_the_one_that_gets_the_small_gain():
 
 
 def test_stored_args_rebuild_the_shape_they_were_trained_with():
-    """The bug this pins cost a launched probe.
+    """The one reader of a checkpoint's stored shape, and its contract.
 
-    `hexn.benchmarks.minibatch_iso_kl` and `hexn.benchmarks.noise_scale` both rebuilt the
-    net from width and rounds alone, so the first `--policy-head mlp` lineage
-    would not load at all: `heads.hexes.weight` against `heads.hexes.0.weight`.
-    One reader now, and this is its contract.
+    A net rebuilt from width and rounds alone does not load a `--policy-head
+    mlp` checkpoint: `heads.hexes.weight` against `heads.hexes.0.weight`.
+    `hexn.benchmarks.minibatch_iso_kl` and `hexn.benchmarks.noise_scale` read
+    the shape through this reader.
     """
     stored = {"width": 64, "rounds": 2, "value_head": "attn", "policy_head": "mlp"}
 

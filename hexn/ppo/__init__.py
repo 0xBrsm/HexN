@@ -26,15 +26,14 @@ axis: a proper win-probability distribution, not a margin. Its target is
 `hexn.rewards.win_loss` — the one-hot eventual winner, rotated into each
 seat's frame like every other
 per-seat vector — and the loss is cross-entropy against it (`minibatch_terms`
-below), the natural loss for a categorical label. `advantages` still runs on
-`Choice.value[0]`, the mover's own recorded estimate at each decision — now a
-probability in `[0, 1]` rather than a points margin, and the terminal payoff
+below), the natural loss for a categorical label. `advantages` runs on
+`Choice.value[0]`, the mover's own recorded estimate at each decision, a
+probability in `[0, 1]`, and the terminal payoff
 GAE bootstraps against is that seat's own win/loss component, on the same
 scale.
 
 The one-hot target has no continuous intermediate to bootstrap a
-lambda-return from, so `value_lam` below 1.0 — the old margin head's
-lambda-mixed target — is refused outright (`PPOConfig.__post_init__`) rather
+lambda-return from, so `value_lam` below 1.0 is refused outright (`PPOConfig.__post_init__`) rather
 than silently reinterpreted; `1.0` (the flat terminal one-hot, replicated
 across every transition of the trajectory) is the only legal value.
 
@@ -42,8 +41,7 @@ across every transition of the trajectory) is the only legal value.
 
 `Prediction.margin` is a second, independent head reading the same trunk
 features as the win head, trained (when `aux_margin_weight > 0`) on
-`hexn.rewards.reward` — `relative_points`, the margin head's old target —
-by plain squared error, added to the loss at that weight. It is never read
+`hexn.rewards.reward` (`relative_points`) by plain squared error, added to the loss at that weight. It is never read
 by a gate, by `advantages`, or by a search's leaf: `minibatch_terms` is its
 only reader, and only for its own term. `aux_margin_weight = 0.0` is the
 default: the head is always built, so a checkpoint stays loadable either
@@ -58,9 +56,8 @@ margin head are all untouched by it. The head emits `players x Q` numbers
 whose mean is `value_logits`, and `minibatch_terms` puts the per-seat
 quantile Huber loss (`hexn.model.quantile_huber_loss`) on that spread
 against the same one-hot winner a scalar head would take cross-entropy
-against instead. This combination is untested -- the quantile shape was
-designed for a continuous margin target, never a categorical one -- so
-treat a quantile-shaped win head as an open ablation, not a result.
+against instead. The quantile shape is built for a continuous target, and
+the win head's target is categorical.
 
 `Stats.value_mse` exists for the reading. Two configurations' `value_loss`
 columns are on different scales (a pinball loss is roughly `E|u|/2`, a
@@ -132,19 +129,17 @@ CLIP_LENGTHS = 6
 @dataclass(frozen=True)
 class PPOConfig:
     lam: float = 0.95
-    # The one value the win head's target has ever been fit against
-    # (`hexn.model.Prediction`'s win-head registration): `"win"` is the only
-    # legal value. Recorded on every run's config anyway, the way `--gamma`
-    # is deliberately *not* -- the codebase's convention is that a trained
-    # choice is an explicit, checked flag rather than an inferred constant,
-    # even where there is currently only one legal answer.
+    # What the win head's target is (`hexn.model.Prediction`'s win head):
+    # `"win"` is the only legal value. Recorded on every run's config anyway,
+    # unlike `gamma`, which is not a parameter: a trained choice is an
+    # explicit, checked flag rather than an inferred constant, even where
+    # only one value is legal.
     reward: str = "win"
     # 1.0 keeps the terminal outcome as the value target. The win head's
     # target is the one-hot eventual winner, a categorical label with no
     # bootstrapped intermediate to mix in, so anything below 1.0 is refused
-    # (`__post_init__`) rather than silently reinterpreted; see the module
-    # docstring's account of the continuous-return lambda-return this flag
-    # mixed in before the win head.
+    # (`__post_init__`) rather than silently reinterpreted (the module
+    # docstring).
     value_lam: float = 1.0
     # The auxiliary VP-margin head's loss weight (`hexn.model.Prediction.
     # margin`, trained on `hexset.victory.relative_points`). `0.0` is the
@@ -154,8 +149,7 @@ class PPOConfig:
     # alone.
     aux_margin_weight: float = 0.0
     # What the auxiliary margin head learns at `aux_margin_weight > 0`.
-    # "relative": every slot, `relative_points` by squared error (the head's
-    # original target). "loss": the head's own slot (slot 0) only, as the
+    # "relative": every slot, `relative_points` by squared error. "loss": the head's own slot (slot 0) only, as the
     # logit that the deciding seat loses victory points before it acts again
     # after its current turn (`hexn.rewards.points_lost_next`), by binary
     # cross-entropy with the positives weighted `aux_pos_weight`; the other
@@ -202,10 +196,8 @@ class PPOConfig:
     # is untouched; the modes ablate the wires, not the module.
     critic: str = "gae"
     # Stop taking epochs once a finished epoch's mean `approx_kl` exceeds this;
-    # 0 disables. A ceiling, not a target — it can only remove epochs, never
-    # raise a rate. A controller steering *toward* the threshold from below
-    # is a failure mode a one-sided break cannot reproduce. The default is a
-    # tuned constant, not inherited from elsewhere.
+    # 0 disables. A ceiling, not a target: it can only remove epochs, never
+    # raise a rate.
     kl_break: float = 0.0
     # The board-paired advantage baseline. Each seat's terminal payoff on
     # the policy-gradient wire becomes r - (r+r')/2,
@@ -215,7 +207,7 @@ class PPOConfig:
     # actions, so the subtraction is a valid control variate and the gradient
     # stays unbiased. The value target keeps the RAW terminal: the baseline
     # changes what the policy is paid, never what the head is trained toward.
-    # Off by default, so existing batch assembly is unchanged.
+    # Off by default.
     pair_baseline: bool = False
     # Weight on KL(pi || prior): the learner's divergence from a fixed prior
     # policy over every legal action, averaged over the minibatch's rows and
@@ -446,8 +438,8 @@ class Stats:
     approx_kl: float
     clip_fraction: float
     explained_variance: float
-    # Everything below defaults, so `hexn.ddp` and `hexn.exit` keep
-    # constructing this positionally without knowing about the new gauges.
+    # Everything below defaults, so `hexn.ddp` and `hexn.exit` construct
+    # this positionally without naming these gauges.
     #
     # `approx_kl` above is the mean over every minibatch of every epoch, which
     # is not a step size and is not comparable to the conventional 0.01-0.02
@@ -466,19 +458,17 @@ class Stats:
     approx_kl_last_epoch: float = 0.0
     clip_fraction_last_epoch: float = 0.0
     # Under decoupled PPO every `approx_kl` gauge above is weighted by the
-    # decoupled weight (`kl_gauge`); this is `approx_kl` unweighted, the
-    # gauge as it read before, so a curve stays comparable across the change.
-    # Without decoupling the two are the same number.
+    # decoupled weight (`kl_gauge`); this is `approx_kl` unweighted, which
+    # reads the same with or without decoupling. Without decoupling the two
+    # are the same number.
     approx_kl_unweighted: float = 0.0
-    # The pre-clip global norm, median over the update's steps.
-    # `clip_grad_norm_` has always returned it and all three call sites threw
-    # it away, which is why "is max_grad_norm binding?" was unanswerable
-    # from the logs. (Note that under Adam a *constant* rescale of the
+    # The pre-clip global norm, median over the update's steps, which shows
+    # whether `max_grad_norm` binds. (Under Adam a *constant* rescale of the
     # gradient cannot change the step anyway, since m/sqrt(v) is invariant
     # to it.)
     grad_norm: float = 0.0
-    # Logged beside `explained_variance` so a shrinking denominator can never
-    # again be misread as an improving head: EV against a terminal return is
+    # Logged beside `explained_variance` so a shrinking denominator is not
+    # misread as an improving head: EV against a terminal return is
     # bounded well below 1 for this target, which a shrinking denominator
     # can make look arbitrarily good even as the numerator stays flat.
     value_target_variance: float = 0.0
@@ -486,9 +476,8 @@ class Stats:
     # `--learning-rate` can be silently overridden by state carried in the
     # checkpoint and nothing in the log would show it.
     lr: float = 0.0
-    # Epochs the update actually took. Equal to `config.epochs` unless
-    # `kl_break` stopped it early; under a break regime this column is the
-    # knob's own telemetry, and the threshold gets re-derived from it.
+    # Epochs the update took. Equal to `config.epochs` unless `kl_break`
+    # stopped it early.
     epochs_taken: int = 0
     # The squared error of the *mean* the rest of the system reads as `V`,
     # whatever the value head's shape and whatever loss was differentiated.
@@ -503,9 +492,8 @@ class Stats:
     # run that later turns the weight on has a baseline to compare against.
     margin_loss: float = 0.0
     # Mean KL(pi || prior) over the update's minibatches, whenever the batch
-    # carries a prior (`attach_prior`); 0.0 when it does not. The distance the
-    # policy has walked from the prior, read directly rather than inferred
-    # from ladder results against it.
+    # carries a prior (`attach_prior`); 0.0 when it does not: the distance the
+    # policy has walked from the prior.
     prior_kl: float = 0.0
     # The fast-win head's cross-entropy (`PPOConfig.fast_win`); 0.0 without it.
     fast_loss: float = 0.0
@@ -1040,9 +1028,8 @@ class Terms:
     value: Tensor
     # The four summands of `loss`, still attached to the graph. `loss` is what
     # the update differentiates; these exist so a caller can differentiate one
-    # term at a time — which is the only way to ask whether the policy or the
-    # value head dominates the shared trunk, an open question four separate
-    # audits answered four different ways from the loss magnitudes alone.
+    # term at a time, to see whether the policy or the value head dominates
+    # the shared trunk, which the loss magnitudes alone do not show.
     policy_term: Tensor
     value_term: Tensor
     entropy_term: Tensor
@@ -1054,8 +1041,8 @@ class Terms:
     # The scalar reads below all stay device tensors (detached, no graph)
     # rather than Python floats. Converting each one with `float(...)` here
     # would force a device->host sync per minibatch, one per scalar
-    # (`hipMemcpyWithStream`), which adds up fast at this shape. `update`
-    # (and `hexn.exit.update`, `hexn.ddp`'s workers) now accumulate these
+    # (`hipMemcpyWithStream`). `update`
+    # (and `hexn.exit.update`, `hexn.ddp`'s workers) accumulate these
     # as tensors across an epoch or a whole update and read them back with one
     # `.item()`/`.mean()` each, not one per minibatch.
     policy_loss: Tensor
@@ -1074,7 +1061,7 @@ class Terms:
     kl_weight: Tensor | None = None
     # `config.prior_kl * prior_kl`, attached, and the divergence itself,
     # detached. Both `None` when the minibatch came with no prior, so a caller
-    # that never attaches one sees exactly the four summands it always has.
+    # that never attaches one sees the four summands alone.
     prior_term: Tensor | None = None
     prior_kl: Tensor | None = None
     # The fast-win head's cross-entropy, detached; `None` without a target.
@@ -1316,9 +1303,7 @@ def minibatch_terms(
         value_loss = -(value_target * log_probs_win).sum(-1).mean()
     else:
         # `players x Q` predictions against the same `value_target` one-hot
-        # vector. Untested: the quantile shape was designed for a
-        # continuous margin target, never a categorical one -- see
-        # the module docstring.
+        # vector (the module docstring).
         value_loss = policy.net.value.loss(evaluation.quantiles, value_target)
     with torch.no_grad():
         # Logged, never differentiated: the comparable column across
@@ -1436,12 +1421,11 @@ def _stack_mean(values: Sequence[Tensor]) -> float:
     """The mean of one update's per-minibatch device tensors, read back to a
     Python float once instead of once per minibatch.
 
-    Accumulated in float64 before the single read, matching what `np.mean`
-    over the old per-minibatch Python floats (each a float32 value promoted to
-    double on conversion) would have produced -- the reduction order differs
-    from numpy's pairwise summation, but every reader of these numbers already
-    compares them to a tolerance (`tests/hexn/test_ppo.py`,
-    `tests/hexn/test_ddp.py`), not bit-for-bit.
+    Accumulated in float64 before the single read, as `np.mean` over the
+    per-minibatch float32 values promoted to double would be. The reduction
+    order differs from numpy's pairwise summation, so every reader of these
+    numbers compares them to a tolerance (`tests/hexn/test_ppo.py`,
+    `tests/hexn/test_ddp.py`), not bit for bit.
     """
     if not values:
         return 0.0
@@ -1715,12 +1699,11 @@ def update(
 
         epochs_taken += 1
         # The break reads the epoch that just finished, so the damage an over-
-        # long update does is bounded at one epoch past the ceiling rather
-        # than three — the two recorded blowouts were fine at epoch 1 and
-        # diverging by epoch 4. This is the one legitimate per-epoch sync: the
+        # long update does is bounded at one epoch past the ceiling. This is
+        # the one per-epoch sync: the
         # decision to keep taking epochs has to be made in Python, and
         # `config.kl_break > 0` short-circuits it away entirely at the
-        # every-run-on-record default of 0.
+        # default of 0.
         # `not <=`, so a gauge that is not a number (an overflowed estimator)
         # breaks rather than slipping past the comparison.
         if config.kl_break > 0 and not _stack_mean(g["epoch_kls"][epoch]) <= config.kl_break:

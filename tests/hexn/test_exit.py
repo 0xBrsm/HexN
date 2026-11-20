@@ -52,8 +52,8 @@ def searched_episodes(policy, space, games: int = 2, seed: int = 0):
     Trade-free (`max_offers=0`), for the reason `test_ppo.some_episodes` gives
     for the plain-policy path: nothing here is about trading, and a width-16
     net's gate prices every coverable candidate after every MAIN action
-    (`hexset.trading.trade_event`) -- unset, that made a searched game cost
-    tens of seconds. Capped at 400 actions like `test_ppo.some_episodes`, and
+    (`hexset.trading.trade_event`), which makes a searched game slow.
+    Capped at 400 actions like `test_ppo.some_episodes`, and
     `decided`, because the win-head properties below need a game with an
     actual winner to be anything but vacuous.
     """
@@ -88,8 +88,8 @@ def corpus():
     """One searched corpus for the whole module: `(policy, space, layout,
     episodes)`.
 
-    A searched game is the expensive thing here and every test used to play
-    its own. Episodes are frozen, so sharing them is safe; the policy is not,
+    A searched game is the expensive thing here, so the tests share one
+    corpus. Episodes are frozen, so sharing them is safe; the policy is not,
     so a test that trains takes `a_student` instead -- `refresh` needs the
     policy that recorded the priors to still be that policy.
     """
@@ -481,8 +481,7 @@ def test_filtering_zeroes_the_policy_weight_where_the_search_agreed(corpus):
 # trunk is shared, the value loss is unweighted, and a network has no
 # per-position parameters. Left unchecked, a shared trunk drifts anyway on
 # every row the policy loss switched off -- degrading agreement with the
-# search on exactly the positions the filter was meant to leave alone, and
-# costing the checkpoint strength against its own unfiltered parent. The
+# search on exactly the positions the filter was meant to leave alone. The
 # anchor is the restoring force that holds those rows in place.
 
 
@@ -520,10 +519,8 @@ def test_the_anchor_holds_the_settled_rows_the_filter_let_go(corpus):
 
 # --- the buffer and the packing -------------------------------------------
 #
-# Collection is 92% of wall clock -- 707 s against 66 s of update on the live
-# run -- and with `--contested-only` about 3% of what it buys carries policy
-# gradient. Both of these attack that: reuse the corpus, and spend the policy
-# term's steps on rows that are actually in it.
+# Two ways to train more on each collected game: reuse the corpus, and spend
+# the policy term's steps on the rows `--contested-only` keeps.
 
 
 def test_concatenating_batches_keeps_every_row(corpus):
@@ -553,11 +550,8 @@ def test_refreshing_against_the_collecting_policy_reproduces_the_filter(corpus):
     rate and nothing else. The invariant is real; asserting past the ties would
     only assert that two arbitrary orderings coincide on one seed.
 
-    Contract 4 needed a second restriction here -- to rows the search never
-    proposed from -- because the trade slot was a sum over every offer on the
-    row and could top the slot ranking while the argmax *option* was not a
-    trade at all. With the trade actions gone the option-to-slot map is
-    injective everywhere and that restriction has nothing left to exclude.
+    The option-to-slot map is injective everywhere (no slot sums several
+    options), so no further restriction on the rows is needed.
     """
     from hexn.exit import refresh
 

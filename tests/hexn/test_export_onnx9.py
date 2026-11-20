@@ -166,14 +166,16 @@ def test_the_graph_chooses_the_decision_the_torch_net_chooses(config, tmp_path):
         np.testing.assert_allclose(v1, v2, atol=1e-4)
 
 
-@pytest.mark.parametrize("contract,global_seat,width", [("9d", False, 828), ("9d.1", True, 848),
-                                                      ("11d", False, 1000)])
-def test_a_two_seat_net_on_contract_9d_exports_and_plays_as_its_torch_net(tmp_path, contract, global_seat, width):
+@pytest.mark.parametrize("contract,global_seat,width,branch", [("9d", False, 828, 0), ("9d.1", True, 848, 0),
+                                                             ("11d", False, 1000, 0), ("11d", False, 1000, 1)])
+def test_a_two_seat_net_on_contract_9d_exports_and_plays_as_its_torch_net(tmp_path, contract, global_seat, width,
+                                                                          branch):
     """A two-seat net (9d, 9d.1 with the global head reading its own seat, or
-    11d with no table token) exports a graph that chooses, values and scores as the torch net does at
-    a two-seat table, declares its contract and seat count, and is refused at
+    11d with no table token, and 11d with a setup branch) exports a graph that chooses, values and scores as the
+    torch net does at a two-seat table, declares its contract and seat count, and is refused at
     a four-seat table."""
-    config = replace(PARTS, contract=contract, others=True, points=False, global_seat=global_seat)
+    config = replace(PARTS, contract=contract, others=True, points=False, global_seat=global_seat,
+                     setup_rounds=branch, setup_attend=2 * branch)
     source = a_checkpoint(tmp_path / "duel.pt", config, players=2)
     out = export9(str(source), tmp_path / "duel.onnx")
     meta = read_metadata(out.read_bytes())

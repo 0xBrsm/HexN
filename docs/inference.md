@@ -67,15 +67,13 @@ device answers for the batch the server ran: `Policy9._heads` with the prior
 for a contract-9 net, `NetworkPolicy.score` for a contract-8 one. Forwards are
 not batch invariant, and another device rounds differently, so a served read
 can differ from an in-process CPU read in the last bits.
-`precision="bf16"` runs the server's forwards under bf16 autocast, which is
-a different policy from fp32, not the same one faster.
+`precision="bf16"` runs the server's forwards under bf16 autocast, which
+makes a different policy from fp32.
 
 The server runs one net's forward at a time, and a contract-9 forward copies
 each input to the device and reads each head back separately. On a device
 where each copy and synchronisation has a high fixed latency, a forward's
-cost barely depends on its rows, so the server pays off only when its
-forwards are large; otherwise workers that run their own forwards on their
-own cores are faster. `gather=` seconds holds a round open for more clients.
+cost barely depends on its rows. `gather=` seconds holds a round open for more clients.
 `panel.stop()` returns the server's counters (`rounds`, `requests`,
 `forwards`, `rows`, busy `seconds`), which show the rows per forward and the
 time per forward.

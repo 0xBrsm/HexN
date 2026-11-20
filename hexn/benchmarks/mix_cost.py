@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: GPL-3.0-only
 """What an opponent mix costs a PPO iteration, per decision and per shard.
 
-`--mix` used to accept two names. Once it accepts any arena entrant spec, the
-question that decides whether the feature is usable is arithmetic: a
-`search2` or `mcts:<ckpt>@64` lane opponent is far more expensive per
-decision than `greedy`. Collection is only a fraction of a PPO iteration's
-wall clock, so the question is how far a lane opponent can stretch that
-fraction before it stops being affordable.
+`--mix` accepts any arena entrant spec, and a `search2` or `mcts:<ckpt>@64`
+lane opponent is far more expensive per decision than `greedy`. Collection is
+only a fraction of a PPO iteration's wall clock; this benchmark measures how
+far a lane opponent stretches that fraction.
 
 The measurement is a **shard**, not a game and not a whole run: one PPO worker's
 share of a production iteration, which at `--lanes 128 --games-per-iteration 128

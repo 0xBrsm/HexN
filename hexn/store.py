@@ -1,18 +1,13 @@
 # SPDX-License-Identifier: GPL-3.0-only
 """The expert-iteration replay store: searched episodes, kept and reused.
 
-Replaces `hexn.exit`'s old `deque[Batch]` window
-(`--buffer-iterations`, retired). That deque held *assembled* batches -- the projection
-already paid, the episodes themselves discarded -- which was the right shape
-for reusing a corpus across an update's epochs, but the wrong one for two
-things this store now does: reload a run's buffer across `--resume` without
-recollecting it, and hand `hexn.reanalyse` the raw `Episode`s it needs to
-rebuild a position and re-search it.
+The store keeps episodes, not assembled batches, so it can reload a run's
+buffer across `--resume` without recollecting it and hand `hexn.reanalyse` the
+raw `Episode`s it needs to rebuild a position and re-search it.
 
-**Retention is by position, not by iteration.** `--buffer-iterations N` kept
-exactly the last N iterations' batches whatever their size, so a change to
-`--games-per-iteration` silently changed how much data a run actually trained
-on. `--replay-positions` bounds `sum(len(episode) for episode in ...)`
+**Retention is by position, not by iteration**, so a change to
+`--games-per-iteration` does not change how much data a run trains on.
+`--replay-positions` bounds `sum(len(episode) for episode in ...)`
 directly, evicting whole iterations oldest-first once the newer ones already
 cover the budget -- the newest iteration is never evicted on its own arrival,
 even if it alone exceeds the budget, because an iteration that just cost real
@@ -67,9 +62,9 @@ class _Shard:
     path: Path
     episodes: tuple[Episode, ...]
     # Lazily assembled and cached: `EpisodeStore.batch` pays the projection
-    # once a shard and reuses it every later update, the same saving the old
-    # `deque[Batch]` banked -- `replace` (a reanalysed iteration) clears this
-    # so the next `batch()` call re-pays only the shard that actually changed.
+    # once a shard and reuses it every later update; `replace` (a reanalysed
+    # iteration) clears this so the next `batch()` call re-pays only the shard
+    # that changed.
     batch: "Batch | None" = None
 
     @property

@@ -1,15 +1,14 @@
 # SPDX-License-Identifier: GPL-3.0-only
 """How the networks hexn trains and plays trade, in HexSet's terms.
 
-HexSet decides how trading works; a table no longer caps it. Each bot
+HexSet decides how trading works. Each bot
 declares its own `hexset.trading.TradeParams`, and a checkpoint declares what
 its network trained with. hexn has two trade settings for its networks;
 opponents bring their own.
 
 `max_offers` is how many offers the network makes a turn, priced by its own
 value head. `0` is the no-trade network. `None` is HexSet's own default, which
-is unlimited (HexSet 0.60 onward). `-1` is hexn's old spelling of "uncapped"
-and reads as `None`.
+is unlimited. `-1` is an older spelling of "uncapped" and reads as `None`.
 
 `trader` names a bot -- a preset or spec, as a HexSet lineup spells it --
 that answers every trade for the network instead (`trader_gate`): the network

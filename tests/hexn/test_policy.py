@@ -192,10 +192,10 @@ def test_score_rows_priors_are_a_distribution_over_that_row_s_own_options():
 
 
 def test_the_gate_a_policy_seats_is_the_engine_s():
-    """There is no torch trade gate any more. `trader` seats this policy
-    behind `hexset.clients.netbot.NetworkBot`, which builds the post-trade
-    position itself and asks only for a value -- one gate for the served
-    `.onnx` file, the duelled checkpoint and the self-play lane."""
+    """`trader` seats this policy behind `hexset.clients.netbot.NetworkBot`,
+    which builds the post-trade position itself and asks only for a value --
+    one gate for the served `.onnx` file, the duelled checkpoint and the
+    self-play lane."""
     policy = a_policy(seed=66)
     game = a_played_game(67)
     gate = policy.trader(game, 2, max_offers=5)

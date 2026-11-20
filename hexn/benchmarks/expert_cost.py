@@ -1,25 +1,23 @@
 # SPDX-License-Identifier: GPL-3.0-only
 """What a search-played move costs, split into engine and network.
 
-`benchmarks.model_forward` measures a *self-play* move, which on typical
-hardware is dominated by the forward — the reason `hexn.selfplay` and
-`hexset.mcts` are shaped the way they are. A move under a search is not that
-move: it enumerates, copies and steps a position for every leaf it expands,
-and on hardware where each engine step is expensive relative to a forward,
-that balance can reverse entirely — so the conclusion drawn from
-`model_forward` does not carry over unconditionally.
+`benchmarks.model_forward` times a *self-play* move. A move under a search
+differs: it enumerates, copies and steps a position for every leaf it expands,
+so on hardware where each engine step is expensive relative to a forward the
+engine can cost more than the network, and `model_forward`'s figures do not
+carry over to it.
 
-This settles it on the box, where it matters, by timing a real collector against
-a real checkpoint. The split is exact rather than modelled: the evaluator is
+This benchmark times a real collector against a real checkpoint on the
+machine it runs on. The split is exact rather than modelled: the evaluator is
 wrapped in a timer, so network seconds are counted where they are spent and
 engine seconds are the remainder. No stub run, no scaling assumption, no
 separate game to compare against.
 
-The output that decides a training run is `games_per_hour`, which is what fixes
-how many expert-iteration games a night holds. It is extrapolated from a partial
-game, since playing whole games at 256 simulations would cost more than the
-measurement is worth; `actions_per_game` is the assumption it rests on and is
-printed alongside so the extrapolation can be checked rather than trusted.
+The output that sizes a training run is `games_per_hour`, the number of
+expert-iteration games an hour holds. It is extrapolated from a partial game,
+since playing whole games at 256 simulations is expensive; `actions_per_game`
+is the assumption it rests on and is printed alongside so the extrapolation
+can be checked.
 """
 
 from __future__ import annotations

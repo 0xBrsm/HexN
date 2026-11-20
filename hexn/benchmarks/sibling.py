@@ -2,13 +2,9 @@
 """How far apart the value head puts two positions one action apart.
 
 `benchmarks.value_head --behaviour` measures whether a head is off-policy-
-blind. A head can pass that check cleanly and still lose badly in a tree
-search built on it, which points at resolution rather than off-policy
-blindness as the remaining explanation.
-
-What is left is resolution. A search never asks "how is this seat doing" — it
-asks which of two siblings, one action apart, is better. Those differ by a
-fraction of a point. If the head's error is larger than the gap it is being
+blind. This module measures resolution. A search never asks "how is this
+seat doing": it asks which of two siblings, one action apart, is better.
+Those differ by a fraction of a point. If the head's error is larger than the gap it is being
 asked to resolve, then PUCT ranks children on noise, and it will do that
 confidently, and no aggregate accuracy figure will ever show it.
 
@@ -41,8 +37,7 @@ roll positions applies one level down: `BUY_DEV_CARD`, `PLAY_KNIGHT` and a
 would then be partly a spread across decks, which is chance and not a
 decision. `--chance-draws N` scores such a child as the mean over N
 independent draws, matching what a tree gets for free by resampling a chance
-edge on every visit. `--chance-draws 1` restores that single-draw path, for
-comparison against numbers produced under it.
+edge on every visit. `--chance-draws 1` scores one draw per child.
 
     python -m hexn.benchmarks.sibling --checkpoint runs/example/latest.pt \\
         --games 64 --probe 0.05
@@ -85,10 +80,9 @@ class Spread:
 
     `chance_children` counts the children whose action resolved hidden
     information, and `chance_spread` is the mean standard deviation of the
-    head's own-seat value *within* such a child, across its draws. That second
-    number is the one the draw count was chosen against: it is the noise a
-    single-draw probe was silently adding to the row, and reporting it lets a
-    run confirm or refute the `DRAWS` the power calculation assumed.
+    head's own-seat value *within* such a child, across its draws: the noise
+    a single-draw probe would add to the row, against which `DRAWS` can be
+    checked.
     """
 
     seat: int
@@ -265,8 +259,8 @@ def main(argv: list[str] | None = None) -> int:
         "--chance-draws",
         type=int,
         default=DRAWS,
-        help="draws to average a chance child's score over; 1 restores the "
-             "single-draw path this module previously used",
+        help="draws to average a chance child's score over; 1 scores a "
+             "single draw per child",
     )
     parser.add_argument("--json", action="store_true")
     add_games_dir(parser)

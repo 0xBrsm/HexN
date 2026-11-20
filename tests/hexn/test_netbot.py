@@ -82,9 +82,9 @@ def checkpoint(tmp_path):
 def test_a_checkpoint_that_predates_the_head_flags_still_loads_as_the_old_shape(
     checkpoint,
 ):
-    """Every checkpoint under `runs/` has no head shape in its `args`.
+    """A checkpoint with no head shape in its `args` loads as `"linear"` on both.
 
-    The default the loader reads has to be the shape those runs trained with, or
+    The default the loader reads has to be the shape such checkpoints trained with, or
     `load_state_dict` fails on the keys — which is a working checkpoint made
     unloadable by a flag nobody passed.
     """
@@ -153,8 +153,8 @@ def test_the_offer_budget_comes_from_the_checkpoint_unless_overridden(checkpoint
 def test_it_only_ever_plays_an_action_the_engine_offered(checkpoint):
     """There is no budget left to filter by: every legal action is a candidate.
 
-    `max_offers` stopped being a filter on the option list at contract 5 --
-    trading is an engine event, not an action (`hexset.trading`) -- so what
+    `max_offers` is not a filter on the option list -- trading is an engine
+    event, not an action (`hexset.trading`) -- so what
     this pins is that the bot's own choice is always in `legal_actions`, and
     that switching trading off changes nothing about which actions it may take.
     """

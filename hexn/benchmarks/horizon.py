@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: GPL-3.0-only
-"""How much of the value target's noise a shorter horizon actually removes.
+"""How much of the value target's noise a shorter horizon removes.
 
 `benchmarks.floor` measures how much of the head's squared error against
 terminal returns is the conditional variance of those returns — dice not yet
 rolled. `--value-horizon` in `hexn.exit` responds by relabelling: a decision
 is trained toward the estimate recorded `horizon` of that seat's own decisions
-later, instead of the game's final score. This measures whether that relabelling
-does what it is supposed to, because so far it is an argument and not a number.
+later, instead of the game's final score. This measures what that relabelling
+does to the label's variance and to its distance from the truth.
 
-## What is being claimed
+## The identity
 
 For a position `s` and the state `s'` that the seat reaches `horizon` decisions
 later, the law of total variance splits the terminal label exactly:
@@ -47,9 +47,9 @@ rising explained variance — and they are told apart precisely here.
 across positions. The tower property says it should be near zero, so a large
 value means the head's bias is being fed back into its own target rather than
 cancelled by it. It averages *signed* gaps, so it detects overall bias and
-nothing else — it was originally the only guard here and it was not enough.
+nothing else, which is why `teacher_ratio` (below) is reported beside it.
 
-## The statistic that actually decides it
+## The statistic that decides it
 
 `teacher_ratio`, and it is the number to read before `variance_ratio`.
 
@@ -82,7 +82,7 @@ from finitely many rollouts, so both errors are inflated by the same estimation
 noise and the ratio is pulled toward 1. `teacher_ratio` is therefore a
 conservative reading — a value below 1 is more meaningful than a value near it.
 
-## Two substitutions, both deliberate
+## Two substitutions
 
 **The rollouts are played by the raw policy, and `V(s')` is read from the value
 head rather than from a search.** The training run uses `SearchPolicy`, whose
@@ -166,8 +166,8 @@ def lambda_label(episode, seat: int, lam: float) -> float:
 
         G = (1 - lam) * sum_{n=1}^{T-1} lam^(n-1) V(s_n)  +  lam^(T-1) * terminal
 
-    which is `V(s_1)` at lam=0 and the terminal return at lam=1 — the two rows
-    the horizon sweep already measured, as the ends of one dial.
+    which is `V(s_1)` at lam=0 and the terminal return at lam=1: the one-step
+    and terminal labels, as the ends of one dial.
 
     A single fixed horizon trades label quality against label noise, and there
     is no reason to expect one `n` to be obviously right; a mixture takes the

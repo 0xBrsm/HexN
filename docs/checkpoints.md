@@ -136,6 +136,11 @@ option, compound and ordinary together.
 | `points` | `False` | a points head beside the win head: one number per seat, the perspective first (`Prediction.points`) |
 | `double_turn` | `"joint"` | how the double turn is chosen: `"joint"`, one decision over every ordered pair of setup turns, or `"parts"`, the setup head twice, the second on the board after the first |
 | `contract` | `"9"` | `"9"`, `"9.1"`, `"9d"`, `"9d.1"` or `"11d"` |
+| `setup_rounds` | 0 | contract 11d: more pooled rounds for setup positions only (before the game's first roll: every setup decision and the finished setup), after the trunk's |
+| `setup_attend` | 0 | pre-norm transformer layers over every hex, vertex, seat and table token for setup positions only, after `setup_rounds`; with both 0 the net has no setup branch |
+| `setup_value` | `False` | contract 11d: a setup value head beside the win head, a hidden layer over the win head's read, each seat's win chance (`Prediction.setup_value_logits`); it feeds nothing else |
+| `setup_value_rounds` | 0 | with `setup_value`: more pooled rounds of its own for the setup value head, run in setup positions on the trunk's tokens as they are before the setup branch |
+| `setup_value_attend` | 0 | pre-norm transformer layers of its own for the setup value head, after `setup_value_rounds`; the head then reads this branch's seat tokens through a norm, and nothing else reads them. With both 0 the head reads the win head's read |
 
 A checkpoint carries its `model_config`; `config_of` reads it, a field the
 checkpoint predates at the value it was trained without. The trainers'
@@ -242,8 +247,7 @@ plays it. An `.onnx` file, and a contract-9 `.pt` on the CPU, are played by
 in `HEXN_ONNX_CACHE` (default `~/.cache/hexn/onnx`) under the checkpoint's
 sha256 and the exporter's and model's source, the workers of one run
 exporting it once between them under a file lock. The export makes the
-torch net's decisions and scores a decision about three times faster at a
-batch of one on one CPU thread. Any other `.pt` is rebuilt in torch.
+torch net's decisions. Any other `.pt` is rebuilt in torch.
 
 `hexn.netbot.load_torch(path, topology, device, compile_mode)` rebuilds the
 torch net from the checkpoint, for training and for code that reads inside
@@ -387,9 +391,7 @@ The serving flags, written as HexSet's metadata keys of the same names
 | `--robber-hits` | `robber_hits`: the file's robber moves stay on other seats' hexes where one is legal |
 
 A numerical parity check runs after every export, on real seeded
-positions, and a mismatch raises (a nonzero exit): an export bug that
-degrades quality costs less to catch here than on a served board. A
-contract-9 file is held to
+positions, and a mismatch raises (a nonzero exit). A contract-9 file is held to
 `Policy9` on positions of every kind of decision: the same `decision`,
 `value` and `prior` within tolerance, the same moves played through
 `hexset.clients.onnxbot`, and the same whole options. The stochastic

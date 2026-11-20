@@ -94,9 +94,8 @@ def test_the_mask_marks_exactly_the_legal_actions():
         assert transition.mask[transition.index]
         wide += transition.mask.sum() > 1
     # A mask with one bit set is trivially right, so insist a good share were
-    # real choices. A third rather than a half since contract 5: the offer
-    # sample used to make almost every MAIN position a wide one, and without
-    # it the forced ROLL/END_TURN steps are a larger share of a game.
+    # real choices. A third: the forced ROLL/END_TURN steps are a large share
+    # of a game.
     assert wide > len(episode) // 3
 
 
@@ -170,7 +169,8 @@ def test_a_collector_game_is_the_arenas_game_for_the_same_index():
     `hexset.arena.deal_game` rather than mirroring each other's derivation.
     """
     from hexset.actions import legal_actions
-    from hexset.arena import run_seated, seat_bots
+    from hexset.arena import seat_bots
+    from hexset.gym.driver import play_seated
     from hexset.record import Tape
     from hexset.victory import victory_points
 
@@ -203,7 +203,7 @@ def test_a_collector_game_is_the_arenas_game_for_the_same_index():
     alone = Scripted()
     game = deal_game(31, 7, 4)
     seat_bots(game, [alone] * 4)
-    run_seated(game, [alone] * 4, 1500, tape=Tape())
+    play_seated(game, [alone] * 4, 1500, tape=Tape())
 
     assert lane_bot.taken == alone.taken
     assert played.index == 7
@@ -463,7 +463,7 @@ def test_a_strided_cohort_collector_keeps_its_shard_across_cohorts():
 
 
 def test_two_learners_share_a_table_and_each_records_only_its_seats():
-    """The table league's stage-1 contract, torch-free.
+    """The table league's seating contract, torch-free.
 
     Two learners seated by parity, both recording: every seat records, every
     trajectory belongs to the seat its caster assigned, and `owned` partitions

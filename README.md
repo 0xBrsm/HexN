@@ -5,13 +5,11 @@ graph-native network that plays the classic ruleset published as
 *Settlers of Catan* (see [Trademarks](#trademarks) below). The board is a
 heterogeneous graph of hexes, vertices, and edges; the network reads that
 graph directly and emits its policy as a per-node readout, so action
-legality is a property of each node. Published agents for this game flatten
-the hex board onto a rectangular grid so an ordinary CNN can approximate hex
-adjacency.
+legality is a property of each node.
 
-## Three repos, one package
+## Two packages
 
-This package (`hexn`) is one of three things a reader of this README may
+This package (`hexn`) is one of two packages a reader of this README may
 be looking at:
 
 - **`hexn`**: this package. Model, PPO self-play, expert iteration, the
@@ -28,10 +26,8 @@ be looking at:
   that same repository; playing bots do not. A bot HexSet does not ship
   comes from a runtime module (`hexset.arena.load_runtime`), and every
   `hexn` command that names one takes `--runtime <module>`.
-- The development repository this package is cut from also carries a
-  research journal, training runs, and a training source tree that this
-  README does not describe. Nothing about it is needed to build or run
-  `hexn` from what is published here.
+
+Nothing beyond these two packages is needed to build or run `hexn`.
 
 `hexset.arena` exposes a small registry (`register_entrant_kind`) that
 `hexn.netbot` populates at import, through `hexset.clients.netbot`'s own
@@ -59,8 +55,8 @@ CUDA build, matched to the training hardware) before training.
 
 A run is a directory, and its frozen manifest is the only input. The
 configuration is frozen first, then launched: the trainers take a run
-directory and refuse every flag, so a recorded result is reproducible from
-what is committed.
+directory and refuse every flag, so a run is reproducible from its
+directory.
 
 ```bash
 # 1. freeze the configuration. Everything after `--` is the mode's own flags,
@@ -117,7 +113,7 @@ Start with [training.md](docs/training.md); the rest are listed by name.
 | `hexn/optim.py` | The Adam execution the trainers share |
 | `hexn/ppo/` (`__init__.py` the GAE/clipped-surrogate/value-loss math, `__main__.py` the runnable `python -m hexn.ppo` loop) | GAE, clipped surrogate, and value loss; the runnable, resumable training loop |
 | `hexn/loop.py` | The checkpointing (atomic write, saved game counter), duel/versus/ladder evaluation stack, and network builder that `hexn.ppo`, `hexn.league`, and `hexn.exit` share |
-| `hexn/league.py` | The table league: several learners training on their own seats of every shared game, for hyperparameter heats |
+| `hexn/league.py` | The table league: several learners, each with its own hyperparameters, training on their own seats of every shared game |
 | `hexn/schedule.py` | The learning-rate controller |
 | `hexn/expert.py`, `hexn/exit/` (`__init__.py` the distillation math, `__main__.py` the runnable `python -m hexn.exit` loop) | Expert iteration through the existing collector, and distilling a search's target back into the policy |
 | `hexn/store.py`, `reanalyse.py`, `replay.py` | The retained-position replay store expert iteration trains from; refreshing a stored position's search target against a newer net without recollecting it; rebuilding a stored episode's live game at any ply |
@@ -139,8 +135,7 @@ Start with [training.md](docs/training.md); the rest are listed by name.
   contract is `CONTRACT_VERSION`, `8.1`),
   and rejects a file naming any other. This package's own module docstrings
   cite older numbers (`contract 5`, `contract 6`) as shorthand for
-  "before/after that shape changed," most often around the trading
-  redesign. `hexn.migrate_c8` carries a checkpoint from contract 7 to
+  "before/after that shape changed." `hexn.migrate_c8` carries a checkpoint from contract 7 to
   contract 8.
 - **A value per seat.** This game has up to four players and one winner,
   so the value head returns one number per seat. Every output is trained

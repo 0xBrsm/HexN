@@ -1,16 +1,14 @@
 # SPDX-License-Identifier: GPL-3.0-only
-"""Does a quantile head give a *better mean*?
+"""Whether a quantile head gives a *better mean* than the squared-error head.
 
-If the seat-conditional terminal return is measurably non-Gaussian (see
-`benchmarks.return_shape`'s Wasserstein-1 reading against a matched Gaussian
-null), a per-seat quantile head has a premise. This asks the only question
-that decides whether the *critic wire* improves: GAE reads `V`, one scalar
-per seat, and nothing downstream reads a spread, so a richer head helps the
-run through that wire only if its mean estimate is better than the MSE
-head's.
+`benchmarks.return_shape` reads how far the seat-conditional terminal return
+is from a matched Gaussian. This benchmark scores what the *critic wire*
+reads: GAE reads `V`, one scalar per seat, and nothing downstream reads a
+spread, so a richer head changes training through that wire only if its mean
+estimate is better than the MSE head's.
 
-It is a pure offline supervised experiment. No self-play training run, no
-league, no heat. The trunk is frozen and both heads read the identical cached
+It is an offline supervised comparison. No self-play training run and no
+league. The trunk is frozen and both heads read the identical cached
 feature vector, so the only difference between the two arms is the loss.
 
 ## What is scored, and why it is not MSE
@@ -39,8 +37,7 @@ A floor dump keeps each position's rollout returns, its seat, its progress and
 the checkpoint head's prediction -- but not the position, so the features a new
 head would need are not in the file. They are recoverable: `benchmarks.floor`'s
 seeding phase is a pure function of the checkpoint and `(seed, seed_games,
-positions, players, action_cap)`, and it is far cheaper than the rollouts
-themselves. `recover` replays it and then proves the replay landed on the same
+positions, players, action_cap)`. `recover` replays it and then proves the replay landed on the same
 positions two ways -- every position's `(seat, progress, prediction)` triple
 must match the dump *bit for bit*, and the checkpoint's own value on the
 re-encoded observation must match the recorded prediction to
@@ -50,7 +47,7 @@ differently-sized batches, and float32 matmul reassociation moves the last bit
 or two; the first check is the exact one and it is the proof that the
 positions are the same.
 
-## The two traps this construction has been bitten by
+## Two conventions the scoring depends on
 
 **Rotation.** `hexset.encoding.to_frame` puts a seat's own payoff in component 0, which
 is the frame the encoder fed the trunk and the frame the head emits in. The
@@ -70,13 +67,13 @@ Both arms use identical optimiser, learning rate, steps and seed -- but
 "identical steps" is not "equally converged", and the difference decides
 the pass line. The pinball loss has a gradient of size `tau` or
 `1 - tau` however small the residual is, while the squared error's shrinks with
-it, so at this project's residual scale (~0.2 reward units) the quantile arm
-descends far faster from the same initialisation at the same learning rate.
+it, so at a small residual the quantile arm descends faster from the same
+initialisation at the same learning rate.
 
 The pinball loss's faster descent means a bias^2 gap read at too few epochs
 can be measuring which arm converges faster rather than which arm fits
-better -- a real gap early in training can close, or even reverse, once both
-curves actually flatten.
+better: a gap early in training can close, or reverse, once both curves
+flatten.
 
 So `--epochs` defaults high enough for both curves to flatten, and every run
 reports each arm's `plateau` -- the relative fall in training loss over its last
@@ -138,11 +135,10 @@ from hexset.encoding import encode
 # initialisation cannot silently leave this comparison measuring a head the run
 # does not have. `_head` is what builds `self.value`; `_DEEP` is which shapes
 # get a hidden layer; `_output` is the layer whose gain sets the output scale.
-# `quantile_levels` and `quantile_huber_loss` were written here for this
-# comparison and moved to `hexn.model` when the production `"quantile"` value
-# head was built on them. Imported, not copied: the heat's loss and this
-# comparison's loss have to be the same arithmetic or the two results are not
-# about the same head.
+# `quantile_levels` and `quantile_huber_loss` are the production `"quantile"`
+# value head's. Imported, not copied: the training loss and this comparison's
+# loss have to be the same arithmetic or the two results are not about the
+# same head.
 from hexn.model import (
     _DEEP,
     _head,
@@ -374,7 +370,7 @@ def plateau(history: Sequence[float], window: int) -> float:
 
     Reported per arm because the gate is only a statement about the two heads
     if both are at their own optimum: reading it too early can measure which
-    arm converges faster rather than which arm actually fits better. A value
+    arm converges faster rather than which arm fits better. A value
     near zero is a flat curve. Negative means the loss rose, which at a fixed
     learning rate is the other way an arm can fail to be converged.
     """
@@ -403,7 +399,7 @@ class HeldOut:
     `returns` is each position's rollout sample -- the estimate of
     `E[return | position]` that makes a per-position bias^2 possible at all.
     `reference` is the checkpoint's own prediction, carried through so the two
-    refit heads are reported beside the head the run actually has.
+    refit heads are reported beside the head the run has.
     """
 
     observations: tuple
@@ -781,7 +777,7 @@ def main(argv: list[str] | None = None) -> int:
         }
     # The checkpoint's own head on the same positions, from the prediction the
     # dump already recorded: the two refits are only interpretable beside the
-    # head the run actually has.
+    # head the run has.
     arms["reference"] = {
         "training_loss": [],
         "plateau": None,

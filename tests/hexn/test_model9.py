@@ -146,7 +146,7 @@ def test_heads_are_linear_unless_a_checkpoint_says_mlp():
     assert isinstance(linear.discard_head, torch.nn.Sequential)      # the discard keeps its hidden layer
     mlp = HexNet(space_for(game), game._state.board.topology, 4, ModelConfig(heads="mlp"))
     assert isinstance(mlp.road_head, torch.nn.Sequential)
-    # c9-bc's first run wrote its model config before `heads` existed.
+    # A contract-9 model config written before `heads` existed.
     assert config_of({"width": 64, "rounds": 3, "contract": "9"}).heads == "mlp"
     assert config_of({"width": 64, "rounds": 3, "heads": "linear"}).heads == "linear"
     assert sum(p.numel() for p in linear.parameters()) < sum(p.numel() for p in mlp.parameters())
@@ -899,7 +899,7 @@ def test_untyped_is_every_move_type_a_position_offers_alone():
     """`model9.UNTYPED` against random duel-variant play, a move at a time:
     every type in it is the only type legal wherever it is legal, and every
     other type is legal beside another type somewhere, so its score trains.
-    A type missing from UNTYPED would drift as the discard type did."""
+    A type missing from UNTYPED would drift."""
     from hexset.actions import options_for
     from hexset.play import step_randomly
     from hexset.rules import DUEL_VARIANT_GAME
@@ -1105,3 +1105,170 @@ def test_decision_entropy_passes_a_finite_gradient_when_a_rows_total_is_far_belo
     assert torch.allclose(entropy, -(p * p.log()).sum().reshape(1), atol=1e-3)  # total - E[s] at -100: fp32 cancellation
     entropy.sum().backward()
     assert torch.isfinite(disc.grad).all()
+
+
+def test_the_setup_branch_reads_setup_positions_alone_and_leaves_the_rest_of_the_net_as_it_was():
+    """`setup_rounds` and `setup_attend` give setup positions (before the
+    game's first roll: every setup decision and the finished setup) more
+    pooled rounds and transformer layers before the heads. Off, the net has exactly the parameters it had, so an
+    older checkpoint loads strictly. On, it is built after the rest, so the
+    rest draws the same initial weights under the same seed; every position
+    after setup reads exactly what the net without the branch reads with the
+    same weights, on both trunk paths; setup positions read the branch."""
+    from hexn.model9 import ModelConfig, config_of
+
+    rows, game = _duel_decisions(count=60, every=2)
+    layout = contract9.layout(2, 19, 54, 72, "11d")
+    inputs = unpack9(layout, torch.from_numpy(np.stack([r[0] for r in rows])))
+    from hexset.contract9 import BOARD_COLUMNS_11D
+
+    table = inputs["table"]
+    setup = (table[:, BOARD_COLUMNS_11D["turn"].start] == 0) & (table[:, BOARD_COLUMNS_11D["rolled"].start] == 0)
+    assert 0 < int(setup.sum()) < len(rows)
+    roads = (inputs["road_owner"] >= 0).sum(1)
+    assert bool((setup & (roads < 4)).any())
+    assert bool((setup & (roads == 4)).any())          # the finished setup, before the first roll, is in the branch
+    assert not bool((~setup & (roads < 4)).any())      # and no setup decision is outside it
+    shape = {"heads": "linear", "messages": "pooled", "attention": False, "others": True, "double_turn": "parts",
+             "contract": "11d"}
+    torch.manual_seed(7)
+    plain = HexNet(space_for(game), game._state.board.topology, 2, ModelConfig(**shape)).eval()
+    assert config_of({"width": 64, "rounds": 3}).setup_rounds == 0 == config_of({"width": 64, "rounds": 3}).setup_attend
+    assert plain.setup_rounds is None and plain.setup_attend is None
+    assert sum(p.numel() for p in plain.parameters()) == 332_281
+    torch.manual_seed(7)
+    branched = HexNet(space_for(game), game._state.board.topology, 2,
+                      ModelConfig(**shape, setup_rounds=1, setup_attend=2)).eval()
+    assert len(branched.setup_rounds) == 1 and len(branched.setup_attend) == 2
+    mine = branched.state_dict()
+    for name, value in plain.state_dict().items():                  # the same draws for everything the plain net has
+        assert torch.equal(mine[name], value), name
+    assert any(k.startswith("setup_") for k in mine)
+    with pytest.raises(ValueError, match="pooled"):
+        ModelConfig(**{**shape, "messages": "separate"}, setup_attend=1)
+    with pytest.raises(ValueError):
+        ModelConfig(**shape, setup_rounds=-1)
+    with pytest.raises(ValueError, match="11d"):
+        ModelConfig(**{**shape, "contract": "9d"}, setup_attend=1)
+    for p in branched.parameters():                                  # off the start, so every path carries signal
+        p.data.add_(0.05 * torch.randn_like(p))
+    plain.load_state_dict({k: v for k, v in branched.state_dict().items() if not k.startswith("setup_")})
+    with torch.no_grad():
+        for fused in (True, False):
+            plain.fused = branched.fused = fused
+            a, b = plain(**inputs), branched(**inputs)
+            after = ~setup
+            assert torch.equal(a.logits[after], b.logits[after]) and torch.equal(a.value[after], b.value[after])
+            assert not torch.allclose(a.logits[setup], b.logits[setup], atol=1e-4)
+            assert not torch.allclose(a.value[setup], b.value[setup], atol=1e-4)
+        branched.fused = True
+        fused_out = branched(**inputs)
+        branched.fused = False
+        torch.testing.assert_close(branched(**inputs).logits, fused_out.logits, atol=1e-4, rtol=1e-4)
+        # A batch with no setup row skips the branch and reads exactly as the plain net.
+        later = {k: v[~setup] for k, v in inputs.items()}
+        assert torch.equal(branched(**later).logits, plain(**later).logits)
+    # Gradients reach the branch from a setup row.
+    branched.train()
+    branched(**{k: v[setup] for k, v in inputs.items()}).value.sum().backward()
+    assert branched.setup_kind.grad is not None and branched.setup_rounds[0].vertex[0].weight.grad is not None
+
+
+def test_the_setup_value_head_feeds_nothing_and_leaves_the_net_as_it_was():
+    """`setup_value` adds a head of its own, built after everything else, so
+    the rest of the net draws the same initial weights; with it, the policy
+    and the win head read exactly what the net without it reads with the same
+    weights, and the head's logits come out per seat. Off, no parameters."""
+    from hexn.model9 import ModelConfig, config_of
+
+    rows, game = _duel_decisions(count=40, every=2)
+    layout = contract9.layout(2, 19, 54, 72, "11d")
+    inputs = unpack9(layout, torch.from_numpy(np.stack([r[0] for r in rows])))
+    shape = {"heads": "linear", "messages": "pooled", "attention": False, "others": True, "double_turn": "parts",
+             "contract": "11d", "setup_rounds": 1, "setup_attend": 2}
+    assert config_of({"width": 64, "rounds": 3}).setup_value is False
+    with pytest.raises(ValueError, match="11d"):
+        ModelConfig(**{**shape, "contract": "9d", "setup_rounds": 0, "setup_attend": 0}, setup_value=True)
+    torch.manual_seed(3)
+    plain = HexNet(space_for(game), game._state.board.topology, 2, ModelConfig(**shape)).eval()
+    assert plain.setup_value_head is None
+    torch.manual_seed(3)
+    headed = HexNet(space_for(game), game._state.board.topology, 2, ModelConfig(**shape, setup_value=True)).eval()
+    mine = headed.state_dict()
+    for name, value in plain.state_dict().items():
+        assert torch.equal(mine[name], value), name
+    extra = [k for k in mine if k not in plain.state_dict()]
+    assert extra and all(k.startswith("setup_value_head.") for k in extra)
+    for p in headed.parameters():
+        p.data.add_(0.05 * torch.randn_like(p))
+    plain.load_state_dict({k: v for k, v in headed.state_dict().items() if k in plain.state_dict()})
+    with torch.no_grad():
+        for fused in (True, False):
+            plain.fused = headed.fused = fused
+            a, b = plain(**inputs), headed(**inputs)
+            assert torch.equal(a.logits, b.logits) and torch.equal(a.value_logits, b.value_logits)
+            assert a.setup_value_logits is None and b.setup_value_logits.shape == (len(rows), 2)
+            assert headed(**inputs, policy=False).setup_value_logits.shape == (len(rows), 2)
+            assert not torch.allclose(b.setup_value_logits, b.value_logits, atol=1e-3)
+
+
+def test_the_setup_value_branch_feeds_the_setup_value_head_alone():
+    """`setup_value_rounds` and `setup_value_attend` give the setup value head
+    a branch of its own, built after everything else. The policy and the win
+    head read exactly what the net without it reads with the same weights.
+    With the setup branch's weights and the seat norm copied into it, the head
+    reads what it reads without a branch of its own; with other weights it
+    reads something else on setup rows."""
+    from hexn.model9 import ModelConfig, config_of
+    from hexset.contract9 import BOARD_COLUMNS_11D
+
+    rows, game = _duel_decisions(count=60, every=2)
+    layout = contract9.layout(2, 19, 54, 72, "11d")
+    inputs = unpack9(layout, torch.from_numpy(np.stack([r[0] for r in rows])))
+    table = inputs["table"]
+    setup = (table[:, BOARD_COLUMNS_11D["turn"].start] == 0) & (table[:, BOARD_COLUMNS_11D["rolled"].start] == 0)
+    assert 0 < int(setup.sum()) < len(rows)
+    shape = {"heads": "linear", "messages": "pooled", "attention": False, "others": True, "double_turn": "parts",
+             "contract": "11d", "setup_rounds": 1, "setup_attend": 2, "setup_value": True}
+    assert config_of({"width": 64, "rounds": 3}).setup_value_rounds == 0
+    assert config_of({"width": 64, "rounds": 3}).setup_value_attend == 0
+    with pytest.raises(ValueError, match="setup_value must be on"):
+        ModelConfig(**{**shape, "setup_value": False}, setup_value_rounds=1)
+    torch.manual_seed(3)
+    headed = HexNet(space_for(game), game._state.board.topology, 2, ModelConfig(**shape)).eval()
+    torch.manual_seed(3)
+    branched = HexNet(space_for(game), game._state.board.topology, 2,
+                      ModelConfig(**shape, setup_value_rounds=1, setup_value_attend=2)).eval()
+    mine = branched.state_dict()
+    for name, value in headed.state_dict().items():
+        assert torch.equal(mine[name], value), name
+    extra = [k for k in mine if k not in headed.state_dict()]
+    assert extra and all(k.startswith("setup_value_") and not k.startswith("setup_value_head.") for k in extra)
+    for p in branched.parameters():
+        p.data.add_(0.05 * torch.randn_like(p))
+    headed.load_state_dict({k: v for k, v in branched.state_dict().items() if k in headed.state_dict()})
+    copied = {**branched.state_dict()}
+    for k, v in branched.state_dict().items():
+        for mine_, its in (("setup_rounds.", "setup_value_rounds."), ("setup_attend.", "setup_value_attend."),
+                           ("out_seat.", "setup_value_out.")):
+            if k.startswith(mine_):
+                copied[its + k[len(mine_):]] = v.clone()
+    copied["setup_value_kind"] = branched.state_dict()["setup_kind"].clone()
+    twin = HexNet(space_for(game), game._state.board.topology, 2,
+                  ModelConfig(**shape, setup_value_rounds=1, setup_value_attend=2)).eval()
+    twin.load_state_dict(copied)
+    with torch.no_grad():
+        for fused in (True, False):
+            headed.fused = branched.fused = twin.fused = fused
+            a, b, c = headed(**inputs), branched(**inputs), twin(**inputs)
+            assert torch.equal(a.logits, b.logits) and torch.equal(a.value_logits, b.value_logits)
+            assert b.setup_value_logits.shape == (len(rows), 2)
+            assert branched(**inputs, policy=False).setup_value_logits.shape == (len(rows), 2)
+            assert torch.allclose(c.setup_value_logits, a.setup_value_logits, atol=1e-5)
+            assert not torch.allclose(b.setup_value_logits[setup], a.setup_value_logits[setup], atol=1e-3)
+            # `setup_value` alone gives the head's logits exactly, with a branch of its own or without.
+            assert torch.equal(branched.setup_value(**inputs), b.setup_value_logits)
+            assert torch.equal(headed.setup_value(**inputs), a.setup_value_logits)
+    plain = HexNet(space_for(game), game._state.board.topology, 2, ModelConfig(**{**shape, "setup_value": False}))
+    with pytest.raises(ValueError, match="no setup value head"):
+        plain.setup_value(**inputs)

@@ -145,7 +145,7 @@ serialise/parse round trip can introduce a type mismatch.
 `exit`, resuming means re-freezing the manifest with `--resume` set, and a
 higher `--iterations` to train further, pointing at the same
 `--checkpoint-dir`; `league` resumes whenever its `learner*/latest.pt`
-checkpoints exist, so relaunching a crashed heat's own manifest is enough:
+checkpoints exist, so relaunching a crashed league run's own manifest is enough:
 
 ```bash
 python -m hexn.run.init --mode ppo --name my-run --force \
@@ -183,7 +183,7 @@ replay shard written just before the crash as its iteration's collection. The lo
 written before an iteration's evaluation, which gets a row of its own, and a
 resumed run appends `{"resumed_from": N}` to `log.jsonl` before its first
 row: an iteration logged but not checkpointed is logged again, so a reader
-keeps the last row per iteration. A `league` heat restores each seat's own
+keeps the last row per iteration. A `league` run restores each seat's own
 config (a controller's entropy coefficient included) and sums its standings
 from the rows before the iteration it resumes at.
 
@@ -217,9 +217,7 @@ Every frozen run's `run.json` carries:
   each `--runtime` module was found in. A run's own clean tree says nothing
   about which engine or bots it trained against.
 - `argv`: what followed `--` on the `run.init` command line.
-- `parent`: the checkpoint this run continues from, if any, so a run's
-  lineage does not have to be reconstructed later by matching iteration
-  numbers between log files.
+- `parent`: the checkpoint this run continues from, if any.
 
 ## Schema
 

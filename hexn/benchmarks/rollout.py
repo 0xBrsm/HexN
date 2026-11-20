@@ -4,14 +4,12 @@
 `hexn.selfplay` batches so the network's fixed dispatch toll is paid once per
 tick rather than once per position. That only pays if the plumbing around it —
 engine step, `encode`, legal actions, mask — is cheap relative to the forward,
-so this measures the plumbing on its own with a trivial policy. Torch-free, so
-it runs on the phone.
+so this measures the plumbing on its own with a trivial policy. Torch-free.
 
 Two numbers matter and they are not the same one. Ticks/sec says how often a
 batch is offered to the policy, and actions/sec says how much experience the
-plumbing can produce. Sweeping the lane count separates them: actions/sec is
-roughly flat, so lanes buy batch size rather than throughput, which is exactly
-the trade the dispatch toll asks for.
+plumbing can produce. Sweeping the lane count separates them: lanes set the
+batch size, and actions/sec shows what they do to throughput.
 
 `benchmarks.throughput` is the floor to read this against — the same engine
 with no observations at all.

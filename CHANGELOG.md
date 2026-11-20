@@ -2,6 +2,59 @@
 
 All notable changes to the `hexn` package are recorded here.
 
+## 0.56.0
+
+### Added
+
+- **A setup branch for contract-11d nets (`ModelConfig.setup_rounds`,
+  `setup_attend`).** In setup positions (before the game's first roll, as
+  the board block's turn count and roll flag show: every setup decision
+  and the finished setup), the trunk's tokens take `setup_rounds` more
+  pooled rounds and then `setup_attend` pre-norm transformer layers over
+  every hex, vertex, seat and table token before the heads; every other
+  position reads the trunk alone, exactly as a net without the branch with
+  the same weights. The branch is built after the rest of the net, so the
+  rest draws the same initial weights under the same seed. Both default to
+  0 (no branch, no parameters), and a checkpoint written before the fields
+  loads as before. The ONNX export runs the branch on every row and keeps
+  it for setup rows.
+
+- **A setup value head (`ModelConfig.setup_value`).** A contract-11d net
+  may carry a head of its own beside the win head: a hidden layer of
+  `width` over the win head's read, each seat's win chance in
+  `Prediction.setup_value_logits`. It is built after every other part and
+  feeds nothing else, so the policy and the win head read exactly as
+  without it; it is meant to be fitted on its own to finished setups.
+
+- **A branch for the setup value head (`ModelConfig.setup_value_rounds`,
+  `setup_value_attend`).** The setup value head may read a branch of its
+  own in place of the win head's read. In setup positions the trunk's
+  tokens, as they are before the setup branch, take that many more pooled
+  rounds and transformer layers, then a norm, and the head reads the seat
+  tokens that come out. Only the head reads the branch, so the policy and
+  the win head read exactly as without it.
+
+- **`HexNet.setup_value(...)`.** The setup value head's logits alone, the
+  numbers `forward` gives as `Prediction.setup_value_logits`. Where the
+  head has a branch of its own, the call runs the trunk, that branch and
+  the head, and skips the setup branch and every other head.
+
+### Changed
+
+- PPO archives a completed collection from the decoded game records it
+  already holds, avoiding another read and decompression of every observation
+  file. Archives retain the same complete records and metadata, and partial
+  collections are removed only after the archive has been flushed and saved.
+
+- **The self-play gate test plays its game through
+  `hexset.gym.driver.play_seated`**, which replaces
+  `hexset.arena.run_seated`.
+
+### Fixed
+
+- **The changelog, docs, docstrings and help text state what the code does
+  and what changed.**
+
 ## 0.55.0
 
 ### Breaking

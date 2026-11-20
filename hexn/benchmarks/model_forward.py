@@ -1,15 +1,14 @@
 # SPDX-License-Identifier: GPL-3.0-only
-"""What one self-play move actually costs, now that there is a network.
+"""What one self-play move costs with a network in the loop.
 
 `benchmarks.throughput` measures the engine alone, which says little about a
 training loop: under expert iteration a move is dominated by network forwards,
-not by the simulator. This splits a move into its three parts — engine step,
-`encode`, and a batched forward — so the next optimisation goes where the time
-is rather than where it was guessed to be.
+not by the simulator. This splits a move into its three parts (engine step,
+`encode`, and a batched forward) and times each.
 
 The batch figure is the one that matters. A search evaluates many leaves at
 once, so per-position cost at batch 1 is a worst case nothing in the loop will
-actually pay.
+pay.
 
 The crossings are timed separately from the forward. A forward on tensors that
 are already resident says nothing about what a search pays, because a search
@@ -84,7 +83,7 @@ def _positions(count: int, players: int, seed: int):
     """Distinct positions from one playthrough, all sharing a board.
 
     A search evaluates many leaves of the same game, so a batch that shares a
-    board is what the training loop will actually encode. Giving each position
+    board is what the training loop encodes. Giving each position
     its own random board instead measures cache misses no real batch pays —
     inflating the reported `encode` cost with an artifact of the benchmark
     rather than anything about the encoder.

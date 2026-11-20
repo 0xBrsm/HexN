@@ -297,9 +297,8 @@ def main(argv: list[str] | None = None) -> int:
     torch.set_num_threads(args.threads)
     state = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
     stored = state.get("args", {})
-    # Shape as well as size: see `hexn.model.config_from_args`. This estimator
-    # is the mechanism behind the minibatch block, so it has to be runnable on
-    # whichever lineage the block calibrates against.
+    # Shape as well as size: see `hexn.model.config_from_args`, so the
+    # estimator runs on a checkpoint of any head shape.
     model = config_from_args(stored)
 
     rng = random.Random(args.seed)

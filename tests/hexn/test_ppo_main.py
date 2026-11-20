@@ -47,9 +47,8 @@ TINY = [
 def run(directory, iterations, extra=()):
     """Freeze a run, then launch it -- `ppo_main.main` takes nothing else.
 
-    Going through `hexn.run.freeze` rather than calling the parser directly is
-    deliberate: it means every test below exercises the manifest path the real
-    trainer uses, so a config that cannot round-trip through a freeze fails
+    Going through `hexn.run.freeze` rather than calling the parser directly
+    means every test below exercises the manifest path the real trainer uses, so a config that cannot round-trip through a freeze fails
     here rather than on the box.
     """
     from hexn.run import freeze
@@ -81,7 +80,7 @@ def test_every_iterations_checkpoint_is_kept_alongside_the_one_that_gets_overwri
     assert kept == ["iter-00001.pt", "iter-00002.pt", "iter-00003.pt", "iter-00004.pt"]
     assert (tmp_path / "latest.pt").exists()
     # The point of keeping them is that they differ; identical copies of the
-    # final weights would answer nothing about when training stopped helping.
+    # final weights would say nothing about the run's course.
     early = torch.load(tmp_path / "iter-00002.pt", weights_only=False)
     late = torch.load(tmp_path / "iter-00004.pt", weights_only=False)
     assert early["iteration"] == 2 and late["iteration"] == 4
@@ -130,13 +129,11 @@ def test_a_run_resumed_from_a_checkpoint_without_a_game_total_logs_none_not_a_wr
 
 
 def test_resuming_with_nothing_to_resume_is_an_error_rather_than_a_fresh_start(tmp_path):
-    """It used to fall through and silently begin at iteration 0.
+    """`--resume` with no checkpoint to resume from refuses to run.
 
-    On a 150-iteration GPU block that is hours spent discarding the campaign,
-    with a log that starts at 0 and looks perfectly healthy. A typo'd
-    `--checkpoint-dir` or an unseeded directory is all it takes. Same shape as
-    the learning rate `--resume` used to throw away: a flag that quietly does
-    nothing.
+    Falling through would silently begin at iteration 0, with a log that
+    starts at 0 and looks healthy. A mistyped `--checkpoint-dir` or an
+    unseeded directory is all it takes.
     """
     with pytest.raises(SystemExit):
         run(tmp_path / "empty", 1, ["--checkpoint-every", "1", "--resume"])
@@ -421,11 +418,11 @@ def test_an_antithetic_self_duel_is_exactly_zero():
 def test_versus_is_the_engines_own_verdict_and_nothing_added():
     """Two scripted rungs, and `versus` reports exactly what HexSet reports.
 
-    The whole claim of the refactor: `hexn.loop.versus` is a lineup, a cast
+    The claim: `hexn.loop.versus` is a lineup, a cast
     and a cohort size handed to `hexset.bench.versus.compete_batched`, so at
     one seed it cannot read differently from the same call made directly. A
     second derivation of the pairing, the interval or the margin would show up
-    here as a number that no longer matches.
+    here as a number that does not match.
     """
     from hexset.bench.versus import BotPolicy, compete_batched
     from hexset.casting import alternating
@@ -485,9 +482,7 @@ def test_duellist_seats_a_networks_trade_gate_before_use():
     trades. Seating it is the contract `NetworkBot.seat_at`'s own docstring
     describes for exactly this caller -- a driver that installs a bot as a
     gate only, rather than asking it to move. `loop.duellist` seats it
-    itself; this is the regression an unpatched `PolicyPolicy` would pass
-    without a single test noticing, since nothing else asserts on a duel's
-    trade count.
+    itself, and nothing else asserts on a duel's trade count.
     """
     from hexset.actions import space_for
     from hexset.arena import deal_game
@@ -531,8 +526,8 @@ def test_the_same_self_duel_reads_off_zero_without_the_pairing():
         journal=fresh(),
     )
 
-    # The verdict stamps the key either way now (`Verdict.metrics`), which is
-    # how an old reading is told apart from a new one in a recorded verdict.
+    # The verdict stamps the key either way (`Verdict.metrics`), so a recorded
+    # verdict says which pairing it used.
     assert result["antithetic"] is False
     assert result["games"] == 8
     assert result["paired_vp"] != 0.0
@@ -1212,3 +1207,27 @@ def test_an_unresolved_signal_gives_no_share_and_no_scale():
     assert negative["signal_g_squared"] < 0
     assert negative["signal_share_at_b_big"] is None and negative["b_simple"] is None
     json.dumps(negative)
+
+
+def test_each_archive_from_decoded_games_is_the_archive_their_files_give(tmp_path, monkeypatch):
+    """Through a real run, every iteration archived from the trainer's decoded
+    games is byte for byte the archive read back from the collection's files."""
+    import gzip
+
+    from hexn import durable
+
+    real, pairs = durable.archive, []
+
+    def both(held, path, *, episodes=None):
+        if episodes is not None:
+            episodes = list(episodes)
+            check = pathlib.Path(str(path) + ".files")
+            real(held, check)
+            pairs.append((pathlib.Path(path), check))
+        return real(held, path, episodes=episodes)
+
+    monkeypatch.setattr(durable, "archive", both)
+    assert run(tmp_path, 2) == 0
+    assert len(pairs) == 2
+    for archived, check in pairs:
+        assert gzip.decompress(archived.read_bytes()) == gzip.decompress(check.read_bytes())

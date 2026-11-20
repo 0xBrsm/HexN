@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: GPL-3.0-only
 """Search-test fixtures `test_expert.py` needs: `a_game`, `Stub`.
 
-Copied from HexSet's `tests/test_mcts.py` (now a different repo) rather than
-imported across the boundary -- a test file is not an installable package
-`hexn`'s dependency on `hexset` can reach, the way `test_expert.py` used to
-when both suites shared one `tests/` directory (`from test_mcts import ...`).
-Keep this in sync with `test_mcts.py` by hand if either changes.
+Copied from HexSet's `tests/test_mcts.py` rather than imported across the
+boundary: a test file is not part of the installable package `hexn`'s
+dependency on `hexset` can reach. Keep this in sync with `test_mcts.py` by
+hand if either changes.
 
 `test_expert.py` is the sole consumer and needs only the two fixtures below;
 keep it that way rather than growing this module for one more caller.

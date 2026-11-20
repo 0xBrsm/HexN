@@ -51,8 +51,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--parent",
         default=None,
-        help="the checkpoint this run continues from, recorded as lineage so it "
-        "never has to be recovered by matching iteration numbers again",
+        help="the checkpoint this run continues from, recorded as lineage",
     )
     parser.add_argument("--force", action="store_true", help="overwrite an existing run")
     parser.add_argument(

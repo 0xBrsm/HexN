@@ -2,17 +2,15 @@
 """Does the value head order siblings the way the truth does?
 
 `benchmarks.sibling` measures the head's error against the spread it has to
-resolve, but that is an *upper bound on the damage, not a measurement of it*,
-and its own write-up says why: sibling
-positions are one action apart and mostly identical, so their biases are
+resolve, but that is an *upper bound on the damage, not a measurement of it*:
+sibling positions are one action apart and mostly identical, so their biases are
 probably correlated, and a bias common to both children cancels in the
 comparison. `sibling` cannot see that cancellation, because it never learns any
 child's true value.
 
 This does. Every legal child of a probed position is rolled out many times, so
 each one gets a Monte Carlo estimate of what it is actually worth, and the
-head's ordering is compared against that. Rank correlation is the number the
-open question wants.
+head's ordering is compared against that, by rank correlation.
 
 **It answers the GAE question too, and that is not a coincidence.** With gamma
 1 the low-lambda credit term is `V(s_next) - V(s)`, and the parent's value is a
@@ -26,8 +24,7 @@ noise, and credit has to come from the outcome instead.
 
 `--simulations N` runs **one search rooted at the parent** and reads its visit
 counts over the same children the truth is known for. That is the object
-distillation trains the policy toward, and it has never been measured against
-anything. The question is one line: **do visits pick the true best child more
+distillation trains the policy toward. The question is one line: **do visits pick the true best child more
 often than the policy's own prior does?**
 
 If they do, the teacher is real at the level that matters, and a distillation
@@ -48,7 +45,7 @@ only when they differ — and then only for the **two contested children**,
 since no other child can enter the comparison. This concentrates the rollout
 budget on the rows that are actually informative.
 
-One semantic change comes with it, and it is the more relevant question anyway.
+The flag changes what `improved` means.
 Without the flag, `improved` means the visits found the globally best child.
 With it, the row has only the two contested children in it, so `improved` means
 **the search moved to the better of the two** — which is exactly what
@@ -56,8 +53,7 @@ distillation would be learning from.
 
 `--child-trees` is the separate, more expensive pass: score every child by a
 search rooted at *it*, which asks whether the backed-up value is a better label
-than the head's read. The flag stays available for that comparison even when
-it is not the current question, because the harness is the same.
+than the head's read.
 
 ## Scoring the row with a tree, not just the head
 
@@ -65,9 +61,9 @@ it is not the current question, because the harness is the same.
 *backed-up value* of a PUCT search rooted at it, against the same truth on the
 same positions, which asks the label question directly: the value head is
 trained on terminal returns whose variance is mostly dice twenty turns out, and
-the standing proposal is to bootstrap off the search's own estimate instead.
-That is only worth doing if the tree's estimate is the better one, and two
-columns over one row of truth is the paired way to find out.
+bootstrapping off the search's own estimate instead is only worth doing if the
+tree's estimate is the better one. Two columns over one row of truth compare
+the two estimates paired.
 
 The search draws from its own generator, so the truth column of a
 `--simulations N` run is what a `--simulations 0` run at the same seed produces.
@@ -104,7 +100,7 @@ decisions. Every `Phase.ROBBER` row is affected, since `MOVE_ROBBER` always
 resolves hidden information; `BUY_DEV_CARD` and `PLAY_KNIGHT` affect any row
 they appear on.
 
-**The fix averages, because averaging is what the search experiences.** The
+**A chance child is averaged, because averaging is what the search experiences.** The
 tree itself resamples a chance edge on every visit and keys the outcome, so
 the edge's `Q` converges on the mean over outcomes and PUCT orders *actions*,
 not realised children. That is precisely the quantity this metric exists to
@@ -124,8 +120,7 @@ mismatch instead of an ordering. So the `--rollouts` budget is **partitioned
 across the N draws rather than multiplied**: total games rolled out is
 unchanged, and the lane-to-stream map is unchanged too, so draw `d` lane `k`
 of one child still shares its deck and its sampling stream with draw `d` lane
-`k` of every sibling. `--chance-draws 1` restores the single-draw path, for
-comparison against numbers produced under it.
+`k` of every sibling. `--chance-draws 1` scores each child on a single draw.
 
 **Cost.** Only chance children multiply, so the added cost of a larger
 `--chance-draws` falls on the head column alone and is modest; the rollout
@@ -140,9 +135,8 @@ the settings when not given) the moment its truth is in. A rerun with the
 same settings replays the seeding pass, which reproduces the same positions,
 checks each kept line's fingerprint against the position it rebuilt, and
 probes only the positions the journal does not hold yet. That works because
-every position draws from streams of its own, keyed by its index; the shared
-stream it used to draw its chance children and its search from made a
-position depend on every one probed before it.
+every position draws its chance children and its search from streams of its
+own, keyed by its index, so no position depends on the ones probed before it.
 
     python -m hexn.benchmarks.rank --checkpoint runs/example/iter-00585.pt \\
         --positions 24 --rollouts 96
@@ -281,8 +275,7 @@ def lane_plan(rollouts: int, draws: int) -> list[tuple[int, int]]:
     `stream_seed + 0 .. + rollouts - 1` in order however many draws it has.
     Every sibling therefore uses the same stream set in the same order, which is
     what `resolution` needs to pair the top two children lane by lane, and what
-    makes a one-draw child's plan `[(rollouts, 0)]` — exactly the single
-    collector the harness built before the chance fix.
+    makes a one-draw child's plan `[(rollouts, 0)]`, a single collector.
 
     Draws with no budget left are dropped rather than run empty.
     """
@@ -316,9 +309,7 @@ def head_row(
 ) -> Row:
     """Score every child of one position, averaging over each one's draws.
 
-    Extracted from `main` because this is where the chance defect lived: the row
-    is the object the whole metric is computed from, and it was built inline in a
-    two-hundred-line function where nothing could reach it. Every child is
+    The row is the object the whole metric is computed from. Every child is
     encoded from the choosing seat's frame, so the only thing varying across the
     row is the position.
 
@@ -482,7 +473,7 @@ def pooled(head_rows, true_rows, se_rows) -> dict:
         # Centring a row of `n` shrinks independent errors by (n-1)/n, and the
         # observed variance below is measured *after* centring. Comparing it
         # against the raw se^2 drives reliability to zero and the correction to
-        # nan — which is what the test caught.
+        # nan.
         variances.append(np.asarray(ses) ** 2 * (n - 1) / n)
     if not x:
         return {"children": 0}
@@ -579,8 +570,8 @@ def chance(rows: list[dict], draws: int) -> dict:
     """How much of this run was contaminated, and how much noise is left.
 
     `spread` is the mean standard deviation of the head's read of one chance
-    child across that child's draws — the noise a single-draw probe left in the
-    row, measured on the run rather than assumed by the power calculation.
+    child across that child's draws: the noise a single-draw probe would leave
+    in the row, measured on the run.
     `residual` is what averaging leaves of it, `spread / sqrt(draws)`, which is
     the figure to read against `true_gap_mean`: the argmax has to resolve that
     gap, so the residual has to sit well inside it.
@@ -680,7 +671,7 @@ def main(argv: list[str] | None = None) -> int:
         default=DRAWS,
         help="draws to average a chance child over, head and truth alike; the "
              "rollout budget is partitioned across them, not multiplied. 1 "
-             "restores this module's earlier single-draw path",
+             "scores each child on a single draw",
     )
     parser.add_argument("--simulations", type=int, default=0,
                         help="also score every child by the backed-up value of a "
@@ -697,9 +688,9 @@ def main(argv: list[str] | None = None) -> int:
                              "than the teacher one")
     parser.add_argument("--wave", type=int, default=16)
     parser.add_argument("--exploration", type=float, default=1.25)
-    # `netbot.load_torch` pins torch to one thread, which is right for the 30-process
-    # CPU sharding it was built for and crippling for this single process. The
-    # rollouts batch every lane per tick, which is what the iGPU is for.
+    # `netbot.load_torch` pins torch to one thread, which suits many-process
+    # CPU sharding and starves this single process; `--threads` sets it back.
+    # The rollouts batch every lane per tick, which a GPU (`--device`) serves.
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--json", default="")
@@ -835,7 +826,7 @@ def main(argv: list[str] | None = None) -> int:
         # into the same flat wave. A chance child's tree value is the mean over
         # whichever of its draws produced a searchable root, which is the same
         # average the head column takes; a draw that produced none falls back to
-        # the head for that draw, as it always did.
+        # the head for that draw.
         tree = list(head)
         if search is not None and args.child_trees:
             flat = [child for outcomes in games for child in outcomes]
@@ -891,8 +882,8 @@ def main(argv: list[str] | None = None) -> int:
         # identically, so lane k across the row shares deck and sampling stream.
         #
         # A chance child spends the same `--rollouts` budget spread over its
-        # draws rather than N times the budget on one of them, so the whole
-        # measurement costs what it always did. `lane_plan` gives each draw its
+        # draws rather than N times the budget on one of them, so the rollout
+        # cost does not grow with the draw count. `lane_plan` gives each draw its
         # lane count and its `stream_seed` offset, consecutively, so a child's
         # lanes still cover streams `stream_seed + 0 .. + rollouts - 1` in the
         # same order as every sibling's however many draws it has. That is what
@@ -948,8 +939,8 @@ def main(argv: list[str] | None = None) -> int:
         row["standard_errors"] = [float(v) for v in ses]
         # The chance columns: how many of this row's children hid a draw, and
         # how far the head's own read of such a child moved across its draws.
-        # `chance_spread` is the noise a single-draw probe was leaving in the
-        # row, and the number the recommended `DRAWS` has to be read against.
+        # `chance_spread` is the noise a single-draw probe would leave in the
+        # row, and the number the default `DRAWS` has to be read against.
         row["chance_children"] = int(sum(hot))
         row["chance_spread"] = [float(np.std(v)) for v in drawn if len(v) > 1]
         if search is not None:

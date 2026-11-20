@@ -6,7 +6,7 @@ overlap, so run it on an otherwise idle machine. It runs identical seeded
 training jobs with and without ``--async-collect`` and reports the median time
 between iteration records after the pipeline-fill iteration. That interval is
 the number that captures overlap; adding logged collection and update durations
-would double-count work that deliberately runs concurrently.
+would double-count work that runs concurrently.
 
 Run from ``src/`` on an idle GPU machine:
 

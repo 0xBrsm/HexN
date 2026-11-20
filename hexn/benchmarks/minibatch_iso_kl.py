@@ -1,35 +1,30 @@
 # SPDX-License-Identifier: GPL-3.0-only
 """What learning rate makes a bigger minibatch travel the same distance?
 
-Two earlier sweeps that both moved `--minibatch` at a fixed rate were
-confounded by the same thing: at a fixed rate a bigger minibatch takes fewer
-steps per iteration, so it travels *less far per iteration* even though
-nothing about the learning rate changed. So "a bigger minibatch read flat" in
-a training curve cannot be told apart from "fewer steps read flat".
-Calibrating the rate against a training run and reading the result after the
-fact is what those sweeps got wrong — the rate needs to be re-calibrated at
-every minibatch so that only the *direction* of the step changes, not its
-length.
+At a fixed rate a bigger minibatch takes fewer steps per iteration, so it
+travels *less far per iteration* even though nothing about the learning rate
+changed, and a change of minibatch at a fixed rate cannot be told apart from
+a change in the number of steps. This calibrates the rate at every minibatch
+so that only the *direction* of the step changes, not its length.
 
-This is the cheap version: one collected batch, no training run, every arm
+It uses one collected batch, no training run, every arm
 starting from identical weights and identical *warm* Adam state, the same
 seeded minibatch order, so `minibatch` and `lr` are the only differences.
 
-Per arm it reports the honest end-to-end distance — the k3 KL of the finished
-policy against the batch's own `old_log_prob`, not the per-minibatch average,
-which understates a finished update because minibatch-to-minibatch drift
-compounds over an epoch — plus the entropy the update left behind and the
+Per arm it reports the end-to-end distance (the k3 KL of the finished policy
+against the batch's own `old_log_prob`, not the per-minibatch average, which
+understates a finished update because minibatch-to-minibatch drift compounds
+over an epoch), plus the entropy the update left behind and the
 median pre-clip gradient norm.
 
 Then it solves, per minibatch, for the rate that matches the reference arm's
-end-to-end KL. Those rates are the arms of the block; nothing here is a guess.
+end-to-end KL.
 
-**Read the entropy column as carefully as the KL column.** An arm can collapse
-because the entropy bonus is the most *coherent* term in a policy objective
-whose gradient is mostly noise, so raising the rate amplifies it
-preferentially. If an iso-KL arm also lands on the reference arm's entropy,
-the entropy coefficient needs no adjustment and the block moves one thing. If
-it does not, that is a second calibration.
+**Read the entropy column as carefully as the KL column.** The entropy bonus
+is the most *coherent* term in a policy objective whose gradient is mostly
+noise, so raising the rate amplifies it preferentially. An iso-KL arm that
+also lands on the reference arm's entropy needs no change to the entropy
+coefficient; one that does not needs that calibrated too.
 
     python -m hexn.benchmarks.minibatch_iso_kl --checkpoint runs/example/latest.pt
 """
@@ -173,14 +168,13 @@ def main(argv: list[str] | None = None) -> int:
     torch.set_num_threads(args.threads)
     state = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     stored = state.get("args", {})
-    # Shape as well as size. Reading only width and rounds here is what stopped
-    # this probe loading the first `--policy-head mlp` lineage at all, and the
-    # whole point of the probe is to calibrate the lineage that will run.
+    # Shape as well as size: a checkpoint with a non-default head shape (for
+    # one, `--policy-head mlp`) loads only with its whole config.
     model = config_from_args(stored)
     parent = args.parent or stored.get("parent", "")
 
-    # The launch configuration of the run being calibrated against, so the block
-    # can be written against what the parent actually ran rather than prose.
+    # The launch configuration of the run being calibrated against, as the
+    # checkpoint recorded it.
     print("checkpoint args: " + json.dumps(
         {k: stored.get(k) for k in (
             "learning_rate", "minibatch", "epochs", "entropy", "lam",
@@ -282,8 +276,8 @@ def main(argv: list[str] | None = None) -> int:
                         optimiser.step()
                         steps += 1
             except _OOM as exc:
-                # A rung that does not fit is a real answer about the ladder's
-                # top, not a crash: record it and carry on.
+                # A minibatch that does not fit in device memory is a result
+                # about the grid's top, not a crash: record it and carry on.
                 if not isinstance(exc, _OOM_TYPES) and "out of memory" not in str(exc):
                     raise
                 print(f"  minibatch {label:>6s} lr {lr:<8.1e} OUT OF MEMORY", flush=True)

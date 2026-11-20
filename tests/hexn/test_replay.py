@@ -48,10 +48,10 @@ def test_replay_to_ply_matches_the_stored_observation_at_every_step():
 
 
 def test_replay_to_ply_is_the_engines_own_replay_and_nothing_added():
-    """The whole claim of this module now: `hexn.replay.replay_to_ply` is
+    """The whole claim of this module: `hexn.replay.replay_to_ply` is
     `hexset.record.replay_to` called on a collected episode's own `record`,
-    so at any ply the two cannot disagree -- a second derivation of one
-    replay path is exactly what used to drift."""
+    so at any ply the two cannot disagree, as a second derivation of one
+    replay path could."""
     episode = a_trade_free_episode(seed=23)
     stream = episode.stream()
     for ply in (0, len(stream) // 2, len(stream)):
@@ -86,10 +86,9 @@ def test_replay_to_ply_refuses_an_episode_with_an_opponent_seat():
 
 
 def test_replay_to_ply_applies_a_hand_built_trade():
-    """Hand-built rather than bot-driven: contract 6 raised the trade floor
-    enough that self-play games trade rarely (`CHANGELOG.md`), so waiting for
-    a scripted bot to produce a real one is slow and unreliable where a
-    manually composed `Trade` is neither -- the convention's own rule:
+    """Hand-built rather than bot-driven: self-play games trade rarely, so
+    waiting for a scripted bot to produce a real one is slow and unreliable
+    where a manually composed `Trade` is neither -- the convention's own rule:
     the cheapest position with the property under test, never a whole
     game played out by a real bot.
     """

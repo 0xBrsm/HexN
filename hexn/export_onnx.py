@@ -1,29 +1,21 @@
 # SPDX-License-Identifier: GPL-3.0-only
 """Export a trained checkpoint to ONNX, for hexset's onnxruntime backend.
 
-`hexn.netbot` loads a checkpoint straight into PyTorch: fine for the training
-box, but heavier than a browser game on borrowed hardware needs. This script
+`hexn.netbot` loads a checkpoint straight into PyTorch; an ONNX file needs
+only onnxruntime to play. This script
 runs the exact reconstruction path `netbot.load_torch()` already trusts (same
 shapes, same `state_dict` keys), traces it once with `torch.onnx.export`, and
 embeds the handful of facts hexset's `hexset.clients.onnxbot.load()` needs at
 runtime as ONNX metadata props.
 
 **Contract v2.** The serving side is an *interface*: it emits state, it
-accepts an action, and nothing in that repo should know how a network reads a
-position.
-Contract 1 broke that — the serving side carried its own `encoding`, a
-340-line reimplementation of `hexset.encoding`, and `onnxbot.py` carried the
-masking, log-softmax,
-give/want factorisation and seat un-rotation in numpy, both of which had to
-stay bit-identical with this repo forever, in a language it does not run.
-Contract 2 moves all of that into the graph: `record -> encoder -> HexNet
--> heads`, where `encoder` is this module's own `RecordEncoder` (the traced
-mirror of `hexset.encoding`, see `onnx_record.py`'s own docstring) and `heads`
-is masking, log-softmax, argmax and value un-rotation — lifted here out of
-`onnxbot.OnnxPolicy`, the contract-1 path that ran them in numpy. That class
-was deleted when contract 1 was dropped, so nothing on the serving side
-mirrors this math any more; `hexn.policy.masked_log_softmax` is the same
-formula, reused here rather than written a third time.
+accepts an action, and nothing in that repo knows how a network reads a
+position. The graph is `record -> encoder -> HexNet -> heads`, where
+`encoder` is this module's own `RecordEncoder` (the traced mirror of
+`hexset.encoding`, see `onnx_record.py`'s own docstring) and `heads` is
+masking, log-softmax, argmax and value un-rotation. Nothing on the serving
+side mirrors this math; `hexn.policy.masked_log_softmax` is the same formula,
+reused here.
 
 The line contract 2 draws is **the rules, not the network**: hexset still
 computes the position and what a seat may legally know (encoded as the
@@ -97,7 +89,7 @@ command line dispatch to it by the checkpoint's own `contract`.
   `iteration` are read with defaults; and only when asked for on the command
   line, `search=mcts` with `simulations`/`wave`, and `gate_plies` (the trade
   gate's own continuation budget, independent of `search`). Inference device
-  is deliberately not metadata: the UI takes it from its own `--device`.
+  is not metadata: the UI takes it from its own `--device`.
 * **Provenance props**, which nothing reads at runtime and everything reads
   afterwards: `source_checkpoint` (repo-relative), `checkpoint_sha256`,
   `exported_at`, and `exporter_commit` when it can be determined. A deployed
@@ -105,9 +97,8 @@ command line dispatch to it by the checkpoint's own `contract`.
   for provenance, and `source_checkpoint` is normally `runs/<run>/latest.pt`,
   a moving pointer. The digest pins the weights and the commit pins the
   code, so an artifact can be reproduced from itself. See `_provenance`.
-* **Scope cut, deliberate.** The stochastic/Gumbel sampling path is gone —
-  every checkpoint served here plays argmax, so there is nothing to sample.
-  A temperature input would be the way back in, if that is ever wanted.
+* **No sampling.** The graph has no temperature input: every checkpoint
+  served here plays argmax.
 * **Runtime**: onnxruntime >= 1.18 on the CPU provider, inside the UI's
   Python server — not onnxruntime-web; the browser only ever talks HTTP.
   Opset 18 is well inside that runtime's range.
@@ -250,8 +241,7 @@ def _sample_games(players: int, count: int, seed: int = 0) -> list[tuple[Game, i
     the graph without ever exercising a mask that looks like one, which is
     exactly the case `action_index`'s exact-match gate exists to
     stress. `perspective` is always `to_move(game)`, same as
-    the seat `hexset.clients.onnxbot.V2Policy` passes to `record_from_game`
-    (contract 1 carried it as `Request.seat`, removed with that path).
+    the seat `hexset.clients.onnxbot.V2Policy` passes to `record_from_game`.
     """
     rng = random.Random(seed)
     pairs: list[tuple[Game, int]] = []
@@ -452,10 +442,8 @@ class _ExportWrapper(nn.Module):
         pred = self.net(hexes, vertices, edges, globals_)
 
         # `masked_log_softmax` is written once in `hexn.policy` for
-        # training-time sampling and reused here. Contract 1 ran the same
-        # formula in numpy on the serving side; that helper went with
-        # `OnnxPolicy` when contract 1 was dropped, so the graph is now the
-        # only place it lives.
+        # training-time sampling and reused here; on the serving side the
+        # graph is the only place it runs.
         slot_log_probs = masked_log_softmax(pred.logits, action_mask)
         action_index = slot_log_probs.argmax(dim=-1)
         # Illegal entries sit at `NEG` before the softmax, so `exp` of the
@@ -464,9 +452,8 @@ class _ExportWrapper(nn.Module):
         # or renormalise, unlike `LeafEvaluator._prior`'s option-subset gather.
         prior = slot_log_probs.exp()
 
-        # The un-rotation contract 1 did in numpy (`onnxbot._board_order`,
-        # removed with it), as a gather: board seat `j`'s value is the
-        # seat-relative value at `(j - perspective) % players`. Contract 2
+        # The value un-rotation, as a gather: board seat `j`'s value is the
+        # seat-relative value at `(j - perspective) % players`. The graph
         # exports `value` already in board-seat order, so the server does not
         # repeat this.
         board_seat = torch.arange(self.players, device=perspective.device)
@@ -502,10 +489,7 @@ def _load_checkpoint(
     # values in 'index' field... will cause the ONNX model to be incorrect").
     # `fused=True` swaps in the dense adjacency-matmul path instead: "the
     # same numbers up to float reassociation" per its own docstring, with a
-    # dedicated equivalence test already pinning that in torch — just
-    # architecturally the wrong default to optimise for a training GPU
-    # (slower in CPU eager mode), which is irrelevant for exporting a graph
-    # that runs once per move.
+    # dedicated equivalence test pinning that in torch.
     net.fused = True
     return net, space, {
         "players": players,
@@ -528,9 +512,9 @@ def _exporter_commit() -> str | None:
 
     `git` is asked first but usually fails here: an export runs in a container
     that bind-mounts the worktree, and a worktree's `.git` is a file holding an
-    absolute gitdir that does not exist inside it (the same trap the dev
-    status journal records). `HEXSET_EXPORT_COMMIT` is the way in, set by
-    whoever launches the container from a shell that *can* read the repo.
+    absolute gitdir that does not exist inside it. `HEXSET_EXPORT_COMMIT` is
+    the way in, set by whoever launches the container from a shell that *can*
+    read the repo.
 
     Returns None when neither works. A missing key is honest; `"unknown"`
     stamped into an artifact is a lie that survives longer than the session.
@@ -613,7 +597,7 @@ def _embed_metadata(
     metadata saying exactly what it does. `gate_plies` -- the trade gate's
     own continuation budget, unrelated to `search` -- follows the same rule
     for the same reason: written only when this export was asked for one,
-    so a file that never asked reads at `hexset.clients._modelmeta`'s unmeasured
+    so a file that never asked reads at `hexset.clients._modelmeta`'s
     default (no rollout) rather than whatever the exporter's own default
     happens to be."""
     import onnx
@@ -709,18 +693,16 @@ def _verify_parity(
 
     The reference path is `hexset.encoding.encode` (numpy) feeding the same
     `net` and `masked_log_softmax` the wrapper's `forward`
-    uses — the exact math `hexset.clients.onnxbot`'s numpy port mirrors, computed
-    here in eager torch rather than a fourth reimplementation. What this
+    uses, computed here in eager torch. What this
     check actually exercises is tracing and onnxruntime execution: does the
     exported graph, run through the runtime hexset actually uses, agree
     with the eager computation on real positions.
 
     `action_index` must match exactly — argmax on a near-tie is
     the one failure this whole check exists to catch, and a tolerance would
-    hide exactly that. `prior`/`value` keep the wider tolerance
-    calibrated against a real checkpoint for the v1 contract (a
-    width=64/rounds=2 net tripped a 1e-4 bound on ordinary fp32 accumulation
-    drift, not a bug): `rtol=1e-3, atol=1e-4`.
+    hide exactly that. `prior`/`value` keep a wider tolerance,
+    `rtol=1e-3, atol=1e-4`: ordinary fp32 accumulation drift on a real net
+    exceeds a 1e-4 bound without any bug.
     """
     import onnxruntime as ort
 
@@ -784,7 +766,7 @@ def export(
     Independent of `search` -- a plain policy file
     can still ask its gate to roll forward. `None`, the default, writes
     nothing, so training collection's own exports (which never pass this
-    flag) leave the served file to `hexset.clients._modelmeta`'s unmeasured
+    flag) leave the served file to `hexset.clients._modelmeta`'s
     default of no rollout.
 
     `trader` names a HexSet bot, as a lineup names it, to answer the served

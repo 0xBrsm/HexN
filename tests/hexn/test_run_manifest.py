@@ -244,17 +244,12 @@ def test_a_manifest_from_another_schema_is_refused(tmp_path):
 
 @pytest.mark.parametrize("mode", ["ppo", "exit"])
 def test_every_mode_can_build_its_parser_twice(mode):
-    """The check that was missing, and the bug it would have caught.
+    """Every mode's parser builds, twice, to the same parameters.
 
-    `hexn.exit` declared `--detach-value` itself while also calling
-    `hexn.loop.add_head_flags`, which declares it too. argparse raises on the
-    duplicate, so *every* invocation of that module failed -- including
-    `--help` -- for as long as it went unnoticed, because nothing built the
-    parser except the module's own `main`, and no test ran it.
-
-    Building twice rather than once is deliberate: a parser that mutates shared
-    module state passes the first call and fails the second, which is exactly
-    the shape of the bug.
+    A flag declared twice (by a mode and again by `hexn.loop.add_head_flags`,
+    say) makes argparse raise, so every invocation of that module fails,
+    `--help` included. Building twice catches a parser that mutates shared
+    module state: it passes the first call and fails the second.
     """
     first = run.parameters(mode)
     second = run.parameters(mode)
@@ -280,8 +275,8 @@ def test_freeze_reads_provenance_before_it_writes_the_run_directory(tmp_path, mo
     """The run directory must not dirty the tree it is recording.
 
     `provenance` reads `git status --porcelain`, which counts untracked paths, so
-    capturing it after `mkdir` made `git_dirty` true for every run once run
-    records became tracked. A constant cannot carry the "cannot be cited" signal.
+    capturing it after `mkdir` would make `git_dirty` true for every run. A
+    constant cannot carry the "cannot be cited" signal.
     """
     from hexn.run import manifest as m
 

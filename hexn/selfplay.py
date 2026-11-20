@@ -15,10 +15,10 @@ the net per move would spend essentially all of its time in dispatch. That is
 why `LaneEnv` exists and why the seam here is `BatchPolicy` -- one call per
 tick per policy, whatever the lane count.
 
-**Reward is deliberately not here.** A collector emits per-seat trajectories and
-the terminal `Outcome`; turning that into returns is the caller's to decide,
-because the choice between terminal win/loss and terminal victory points is
-still open. Nothing in this module assumes either.
+**Reward is not computed here.** A collector emits per-seat trajectories and
+the terminal `Outcome`; turning that into returns (terminal win/loss or
+terminal victory points) is the caller's to decide. Nothing in this module
+assumes either.
 
 Trajectories come out demultiplexed by seat, which is `LaneEnv`'s doing: a Catan
 game interleaves four seats' decisions into one action stream, and a seat's next
@@ -27,9 +27,9 @@ position that seat was asked about. What this module adds is the join, by
 `(seat, step)`, between the environment's `Decision`s and the encoding,
 log-probability, value and `aux` the policy produced for the same decision.
 
-The plumbing stays numpy-only and torch-free, because PyTorch cannot be
-installed on the development phone: it is tested and timed here against a
-trivial policy and only the torch-backed policy is deferred to the training box.
+The plumbing stays numpy-only and torch-free, so it is tested and timed
+against a trivial policy on a machine without PyTorch; only the torch-backed
+policy needs it.
 """
 
 from __future__ import annotations
@@ -107,10 +107,9 @@ _seat_points = seat_points
 # roll, moving the robber, and the main phase. Setup has no round to read and
 # a discard is another seat's decision mid-roll.
 _OUTLOOK_PHASES = frozenset((Phase.ROLL, Phase.ROBBER, Phase.MAIN))
-# The share of those decisions labelled. A label costs several times what the
-# rest of a decision's collection does (batched across lanes), so labelling
-# them all would slow collection several-fold; a tenth adds about a tenth and
-# still labels far more rows an iteration than the head needs. Which ones is a
+# The share of those decisions labelled. A label is expensive relative to the
+# rest of a decision's collection, and a tenth still labels far more rows an
+# iteration than the head needs. Which ones is a
 # pure function of the decision (`_outlook_kept`), so it does not depend on
 # lanes or workers.
 OUTLOOK_SHARE = 0.10
@@ -144,8 +143,8 @@ class Request:
     `options` rides along with `mask` because a searching policy wants the
     `Action` objects themselves and rebuilding them from the mask would mean
     enumerating the position a second time. Every one of them is recoverable
-    from its flat index under contract 5 — there is no trade action left whose
-    operands do not fit in one (`hexset.trading`).
+    from its flat index: every action's operands fit in one
+    (`hexset.trading`).
 
     `seat` is `to_move`, which is not always `current_player` — discarding on a
     seven belongs to somebody else — and it is both the perspective
@@ -479,8 +478,8 @@ class RuledLaneEnv(LaneEnv):
 
 
 def standard_law(index: int) -> tuple[GameType, frozenset[int]]:
-    """The game law every run before `duel(...)` played: the standard game
-    at every seat, nobody retired."""
+    """The default game law: the standard game at every seat, nobody
+    retired."""
     return STANDARD_GAME, frozenset()
 
 
@@ -573,8 +572,7 @@ class Collector:
         refilled the moment its game ends and the collector runs forever, which
         is what a training run wants. An *evaluation* wants a fixed cohort, and
         without a bound the only way to get one is to keep dealing replacements
-        and throw them away after playing them in full — which is where a
-        400-game duel went to spend ten minutes.
+        and throw them away after playing them in full.
 
         `stride` deals every `stride`-th index instead of every one, which is
         how parallel collectors shard one run's games: worker `w` of `K` takes
@@ -591,7 +589,7 @@ class Collector:
         is what a PPO iteration wants; anything else deals its lanes here.
 
         `sample_stream` is `SAMPLE_STREAMS`' choice: "game" hands every request
-        its `draw_key`, so a game's sampled actions no longer depend on
+        its `draw_key`, so a game's sampled actions do not depend on
         `lanes`, `stride` or which games shared a batch.
 
         `outlook` reads `Request.outlook`, the `--aux-target outlook` label, on
@@ -658,7 +656,7 @@ class Collector:
         self.temperatures = temperatures
         # Game index -> (game type, retired seats), pure in the index like the
         # caster (`hexn.collect.mix_deal`); None deals the standard game at
-        # every seat, as every run before `duel(...)` did.
+        # every seat.
         self.game_law = game_law
         if deal_law is not None and (game_law is not None or pair_boards):
             raise ValueError("deal_law cannot be combined with game_law or pair_boards")
@@ -667,8 +665,8 @@ class Collector:
         # like the caster (`hexn.collect.mix_coalitions`); None hangs nothing
         # on any game.
         self.coalition = coalition
-        # Which policy ids record their seats. {0} is every run before gen3 —
-        # one learner, opponents as scenery. The table league seats several
+        # Which policy ids record their seats. {0} is one learner, opponents
+        # as scenery. The table league seats several
         # learners in one game: id 0 is `policy`, id k>0 is `opponents[k-1]`,
         # and a seat records iff its id is here.
         self._learners = frozenset(learners)

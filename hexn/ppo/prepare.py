@@ -2,13 +2,13 @@
 """Assembling a collection off the trainer's critical path.
 
 Under async cohort collection the workers finish the next cohort while the
-update is still running, and until now the trainer only then decoded those
-games and assembled their batch, with the workers and the GPU waiting on it.
-`Preparer` is a helper process that does that work as soon as the cohort's
-last game is on disk (`hexn.durable.Partial`): it decodes the games
-(`hexn.gamefile`), assembles the batch (`prepare`) and hands back the batch,
-the per-game gauges and the games stripped of their transitions. The
-trainer only receives the games from the workers' pipes, as before.
+update is still running. `Preparer` is a helper process that decodes and
+assembles that cohort as soon as its last game is on disk
+(`hexn.durable.Partial`), so the workers and the GPU do not wait on the
+trainer to do it: it decodes the games (`hexn.gamefile`), assembles the batch
+(`prepare`) and hands back the batch, the per-game gauges and the games
+stripped of their transitions. The trainer only receives the games from the
+workers' pipes.
 
 **Exact.** The helper runs the trainer's own `prepare` on the same games: the
 files the workers wrote are the bytes they sent home (one `gamefile.encode`

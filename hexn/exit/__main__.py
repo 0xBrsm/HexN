@@ -13,8 +13,7 @@ games, `hexn.exit`'s own math (`__init__.py`) consumes their visit targets,
 PPO and distillation share the checkpoint format, the duel, the progress record
 and the network builder (`hexn.loop`), so those are imported rather than
 copied. What differs is the two lines in the middle: who chooses the action,
-and what the update optimises. Threading that through `hexn.ppo` as a mode
-would put a branch in that trainer's loop, to save about forty lines.
+and what the update optimises.
 
 ## The search is over the *current* student, not a frozen teacher
 
@@ -184,9 +183,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="positions kept in the disk-backed replay store under "
         "<checkpoint-dir>/replay/ (hexn.store.EpisodeStore), evicting whole "
         "iterations oldest-first once the newer ones already cover the budget; "
-        "the freshest iteration is never evicted on its own arrival. Replaces "
-        "--buffer-iterations: sized in positions, which stays meaningful across "
-        "--games-per-iteration, where a fixed iteration count did not. 0 keeps "
+        "the freshest iteration is never evicted on its own arrival. Sized in "
+        "positions, so the budget holds whatever --games-per-iteration is. 0 keeps "
         "no store: each iteration trains on its own games only, which stay in "
         "<checkpoint-dir>/partial/ until its checkpoint is written",
     )
@@ -197,9 +195,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="stored positions re-searched over the CURRENT net each "
         "iteration (hexn.reanalyse), replacing their stale visit target "
         "before assembly -- staleness is worst for the oldest rows in the "
-        "store, collected under the earliest, weakest net still retained. "
-        "0 disables; there is no measured optimal fraction yet, so the "
-        "default is a stated starting point rather than a tuned constant. "
+        "store, collected under the earliest net still retained. 0 disables. "
         "Incompatible with --corpus, which never grows a store to reanalyse",
     )
     parser.add_argument(
@@ -420,9 +416,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     counted = GameCount()
     first_game = 0
     if args.resume and not latest.exists() and not args.init:
-        # It used to fall through and start fresh, silently: the same refusal
-        # `hexn.ppo` makes, for the same reason. With `--init` it is a fresh
-        # start from those weights, as in `hexn.ppo`.
+        # Refused rather than started fresh: the same refusal `hexn.ppo`
+        # makes, for the same reason. With `--init` it is a fresh start from
+        # those weights, as in `hexn.ppo`.
         raise SystemExit(
             f"--resume was given but {latest} does not exist; "
             "seed the directory with the checkpoint to continue from, "
@@ -535,10 +531,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         rng=random.Random(args.seed),
     )
     if args.collect_workers > 1:
-        # Searched collection is the path that needs this: a single process
-        # is slow because batching amortises the network call and nothing
-        # else. Each worker builds its own search over its own CPU copy of
-        # the net; the learner keeps the GPU.
+        # Searched collection sharded across processes: each worker builds
+        # its own search over its own CPU copy of the net; the learner keeps
+        # the GPU.
         shard = max(1, -(-args.lanes // args.collect_workers))
         collector = ParallelCollector(
             [

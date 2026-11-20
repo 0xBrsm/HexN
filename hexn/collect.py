@@ -2,29 +2,23 @@
 """Parallel self-play collection: the torch-free Collector, sharded.
 
 A single collector process leaves the box's other cores idle, because
-everything a tick does — `legal_actions`, `encode`, the engine step, a
-scripted opponent's one-ply search — is Python compute holding the GIL. That
-rules out the usual vectorised-env fan-out, a thread pool over native engine
-subprocesses whose `step()` blocks on pipe I/O and releases the GIL; ours
-never releases it, so the shard has to be a process.
+everything a tick does (`legal_actions`, `encode`, the engine step, a
+scripted opponent's one-ply search) is Python compute holding the GIL. A
+thread pool cannot spread work that never releases the GIL, so each shard is
+a process.
 
 Each worker owns a slice of the lanes and a CPU copy of the network, and
 plays its games end to end: worker `w` of `K` deals game indices
 `base + w, base + w + K, ...` (the Collector's `stride`), so the workers'
-index sets are disjoint by construction, every game stays the same pure
-function of `(seed, index)` it always was, and the caster — also pure in the
-index — casts identically at any worker count. Inference stays per-worker on
-CPU: at the batch sizes one worker's slice of lanes reaches, per-worker CPU
-inference beats moving those lanes' observations to a shared GPU and back.
-The GPU stays free for the update, and the learner re-syncs weights to every
-worker once per iteration.
+index sets are disjoint by construction, every game is a pure function of
+`(seed, index)`, and the caster (also pure in the index) casts identically
+at any worker count. Inference stays per-worker on CPU, with no shared
+inference server and no global tick barrier. The GPU stays free for the
+update, and the learner re-syncs weights to every worker once per iteration.
 
 What crosses processes is one weights dict per iteration going out and
 finished games coming back, each encoded (`hexn.gamefile`) — never per-tick
-observations. The other shape
-considered, SampleFactory-style central inference, was rejected for this
-model: it reintroduces a global tick barrier plus per-tick traffic over the
-pipes, to buy GPU batching that only pays above the batch sizes a shard sees.
+observations.
 
 On a resume, `games_started()` reports the *max* over the workers' counters.
 Indices between the slowest and fastest worker's next deal are skipped rather
@@ -187,17 +181,12 @@ def named_opponent(name: str, seed: int, lanes: int) -> BoardBots:
 
 # `--mix` names that are not arena entrants, and must never become them.
 #
-# Both predate `named_opponent`. A lane opponent whose strength moved
-# silently would invalidate every run that used it, without changing a line
-# of that run's own configuration. So they are resolved here, by name,
-# exactly as they were before an entrant spec was accepted at all.
-#
-# `greedy` was the third reserved name and is gone: HexSet 0.47.0 deleted
-# `search2` and with it `hexset.bots.greedy`, so there is no bot to resolve it
-# to. It is not re-pointed at another bot -- a mix name that silently changed
-# which opponent a run trained against is exactly what this list exists to
-# prevent -- so `--mix greedy=...` is now an unknown name, and a recipe that
-# wants a handcrafted opponent names that bot and means it.
+# A reserved name is resolved here, by name, so the opponent a run's
+# configuration names cannot change without a line of that configuration
+# changing. `--mix greedy=...` is an unknown name: no bot backs it, and it is
+# not re-pointed at another bot, since a mix name that silently changed which
+# opponent a run trained against is what this list exists to prevent. A
+# recipe that wants a handcrafted opponent names that bot.
 RESERVED_MIX = ("parent",)
 
 # The learner itself as a *table pool* member, and only there. A table whose
@@ -296,7 +285,7 @@ def mix_opponents(
     Id `k + 1` is `mix[k]` — the contract `mixed_caster` casts against and
     the driver dispatches on (`Collector._seats`) — so this list's order is load-bearing.
 
-    Reserved names resolve as they always have (see `RESERVED_MIX`). A bare
+    Reserved names resolve by name (see `RESERVED_MIX`). A bare
     `network:<path>` (no `@trades` override) is an RL-only pool member with
     no trading stance of its own to preserve, so it is routed through
     `frozen` — the same batched `NetworkPolicy` a ladder rung uses — rather
@@ -320,8 +309,7 @@ def mix_opponents(
     `frozen` needs a topology and a device to build its net on, neither of
     which `named_opponent`'s arena spawn requires (it takes the board at
     spawn time, one bot per lane's own board). A bare entry with no `board`
-    falls back to `named_opponent` too, so a caller that never passes one
-    (there are none left in this tree) keeps today's behaviour.
+    falls back to `named_opponent` too.
 
     `torch_seed`, a worker's own, seeds a `sampled:` member's stream, so two
     workers sharing the board seed do not sample in lockstep; without it the
@@ -336,8 +324,7 @@ def mix_opponents(
         else:
             # A stream per entry for a `sampled:` member and for a bench's
             # one bot per board (`BoardBots.bot`); a lane's own bots draw off
-            # their game and seat (`hexset.arena.seat_key`). 77 stays where
-            # it was.
+            # their game and seat (`hexset.arena.seat_key`).
             out.append(
                 rung_opponent(
                     name,
@@ -706,7 +693,7 @@ def mix_names(mix: Sequence[tuple[str, float]]) -> list[str]:
     Plain entries contribute their own name and a table entry contributes its
     pool, each name once at its first appearance — so a mix with no table
     entries and no repeated names lists exactly `[name for name, _ in mix]`,
-    which is the id law every recorded run was cast under. `mix_opponents`
+    which is `mixed_caster`'s id law. `mix_opponents`
     builds this list and `mix_caster` casts against it; keeping them on one
     function is what stops the two from drifting.
     """
@@ -730,7 +717,7 @@ def mix_table(mix: Sequence[tuple[str, float]], players: int, seed: int):
     draw filled with a `self~band` member, which draws its own from
     `[1 - band, 1 + band]`. The temperature draws come off the same per-index
     stream *after* every seat is cast, so a pool with no band consumes nothing
-    extra and every cast law on record is byte-identical.
+    extra and its casts are byte-identical to a pool without the band law.
     """
     draw = _mix_draw(mix, players, seed)
 
@@ -861,7 +848,7 @@ def mix_coalitions(mix: Sequence[tuple[str, float]], players: int, seed: int, *,
 def mix_deal(mix: Sequence[tuple[str, float]], players: int, seed: int, *, pair_boards: bool = False):
     """Game index -> `(game_type, retired seats)` for a mix holding a
     `duel(...)` entry, or None when it holds none -- so a collector deals the
-    standard game exactly as before unless asked. A game the walk casts from
+    standard game unless asked. A game the walk casts from
     any other entry is `(STANDARD_GAME, frozenset())`. The third part of
     `mix_table`'s verdict, off the same per-index stream as the cast.
     `pair_boards` mirrors `paired_caster`: games `2k` and `2k+1` share one draw."""
@@ -883,8 +870,8 @@ def mix_caster(mix: Sequence[tuple[str, float]], players: int, seed: int):
 
     Without a table entry this *is* `mixed_caster` — same rng key, same
     cumulative walk over the shares, same alternating seat pairs — and the
-    identity is pinned by test, because a resumed run must still deal the
-    games an earlier version of this function would have dealt.
+    identity is pinned by test, so a resumed run deals the games it would
+    have dealt.
 
     A table entry, when the walk lands on it, seats the learner once and fills
     every other seat with an independent draw from its pool -- `SELF` in the
@@ -892,8 +879,8 @@ def mix_caster(mix: Sequence[tuple[str, float]], players: int, seed: int):
     draw gives it. The learner's seat and the draws come off the same per-index
     stream as the entry draw, so a cast is still a function of `(seed, index)`
     alone. The seat is drawn rather than taken as `index % players`: the board
-    is keyed to the index too, and `alternating`'s history is what a
-    parity-correlated cast costs. The cast half of `mix_table`.
+    is keyed to the index too, and a parity-correlated cast confounds seat
+    with board (see `alternating`). The cast half of `mix_table`.
     """
     table = mix_table(mix, players, seed)
 
@@ -943,15 +930,9 @@ def mixed_caster(fractions: Sequence[float], players: int, seed: int):
     and the third is itself: exposure is `fraction * 2/3`, so e.g.
     `mybot=0.15` gives the learner 10% opponent-facing exposure to mybot.
 
-    Adding heterogeneous tables needs no new flag and should not get one — a new
-    argparse dest changes `run.manifest.parameters` and every frozen config then
-    fails `load`. It belongs in the spec string, as a `+` between names sharing
-    one share: `"mybot+parent=0.1"` keeps every existing spec
-    byte-identical, keeps the shares exact because there is still one draw a
-    game, and turns each entry's cast from an id into a pair of ids. The seat
-    assignment within the pair is the part that needs care rather than taste —
-    see `alternating`, where a parity-correlated cast can read as a phantom
-    effect that has nothing to do with what is actually being compared.
+    Heterogeneous tables are `table(...)` entries in the spec string (see
+    `TABLE` and `mix_caster`), not a flag: a new argparse dest changes
+    `run.manifest.parameters`, and every frozen config then fails `load`.
     """
 
     def caster(index: int) -> tuple[int, ...]:
@@ -1021,13 +1002,12 @@ class WorkerSpec:
     # play only. One flag drives both wires because either alone breaks what
     # `ppo.pair_baseline` conditions on.
     pair_boards: bool = False
-    # Searched collection. `simulations` of 0 keeps the plain policy, which is
-    # every PPO run on record. Above 0 the worker wraps its policy in a
-    # `SearchPolicy`, so each transition carries the search's `Target` and the
-    # corpus is distillable.
+    # Searched collection. `simulations` of 0 keeps the plain policy. Above 0
+    # the worker wraps its policy in a `SearchPolicy`, so each transition
+    # carries the search's `Target` and the corpus is distillable.
     #
-    # The searched path is the one that needed this: with search on, a single
-    # process spends most of a tick in single-threaded Python -- the engine,
+    # With search on, a single process spends most of a tick in
+    # single-threaded Python -- the engine,
     # `encode` over every leaf a decision visits, and the tree descent itself
     # -- and batching only amortises the network call, none of that. So
     # throughput comes from running many worker processes, not from widening

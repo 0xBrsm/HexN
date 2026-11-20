@@ -149,9 +149,9 @@ COLLECTS = {"collect", "cohort", "start_collect"}
 
 
 def test_every_trainer_collection_keeps_its_games():
-    """The rule in AGENTS.md, for the loops it matters most in: a trainer that
-    collects without a `partial=` holds an iteration's games in memory until
-    the iteration ends, and a crash loses every one of them."""
+    """Every trainer collects with a `partial=`: a trainer that collects
+    without one holds an iteration's games in memory until the iteration
+    ends, and a crash loses every one of them."""
     bare = []
     for relative in TRAINERS:
         tree = ast.parse((PACKAGE / relative).read_text())
@@ -255,3 +255,77 @@ def test_pruning_keeps_every_game_and_its_record_before_removing_the_collection(
         record = from_json(json.dumps(line["record"]))
         game = replay(record)
         assert (game.won_by, game.turns) == (line["outcome"]["winner"], line["outcome"]["turns"])
+
+
+def test_decoded_episodes_archive_identically_without_reading_observations(tmp_path, monkeypatch):
+    import gzip
+    from dataclasses import replace
+
+    from hexn import gamefile
+
+    held = durable.Partial(tmp_path / "partial")
+    episodes = Collector(First(), fill=False, **QUICK, keep=held).cohort(4)
+    # Only the fields that preparation retains are needed. Include the legacy
+    # absent-record form as well as the complete records of the other games.
+    episodes[0] = replace(episodes[0], record=None, cast=(0, 1, 0, 1), trades=((1, 0, 1, (1, 0, 0, 0, 0)),))
+    held.keep(episodes[0])
+    original, decoded = tmp_path / "original.gz", tmp_path / "decoded.gz"
+    assert durable.archive(held, original) == len(episodes)
+
+    def no_read(*args, **kwargs):
+        pytest.fail("decoded records must not read or inflate observation files")
+
+    monkeypatch.setattr(durable.Partial, "games", no_read)
+    monkeypatch.setattr(gamefile, "fields", no_read)
+    stripped = [replace(episode, trajectories=()) for episode in reversed(episodes)]
+    assert durable.archive(held, decoded, episodes=iter(stripped)) == len(episodes)
+    assert gzip.decompress(decoded.read_bytes()) == gzip.decompress(original.read_bytes())
+
+
+@pytest.mark.parametrize("change", ["missing", "duplicate", "other_index"])
+def test_archive_refuses_a_different_episode_set_without_removing_games(tmp_path, change):
+    from dataclasses import replace
+
+    root = tmp_path / "partial"
+    held = durable.partial(root, 0)
+    episodes = Collector(First(), fill=False, **QUICK, keep=held).cohort(2)
+    supplied = (episodes[:-1] if change == "missing" else [episodes[0], episodes[0]] if change == "duplicate"
+                else [replace(episodes[0], index=100), episodes[1]])
+    before = {path.name: path.read_bytes() for path in held.directory.iterdir()}
+    with pytest.raises(ValueError, match="every finished game exactly once"):
+        durable.prune(root, 0, episodes=supplied)
+    assert {path.name: path.read_bytes() for path in held.directory.iterdir()} == before
+    assert not durable.archived(root, 0).exists()
+
+
+def test_archive_failure_keeps_the_partial_and_previous_archive(tmp_path, monkeypatch):
+    root = tmp_path / "partial"
+    held = durable.partial(root, 0)
+    episodes = Collector(First(), fill=False, **QUICK, keep=held).cohort(2)
+    path = durable.archived(root, 0)
+    durable.archive(held, path)
+    previous = path.read_bytes()
+
+    def fail_replace(*args):
+        raise OSError("cannot commit archive")
+
+    monkeypatch.setattr(durable.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="cannot commit archive"):
+        durable.prune(root, 0, episodes=episodes)
+    assert path.read_bytes() == previous
+    assert held.finished() == sorted(episode.index for episode in episodes)
+
+
+def test_prepared_records_apply_only_to_the_current_iteration(tmp_path):
+    import gzip
+
+    root = tmp_path / "partial"
+    earlier = durable.partial(root, 0)
+    old = Collector(First(), fill=False, **QUICK, keep=earlier).cohort(2)
+    current = durable.partial(root, 1)
+    new = Collector(First(), fill=False, first_game=2, **QUICK, keep=current).cohort(2)
+    durable.prune(root, 1, episodes=new)
+    for iteration, episodes in ((0, old), (1, new)):
+        lines = [json.loads(line) for line in gzip.decompress(durable.archived(root, iteration).read_bytes()).splitlines()]
+        assert [line["index"] for line in lines] == sorted(episode.index for episode in episodes)
+        assert not durable.partial(root, iteration).directory.exists()

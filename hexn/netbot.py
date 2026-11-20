@@ -4,13 +4,9 @@ nothing else.
 
 How a checkpoint is *played* — the bot, the leaf evaluation, the search, the
 trade gate — is runtime-agnostic and lives in `hexset.clients.netbot`, over
-the `hexset.clients.policy.Policy` protocol. This module used to carry a
-torch copy of all four of those classes alongside onnxruntime's copy in
-HexSet, and the two drifted three ways in the trade gate alone before anybody
-noticed. What is left here is the part that genuinely differs between
-runtimes: finding the file, rebuilding the net from the `args` the run
-recorded, and handing back a
-`Checkpoint`. `hexn.policy.NetworkPolicy` is the `Policy` itself.
+the `hexset.clients.policy.Policy` protocol. This module holds the part
+that differs between runtimes: finding the file, rebuilding the net from the
+`args` the run recorded, and handing back a `Checkpoint`. `hexn.policy.NetworkPolicy` is the `Policy` itself.
 
 Three things here are not decoration:
 
@@ -35,7 +31,7 @@ the policy worth scoring; `NetworkPolicy(greedy=True)` takes the argmax.
 `hexset.clients.onnxbot.load` (one onnxruntime thread, its own cache keyed on
 the file's mtime), and so does a contract-9 `.pt` on the CPU, through its
 export (`onnx_of`, made once per checkpoint): the same decisions as the torch
-net, about three times faster at a batch of one on one CPU thread. Every
+net. Every
 entrant the arena seats (`network:`, `mcts:`, `rollout:`) loads this way.
 `load_torch` is the torch net itself, for training and for code that reads
 inside the net; `load` gives it too for an older contract or another device.

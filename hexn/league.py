@@ -1,17 +1,14 @@
 # SPDX-License-Identifier: GPL-3.0-only
 """The table league: N learners share every game, each training on its own seats.
 
-Stages 2-3 of the table-league design, shaped for hyperparameter
-heats: the same architecture on every seat, warm-started from one checkpoint,
-with per-learner `PPOConfig` overrides. Four seats a game means a four-arm
-ablation costs ~1.1x one arm — collection is shared, and four quarter-sized
-updates cost one full one. The arithmetic that licenses the seat split is the
-noise-scale finding: the independent unit is the game, and a learner seated
-once in every game keeps every game.
+Built for hyperparameter heats: the same architecture on every seat,
+warm-started from one checkpoint, with per-learner `PPOConfig` overrides.
+Collection is shared: every game is played once and each learner trains on
+the seats it held in it, so a learner seated in every game keeps every game.
 
-Standings come from the games themselves — every game scores every learner —
+Standings come from the games themselves (every game scores every learner),
 so the heat's gate reads off the log. The heat measures who learns best in
-this shared ecology, not isolated self-play; external anchors calibrate.
+this shared ecology, not in isolated self-play.
 
 A heat checkpoints every seat every iteration and keeps each game on disk as
 it finishes (`<checkpoint-dir>/partial/`). Launched again over a directory
@@ -148,8 +145,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="continue a heat from its own learner*/latest.pt checkpoints — "
-        "the box restart that killed the entropy heat at 35/60 is why this exists. "
+        help="continue a heat from its own learner*/latest.pt checkpoints. "
         "A heat whose checkpoints exist resumes without it",
     )
     parser.add_argument(
@@ -170,9 +166,8 @@ def build_parser() -> argparse.ArgumentParser:
              "before its rotation. Changes who sits next to whom while leaving "
              "every learner's share of every board seat balanced; rotation alone "
              "cannot, because the cyclic order round the table is always "
-             "0,1,2,3. Use to test whether the two-tight-pairs structure both "
-             "noise heats produced is turn-order adjacency: '0,2,1,3' reseats "
-             "the cycle, so adjacency predicts the pairs become {0,2}/{1,3}.",
+             "0,1,2,3. '0,2,1,3', for one, reseats the cycle so that learners "
+             "0 and 1 are no longer neighbours.",
     )
     parser.add_argument(
         "--pair-boards",
@@ -196,8 +191,7 @@ def build_parser() -> argparse.ArgumentParser:
         "base checkpoint's. Empty (the default) keeps the base's own shape. "
         "'quantile' keeps the head's mean as V and leaves the policy wire "
         "untouched, but changes the value loss to a per-seat quantile Huber "
-        "loss -- a way to test whether a richer value loss reshapes what the "
-        "shared trunk learns. A scalar base is warm-started into it, so V at "
+        "loss. A scalar base is warm-started into it, so V at "
         "iteration 0 is the base's own",
     )
     parser.add_argument(
@@ -243,9 +237,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     A run is `runs/<...>/` holding `run.json` and a frozen `config/`, created by
     `python -m hexn.run.init`. Flags are not accepted here: the manifest is the
-    only input, so a recorded result is reproducible from the repository rather
-    than from whichever script in gitignored `tmp/` happened to survive. See
-    `hexn.run.manifest` for the three losses that motivated this.
+    only input, so a run is reproducible from the repository
+    (`hexn.run.manifest`).
     """
     from .run import load
     from .run.manifest import MODULES

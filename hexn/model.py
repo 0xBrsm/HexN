@@ -3,30 +3,24 @@
 
 Message passing runs over two relations, hex-vertex and vertex-edge, in both
 directions, with a global token that reads and writes every type. `StaticGraph`
-also carries `hex_hex` and `vertex_vertex`; both are left out until they are
-shown to pay, since hex adjacency is reachable through shared vertices and
-vertex adjacency through shared edges, and the point of the extra relation is
-only to shorten that path by a round.
+also carries `hex_hex` and `vertex_vertex`; neither is used: hex adjacency is
+reachable through shared vertices and vertex adjacency through shared edges,
+and the extra relation would only shorten that path by a round.
 
 Adjacency is fixed at construction, so a batch is dense `(B, nodes, features)`
 against one shared index set rather than a block-diagonal union of graphs. That
-holds because every game on a given layout shares a topology — only the
-features differ. A second layout needs a second model, which is what would
-happen anyway.
+holds because every game on a given layout shares a topology: only the
+features differ. A second layout needs a second model.
 
 The heads emit exactly the widths `hexn.readout` declares and are scattered
 into the flat action space by its plan, so the policy is masked and applied
 with the same indices the engine already uses.
 
-`ModelConfig.value_head` and `.policy_head` exist because of a suspected
-architectural weakness: the value head is globally calibrated and locally
-blind. It reads a single 64-vector `g` that saw the board only through
-`h.mean(1), v.mean(1), e.mean(1)`, so two positions one settlement apart
-differ in it by about a fifty-fourth of a mean, and one `nn.Linear` then has
-to turn that into the difference a search is asking about. Whether that
-shape is the cause is a hypothesis, not settled, and the shapes below exist
-to be ablated against each other rather than because any of them is known to
-be better.
+`ModelConfig.value_head` and `.policy_head` select the heads' shapes. The
+default value head reads a single 64-vector `g` that saw the board only
+through `h.mean(1), v.mean(1), e.mean(1)`, through one `nn.Linear`; the other
+shapes add a hidden layer, read the node embeddings as well, or change the
+value loss (`ModelConfig`).
 """
 
 from __future__ import annotations
@@ -64,42 +58,35 @@ _DEEP = frozenset({"mlp", "mlp_pooled"})
 class ModelConfig:
     """`width` is capacity; the two head fields are shape, and only shape.
 
-    Existing checkpoints were written by the defaults, so the defaults are
-    load-bearing: `"linear"` on both has to build the same modules under the
-    same names as before these fields existed, and `test_model` pins the
-    `state_dict` keys to make sure it stays that way.
+    Existing checkpoints were written by the defaults, so `"linear"` on both
+    has to build the same modules under the same names as before these fields
+    existed, and `test_model` pins the `state_dict` keys to make sure it stays
+    that way.
 
-    The value shapes, and what each one would show if it won an ablation:
+    The value shapes:
 
-    `"mlp"` — the head is too shallow to read `g`. Cheapest of the five and the
-    only one that leaves the head's input unchanged, so it separates "the
-    readout is too weak" from "the readout is looking at the wrong thing".
+    `"mlp"`: a hidden layer in front of the output, reading the same `g`. The
+    only shape besides `"linear"` and `"quantile"` that leaves the head's input
+    unchanged.
 
-    `"pooled"` — mean pooling washed out the extremes. `g` is built from
-    `h.mean(1), v.mean(1), e.mean(1)`; this concatenates max-pools of the same
-    three onto it, which preserves the best vertex rather than the average one.
-    A settlement placed on the best remaining spot moves a max and barely moves
-    a mean.
+    `"pooled"`: `g` is built from `h.mean(1), v.mean(1), e.mean(1)`; this
+    concatenates max-pools of the same three onto it, which preserves the
+    best vertex rather than the average one.
 
-    `"mlp_pooled"` — both, and the control for reading the two above together.
+    `"mlp_pooled"`: both of the above.
 
-    `"attn"` — the value needs to look at *specific* nodes, and which ones
-    depends on the position. A single query off `g` attends over the 54 vertex
-    embeddings; a max-pool is the same idea with the choice frozen.
+    `"attn"`: a single query off `g` attends over the 54 vertex embeddings,
+    so which nodes the head reads depends on the position.
 
-    `"quantile"` — `"linear"`'s shape widened to `players x quantiles`
+    `"quantile"`: `"linear"`'s shape widened to `players x quantiles`
     outputs, read as one distribution per seat. **The mean of the quantiles
     is `V`**: `forward` returns the `players`-vector mean and nothing
     downstream sees the spread, so GAE, the search and `benchmarks.*` are
-    unchanged by construction. What differs is the loss — `hexn.ppo` trains
-    it with the per-seat quantile Huber loss instead of squared error, and
-    the mechanism under test is that loss shaping the shared trunk.
+    unchanged by construction. What differs is the loss: `hexn.ppo` trains
+    it with the per-seat quantile Huber loss instead of squared error.
     `quantiles` below is its width.
 
-    The policy shapes are `"linear"` and `"mlp"`, applied per node type. The
-    policy is not suspected to be the weak head, so this is here to hold
-    capacity fixed across an ablation of the value head, not because there
-    is a defect to chase in the policy itself.
+    The policy shapes are `"linear"` and `"mlp"`, applied per node type.
     """
 
     width: int = 64
@@ -121,8 +108,8 @@ class ModelConfig:
     contract: str = "8"
 
     def __post_init__(self) -> None:
-        # A mistyped shape has to fail before a run starts, not silently fall
-        # back to the default and be discovered when the ablation reads flat.
+        # A mistyped shape fails before a run starts rather than falling back
+        # to the default.
         if self.value_head not in VALUE_HEADS:
             raise ValueError(f"unknown value_head {self.value_head!r}: {VALUE_HEADS}")
         if self.policy_head not in POLICY_HEADS:
@@ -136,12 +123,10 @@ class ModelConfig:
 def config_from_args(args: Mapping[str, object]) -> ModelConfig:
     """The shape a checkpoint's stored `args` says it was trained with.
 
-    Width and rounds have always been read back this way; the head shapes have
-    to be, and were not everywhere. A checkpoint that records a shape and is
-    rebuilt without it fails in `load_state_dict` on the key names -- the loud
-    failure, and the right one, but it fired twice in `benchmarks/` on the first
-    `--policy-head mlp` lineage because two net builders read only width and
-    rounds. One reader, so it cannot drift a third time.
+    Net builders read width, rounds and the head shapes back through this
+    function, so none of them drops a shape. A checkpoint that records a
+    shape and is rebuilt without it fails in `load_state_dict` on the key
+    names.
 
     Missing keys default to what every checkpoint written before the field
     existed was trained with, so a namespace that predates a knob means "the
@@ -161,9 +146,8 @@ def config_from_args(args: Mapping[str, object]) -> ModelConfig:
 class Prediction:
     """`logits` indexes the flat action space; mask it with `legal_mask`.
 
-    There is no trade head. Contract 6 deleted trading's whole public layer:
-    a seat's private gate is read straight off the value head
-    (`hexset.clients.netbot.NetworkBot`), never a head of its own, so the
+    There is no trade head: a seat's private gate is read straight off the
+    value head (`hexset.clients.netbot.NetworkBot`), never a head of its own, so the
     flat space carries no trade slot and the network emits no offer.
 
     **The value head is a win head.** `value` is `softmax(value_logits)`
@@ -171,9 +155,8 @@ class Prediction:
     `value[..., 0]` — so it is a proper distribution (nonnegative, sums to
     one across `players`) rather than a margin, and it is what every reader
     (`hexn.policy`'s trade gates, `hexn.ppo`'s advantage, a search's leaf)
-    has always read as `value` and continues to. `value_logits` is the same
-    head's raw, pre-softmax output — one number per seat, seat-relative like
-    the encoder — kept for the cross-entropy loss against the one-hot winner
+    reads as `value`. `value_logits` is the same head's raw, pre-softmax
+    output (one number per seat, seat-relative like the encoder), kept for the cross-entropy loss against the one-hot winner
     (`hexn.ppo`), which needs logits, not the probabilities they produce.
 
     `margin` is the auxiliary VP-margin head: a second, independent linear
@@ -189,7 +172,7 @@ class Prediction:
     the last slot (`hexn.ppo`), so `fast[..., :players]` is each seat's
     expected time-weighted win. A PPO run that pays for fast wins reads its
     advantage off it; the win head, which every gate and search reads, is
-    trained exactly as before.
+    trained the same whether the fast head is built or not.
 
     `quantiles` is `None` for every head shape but `"quantile"`, where it is
     the `(B, players, Q)` tensor whose last-axis mean *is* `value_logits`
@@ -227,8 +210,8 @@ def _head(in_dim: int, out_dim: int, width: int, *, deep: bool) -> nn.Module:
     """A head that is a bare `nn.Linear` when it is one.
 
     Not a wrapper module with a `.out` inside it, which is the obvious way to
-    write this and would rename every head's parameters — `heads.vertices.weight`
-    becomes `heads.vertices.out.weight` and no checkpoint in `runs/` loads again.
+    write this and would rename every head's parameters (`heads.vertices.weight`
+    becomes `heads.vertices.out.weight`) so that no existing checkpoint loads.
     The shallow case has to *be* the layer.
     """
     if not deep:
@@ -326,9 +309,8 @@ class QuantileValueHead(nn.Module):
     `_read_value`, `Prediction.value` (via the win head's softmax), GAE,
     `hexset.mcts` and every `benchmarks.*` reader keep the shape and the
     meaning they had; `spread` hands the full tensor to the one caller that
-    needs it, the value loss in `hexn.ppo`. The mechanism on trial is the
-    loss reaching the shared trunk -- which an offline head swap alone
-    cannot express and which this wiring is built to allow.
+    needs it, the value loss in `hexn.ppo`, whose gradient reaches the
+    shared trunk.
 
     Built by `hexn.model._head` at the same width and depth as the scalar head
     it replaces, widened only in its output, so the two differ in their loss
@@ -510,15 +492,12 @@ class HexNet(nn.Module):
             )
         else:
             self.value = _head(value_in, players, width, deep=shape in _DEEP)
-        # The auxiliary VP-margin head (contract 6's win-head registration):
-        # a second, independent read of the same `value_in` features
-        # `self.value` reads, so a `--value-head` ablation holds capacity
-        # comparable across both heads the way it already does across the
-        # policy heads. Always built, so every checkpoint stays loadable
-        # whatever `--aux-margin-weight` trained under -- the flag gates
-        # the loss term in `hexn.ppo`, not
-        # this module's existence. Never a `QuantileValueHead`: the margin
-        # target is a plain regression and has no shape ablation of its own.
+        # The auxiliary VP-margin head: a second, independent read of the
+        # same `value_in` features `self.value` reads, at the same depth.
+        # Always built, so every checkpoint stays loadable whatever
+        # `--aux-margin-weight` trained under: the flag gates the loss term
+        # in `hexn.ppo`, not this module's existence. Never a
+        # `QuantileValueHead`: the margin target is a plain regression.
         self.aux_margin = _head(value_in, players, width, deep=shape in _DEEP)
         # The fast-win head, a third read of the same features: one slot per
         # seat plus "not won in time" (`Prediction.fast`). Only built when
@@ -581,40 +560,29 @@ class HexNet(nn.Module):
     def _initialise(self) -> None:
         """Orthogonal weights: gain √2 through the trunk, 0.01 on every head.
 
-        Nothing in this package initialised anything before this: all 27
-        `nn.Linear` layers ran on PyTorch's default `kaiming_uniform_(a=√5)`,
-        which is the most-cited missing item on the standard PPO
-        implementation-details list. Two distinct consequences follow from
-        this architecture, and **they pull in opposite directions, which is
-        why this is one method and not two changes.**
+        The two gains pull in opposite directions, so they are set together.
 
-        *The trunk is suppressed.* A default-initialised residual branch here
-        carries a small fraction of its skip connection's magnitude, so each
-        `Round` contributes much less than it should and the trunk barely
-        moves across rounds. At initialisation the network is very nearly a
-        linear readout of the raw embeddings — the message passing, which is
-        the entire point of the architecture, starts at reduced strength and
-        has to be learned up. Orthogonal √2 restores the branch to roughly
-        the skip connection's own scale, which is the point of the gain.
+        *The trunk.* Under PyTorch's default `kaiming_uniform_(a=√5)` a
+        residual branch here carries a small fraction of its skip
+        connection's magnitude, so each `Round` contributes little and the
+        network at initialisation is very nearly a linear readout of the raw
+        embeddings. Orthogonal √2 brings the branch to roughly the skip
+        connection's own scale.
 
-        *The heads have to go the other way.* The default heads happen to
-        produce a near-uniform policy **only because they sit on those cold
-        activations**. Raising the trunk's scale while leaving the heads hot
-        would manufacture a peaked initial policy — the exact defect that
-        was, by luck, absent. So every logit-producing head gets gain 0.01,
-        the standard PPO value, and the value head gets 1.0 because it
-        predicts at its target's scale. Biases are zeroed everywhere; the
-        default gave them `U(±1/√fan_in)` too.
+        *The heads.* Raising the trunk's scale while leaving the heads at
+        their default scale would give a peaked initial policy. So every
+        logit-producing head gets gain 0.01, the standard PPO value, and the
+        value head gets 1.0 because it predicts at its target's scale. Biases
+        are zeroed everywhere.
 
         A multi-layer head splits that argument rather than escaping it. Only
         the layer that emits the number is at the head's scale; a hidden layer
         inside a head is trunk by every property this method cares about — it
         feeds a SiLU, its output is not a logit and not a value — so it keeps
         √2 from the loop and `_output` picks out the one layer that does not.
-        Giving a whole `Sequential` gain 0.01 would be the other reading and it
-        is the wrong one: it would suppress the hidden layer for a reason that
-        only applies to logits, and a two-layer head would start weaker than
-        the one-layer head it is meant to be tested against.
+        Giving a whole `Sequential` gain 0.01 would suppress the hidden layer
+        for a reason that only applies to logits, and a two-layer head would
+        start weaker than the one-layer head of the same shape.
         """
         for module in self.modules():
             if isinstance(module, nn.Linear):
@@ -868,18 +836,16 @@ class HexNet(nn.Module):
         # off the optimiser: the head keeps fitting the moving features, but
         # stops voting on where they move. Distillation wants that because the
         # value term is an unweighted mean over every row while the policy term
-        # sees only the contested ones, so the trunk's largest gradient comes
-        # from a head the duel never reads. Every tensor the head reads is cut,
+        # sees only the contested ones, so the trunk's largest gradient would
+        # come from a head the distilled policy never reads. Every tensor the head reads is cut,
         # not just `g`, or a pooled head would keep the path the flag exists to
         # remove.
         cut = self.detach_value
         # `g` feeds the global head and the value head, and autograd accumulates
         # its gradient in the order the forward created the nodes, so the order
-        # of these two reads is load-bearing: reassociating that sum moves the
-        # gradient in the last couple of bits, which was once enough to make a
-        # default-config update diverge after a single step. Measured, not
-        # theorised — and the reason the logits read stays first now that the
-        # deleted trade heads no longer sit between them.
+        # of these two reads is fixed, the logits read first: reassociating
+        # that sum moves the gradient in the last couple of bits, enough to
+        # make a default-config update diverge after a single step.
         logits = stacked.index_select(1, self.flat_gather)
         value_logits, quantiles, margin, fast_logits = self._read_value(
             g.detach() if cut else g,

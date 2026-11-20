@@ -87,9 +87,8 @@ def test_the_traced_rotation_is_the_encoders_own():
 def test_record_encoder_matches_encode_exactly_on_a_seeded_playout():
     """Real positions from a random playout, not gaussians: `encode` is a
     construction from integers, so the torch mirror must match it bit for
-    bit, with no tolerance. Moved here from `tests/test_onnx_record.py`:
-    `RecordEncoder` itself now lives in `hexn.export_onnx`, not
-    `hexset.onnx_record`, which stays torch-free."""
+    bit, with no tolerance. `RecordEncoder` lives in `hexn.export_onnx`;
+    `hexset.onnx_record` stays torch-free."""
     rng = random.Random(7)
     games = [start(random_base_board(rng), 4, rng) for _ in range(6)]
     space = space_for(games[0])
@@ -286,7 +285,7 @@ def test_the_exported_metadata_says_contract_8_and_matches_the_checkpoints_own_a
     assert meta["num_edges"] == str(board.topology.num_edges)
     assert meta["source_checkpoint"] == str(checkpoint)
     # A plain export says nothing about search, so the UI plays one forward
-    # pass — the cheap default every pre-`search` export already gets.
+    # pass, the default.
     assert "search" not in meta
     assert "simulations" not in meta
     assert "wave" not in meta

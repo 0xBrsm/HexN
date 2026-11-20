@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: GPL-3.0-only
 """Expert iteration: play with a search, train toward what the search decided.
 
-A search rooted on a checkpoint's own priors plays better than the raw policy
-does on its own — that gap is why this module exists: the search supplies a
-policy target the raw policy does not already contain. Producing those
+A search rooted on a checkpoint's own priors supplies a policy target the raw
+policy does not already contain. Producing those
 searched games is all this module does; consuming their visit targets belongs
 to distillation.
 
@@ -18,9 +17,8 @@ tree still contributes at most its own wave. That distinction matters: making
 one tree's wave wide causes descents to collide on unexpanded leaves and
 changes how much search the nominal simulation count buys; combining wave-16
 leaves from separate roots changes only the network batch. Which of those
-trades favours GPU inference depends on the hardware; serial Python tree work
-can make a compiled single-lane CPU configuration faster regardless. Scale
-comes from independent CPU collector processes either way.
+trades favours GPU inference depends on the hardware. Scale comes from
+independent CPU collector processes either way.
 """
 
 from __future__ import annotations
@@ -119,8 +117,8 @@ class SearchPolicy:
         make = getattr(evaluator.policy, "trader", None)
         if make is None:
             return None
-        # Only a run that names a trader asks for one, so a policy whose hook
-        # predates it is still asked exactly as it always was.
+        # Only a run that names a trader passes one, so a policy whose
+        # `trader` hook takes no trader argument is still asked with three.
         return make(game, seat, max_offers) if trader is None else make(game, seat, max_offers, trader)
 
     def _one(self, request: Request) -> Choice:
@@ -202,9 +200,8 @@ def _value(root: Node, visits: np.ndarray) -> tuple[float, ...]:
     total = float(visits.sum())
     if not root.expanded or total <= 0:
         # Nothing was evaluated here. Empty means "no estimate", as it does
-        # for every scripted policy. A forced move is not this case: since
-        # HexSet 1.1 a root with one legal move is evaluated and its only
-        # edge credited with every simulation at that value, so it reads
-        # like any other root (before, it came back unexpanded and empty).
+        # for every scripted policy. A forced move is not this case: a root
+        # with one legal move is evaluated and its only edge credited with
+        # every simulation at that value, so it reads like any other root.
         return ()
     return tuple(root.totals.sum(axis=0) / total)

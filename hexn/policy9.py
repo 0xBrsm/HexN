@@ -534,8 +534,9 @@ class NetworkPolicy9:
         stated = collate([r.decision for r in requests])
         del stated["double"]
         batch = {k: torch.from_numpy(v).to(self.device) for k, v in stated.items()}
-        # Inference mode, not just no grad: nothing here is kept for autograd,
-        # and the dispatcher's bookkeeping is a share of a 30-row forward.
+        # Inference mode rather than no grad alone: nothing here is kept for
+        # autograd, and the dispatcher's bookkeeping is a share of a small
+        # forward.
         # The forward and the on-demand heads `decision_scores` runs under one
         # autocast; the scores come back in fp32 and the draw and the recorded
         # log-probability are taken on those.

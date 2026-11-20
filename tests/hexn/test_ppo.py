@@ -45,8 +45,7 @@ def some_episodes(policy, games: int = 4, seed: int = 0, lanes: int = 8, outlook
 
     Nothing here is about trading, and a width-16 net's gate prices every
     coverable candidate after every MAIN action (`hexset.trading.trade_
-    event`) -- at a few dozen ms per event that made one capped game cost
-    minutes. A game the cap truncates has no winner and `win_loss` gives every
+    event`), which makes a capped game slow. A game the cap truncates has no winner and `win_loss` gives every
     seat zero, which is a legitimate target but not one the update can be
     seen learning from, so `decided` names one: `win_loss` reads only
     `outcome.winner`.
@@ -303,8 +302,7 @@ def test_the_kl_break_is_a_ceiling_that_stops_further_epochs(collected):
     optimiser = torch.optim.Adam(policy.net.parameters(), lr=1e-2)
 
     # A threshold below any real post-step divergence stops the update after
-    # the first finished epoch; the default of 0 takes every epoch, which is
-    # every run on record.
+    # the first finished epoch; the default of 0 takes every epoch.
     tripped = update(
         policy, optimiser, batch, PPOConfig(epochs=4, minibatch=minibatch, kl_break=1e-9)
     )
@@ -433,7 +431,7 @@ def test_a_missing_mate_or_an_odd_cohort_refuses_to_baseline(collected):
 
 
 # ---------------------------------------------------------------------------
-# The quantile value loss: an alternative value-head shape under evaluation.
+# The quantile value loss, under a quantile value head.
 # ---------------------------------------------------------------------------
 
 
@@ -514,8 +512,7 @@ def test_a_linear_heads_loss_is_exactly_cross_entropy_against_the_one_hot_winner
     assert torch.equal(terms.value_term, config.value_coefficient * value_loss)
     assert torch.equal(terms.margin_term, torch.zeros_like(terms.loss))
     # Cross-entropy and squared error are on different scales, so the two are
-    # never equal in general -- unlike the pre-win-head arithmetic where
-    # `value_loss` and `value_mse` were the same expression.
+    # never equal in general.
     assert terms.value_mse != terms.value_loss
 
     # And the gradient, which is what actually moves the weights.
@@ -556,11 +553,7 @@ def test_the_quantile_value_term_is_the_pinball_loss_on_the_same_target(collecte
 
     The value term becomes `quantile_huber_loss` against the identical
     `value_target` one-hot vector `assemble` already builds; the policy term
-    and the entropy term are untouched. This exact pairing -- a quantile head
-    against a categorical one-hot target -- is untested territory (see
-    `hexn.ppo`'s module docstring, "The value loss under a quantile head"),
-    but the wiring still has to be exactly this whether or not the
-    combination has ever been trained.
+    and the entropy term are untouched (`hexn.ppo`'s module docstring).
     """
     from hexn.model import QUANTILE_HUBER_KAPPA, quantile_huber_loss
 
@@ -598,9 +591,8 @@ def test_the_quantile_loss_reaches_the_shared_trunk(collected):
     at the value head's own weights.
 
     The policy head and the value head share a trunk. If the quantile value
-    loss's gradient never reached that shared trunk, an ablation comparing
-    value-head shapes by the policy they produce would be measuring nothing:
-    the trunk, and so the policy, would never see the value loss at all.
+    loss's gradient never reached that shared trunk, the trunk, and so the
+    policy, would never see the value loss at all.
     """
     _, episodes = collected
     policy = a_quantile_policy(seed=36)
@@ -1187,9 +1179,9 @@ def test_an_overflowed_row_with_no_weight_adds_its_true_term_to_the_kl_gauge():
 
 
 def test_a_bf16_knife_edge_row_with_a_subnormal_weight_stays_finite():
-    # duel1-sp, 2026-11-07: a bf16 collector sampled a move the fp32 proximal
-    # policy put at e**-95 (weight about 5e-42, subnormal but not zero), and
-    # the update moved it 95 nats. w * inf read inf and the break fired on
+    # A bf16 collector can sample a move the fp32 proximal policy puts at
+    # e**-95 (weight about 5e-42, subnormal but not zero), which the update
+    # then moves 95 nats: w * inf reads inf and would fire the break on
     # every update; in log space the row adds about 1.
     g = torch.Generator().manual_seed(6)
     log_ratio = torch.randn(4096, generator=g) * 0.05

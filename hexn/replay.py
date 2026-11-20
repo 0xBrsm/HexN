@@ -5,10 +5,9 @@
 `Episode` already carries the exact `hexset.record.Record` of the game it
 played -- every seat's actions, the chance stream and the trades the table
 actually cleared. `hexset.record.replay_to` is the one path that walks a
-`Record` back to a live `Game` at some ply; re-deriving a position from
-`(seed, index)` plus a hand-rolled trade replay, which this module used to
-do, is a second derivation of that path and exactly the kind of drift this
-package's boundary rule exists to stop.
+`Record` back to a live `Game` at some ply, and this module calls it rather
+than re-deriving a position from `(seed, index)` plus a trade replay of its
+own.
 
 This is what turns `hexn.reanalyse`'s "re-search a stored position" into
 something cheaper than "re-collect it": no live game has to be kept around
@@ -38,8 +37,8 @@ def replay_to_ply(episode: Episode, ply: int) -> Game:
     no such gap -- it is the whole table's, not the learner's -- but the
     refusal is kept for a caller relying on it.
 
-    Refuses an episode with no `record` at all: one collected before
-    `Collector` carried `records=True`, or built without one by hand. There
+    Refuses an episode with no `record` at all: one collected without
+    `records=True`, or built without one by hand. There
     is nothing left here to reconstruct a game from instead.
 
     A negative or out-of-range `ply` is `replay_to`'s own refusal to raise,

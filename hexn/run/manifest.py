@@ -254,7 +254,7 @@ def engine_provenance(runtimes: Sequence[str] = ()) -> dict[str, Any]:
     of each bot runtime the run loads.
 
     Additive to `provenance()`, which is about *this* repo's checkout --
-    HexNet no longer vendors the engine, so a run's own tree being clean says
+    this package does not vendor the engine, so a run's own tree being clean says
     nothing about which `hexset` it trained against. Nor does the engine's
     commit say which bots a run's names resolved to: HexSet ships none, and
     a bot name such as `mybot` is whatever bot the run's `--runtime` provides
@@ -266,11 +266,7 @@ def engine_provenance(runtimes: Sequence[str] = ()) -> dict[str, Any]:
     commit rather than a failed `run.init`.
 
     The engine's commit comes from `hexset.experiment.provenance()`, where the
-    rest of a result's fingerprint already lives. HexSet 0.47.0 dropped the
-    package-level `build_info()` this used to call, when `GET /api/version`
-    went back to answering for the API rather than the build. Worth preferring
-    on its own merits and not only because the old call is gone: it answers
-    `dirty` too, recorded here as a third key, since a commit alone cannot
+    rest of a result's fingerprint already lives. It answers `dirty` too, recorded here as a third key, since a commit alone cannot
     reproduce a run trained against a modified engine tree. `version` and
     `git_commit` keep their names -- `provenance()` calls the latter `commit`
     -- so every manifest already on disk stays readable by the same tooling.
@@ -376,11 +372,8 @@ def freeze(
     now = now or datetime.now(timezone.utc)
     # BEFORE the directory exists. `provenance` reads `git status --porcelain`,
     # which counts untracked paths, and a run directory is untracked at the
-    # moment it is created -- so calling this afterwards reported `git_dirty`
-    # true for every run, whatever the tree actually looked like. That was
-    # invisible while `.gitignore` still held a blanket `/runs/` rule (the new
-    # directory was ignored, so the status came back clean); tracking run
-    # records as the record they are turned the field into a constant. A signal
+    # moment it is created, so calling this afterwards would report
+    # `git_dirty` true for every run, whatever the tree looked like. A signal
     # that is always true cannot say "this result cannot be cited".
     prov = provenance(repo)
     engine = engine_provenance(resolved.get("runtime") or ())
