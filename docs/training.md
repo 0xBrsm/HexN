@@ -65,7 +65,10 @@ row the behaviour policy sampled but the proximal policy would almost never
 sample does not move it. `approx_kl_unweighted` logs the plain mean beside it;
 without decoupling the two are the same. On a GPU device
 the learner's update also defaults to the fused trunk (`--fused`) and fp16
-autocast (`--amp auto`); on CPU both stay off. `--update-workers
+autocast (`--amp auto`); on CPU both stay off. `--amp bf16` runs the
+update under bf16 autocast with no gradient scaler; it needs `--decoupled`,
+since the clip is centred on proximal log-probs computed under the same
+autocast. `--update-workers
 N` shards the PPO *update* itself across `N` CPU processes with a central
 Adam step (`hexn.ddp`): data parallelism at the gradient level, for boxes
 where a single-device GPU update is not the bottleneck.

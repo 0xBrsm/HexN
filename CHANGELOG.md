@@ -2,6 +2,12 @@
 
 All notable changes to the `hexn` package are recorded here.
 
+## 0.56.1
+
+### Fixed
+
+- **`docs/training.md` describes the bf16 update (`--amp bf16`).**
+
 ## 0.56.0
 
 ### Added
