@@ -209,6 +209,44 @@ def test_a_two_seat_net_on_contract_9d_exports_and_plays_as_its_torch_net(tmp_pa
                                    reference.value_rows([(game, s) for s in range(2)]), atol=1e-4)
 
 
+def test_an_11_net_exports_and_plays_as_its_torch_net_at_four_seats(tmp_path):
+    """A contract-11 net exports a graph that declares its contract and four
+    seats, reads 11's observation (my token, three opponents', the board
+    block) at a standard table, and chooses, values and scores as the torch
+    net does there; an 11d checkpoint widened by `hexn.widen9` exports the same way."""
+    from hexn.widen9 import main as widen_main
+
+    config = replace(PARTS, contract="11", others=True, points=False)
+    source = a_checkpoint(tmp_path / "four.pt", config, players=4)
+    duel = a_checkpoint(tmp_path / "duel.pt", replace(config, contract="11d"), players=2)
+    widened = widen_main([str(duel), str(tmp_path / "widened.pt"), "--players", "4"])
+    for checkpoint in (source, widened):
+        out = export9(str(checkpoint), tmp_path / f"{checkpoint.stem}.onnx")
+        meta = read_metadata(out.read_bytes())
+        assert meta["contract"] == "11" and meta["players"] == "4"
+        game = _deal(0, 0, 4)
+        topology = game._state.board.topology
+        served = load(str(out), topology).policy
+        reference = _torch_policy(checkpoint, config, players=4)
+        assert isinstance(served, DecisionPolicy) and served.players == 4
+        assert served.layout.width == 40 + 3 * 43 + 9 + 19 * 17 + 54 * 7 + 54 + 72 + 4 * 54 == 1221
+        rows = positions(4, 120, players=4)
+        assert {"setup", "flat", "inside"} <= _kinds(rows, False, served.space)
+        decisions = [reference.decision(g, s) for g, s in rows]
+        feed = served._feed(rows, decisions)
+        got = served._run(feed, ["decision", "value", "prior"])
+        arrays = {k: v for k, v in feed.items() if k != "observation"}
+        arrays.setdefault("double_rows", np.zeros(0, dtype=np.int64))
+        want = reference.answers(feed["observation"], arrays, topology)
+        np.testing.assert_array_equal(got["decision"], want["decision"])
+        assert got["value"].shape == (len(rows), 4)
+        for name in ("value", "prior"):
+            np.testing.assert_allclose(got[name], want[name], rtol=1e-3, atol=1e-4, err_msg=name)
+        for game, seat in rows[:40]:
+            options = tuple(options_for(game))
+            assert served.act_rows([(game, seat, options)]) == reference.act_rows([(game, seat, options)])
+
+
 def _first_moves(option, seat, space) -> dict[int, float]:
     """Where a whole option's probability goes among the first atomic moves:
     its first part, or for a discard each kind of card it gives, by its share

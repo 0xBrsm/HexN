@@ -2,6 +2,21 @@
 
 All notable changes to the `hexn` package are recorded here.
 
+## 0.57.0
+
+### Added
+
+- **Contract 11 nets: contract 11d at two to four seats.** `ModelConfig(contract="11")`
+  builds a `hexn.model9.HexNet` that reads `hexset.contract9`'s contract 11:
+  my token, one token per opponent embedded by one shared layer, and the
+  board block. The move-type scores and role queries read the opponents'
+  mean token, the hand value the opponents' combined hand, the robber a key
+  per hex and victim, and the win head every seat. An 11d checkpoint loads
+  into an 11 net with its embedding weights copied and 11's appended columns
+  at zero; `python -m hexn.widen9 <11d.pt> <11.pt> --players N` writes one.
+  The trainers take `--contract 11` with `--players` 2 to 4, and
+  `hexn.export_onnx9` exports it.
+
 ## 0.56.1
 
 ### Fixed

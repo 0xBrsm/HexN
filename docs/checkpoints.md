@@ -10,10 +10,10 @@ the source of truth for them. This package trains two networks:
 | Contract | Network | Reads | Answers |
 | --- | --- | --- | --- |
 | `6`, `8`, `8.1` | `hexn.model.HexNet` | `hexset.encoding`'s hex, vertex, edge and global inputs | One flat action a decision |
-| `9`, `9.1`, `9d`, `9d.1`, `11d` | `hexn.model9.HexNet` | `hexset.contract9`'s seat, table, hex and vertex tokens | A whole decision (`hexset.decisions`) |
+| `9`, `9.1`, `9d`, `9d.1`, `11d`, `11` | `hexn.model9.HexNet` | `hexset.contract9`'s seat, table, hex and vertex tokens | A whole decision (`hexset.decisions`) |
 
-A trainer's `--contract` picks one (`8`, `9`, `9.1`, `9d`, `9d.1` or `11d`;
-the two-seat `9d`, `9d.1` and `11d` with `--players 2`). A contract-8 net becomes an 8.1 net by
+A trainer's `--contract` picks one (`8`, `9`, `9.1`, `9d`, `9d.1`, `11d` or `11`;
+the two-seat `9d`, `9d.1` and `11d` with `--players 2`, `11` with two to four). A contract-8 net becomes an 8.1 net by
 loading 8.1 weights, and a contract-6 net by loading contract-6 weights
 ([loading across contracts](#loading-across-contracts)).
 Module docstrings cite older numbers as shorthand for "before/after that
@@ -56,7 +56,10 @@ shape changed":
   the hex number one-hot. Its net is architecture a10: a score per move type
   and a query per targeted role read against keys of each vertex, edge and
   robber target, and a hand value for the resource moves (the changelog
-  entry "Contract 11d and its net" gives every part).
+  entry "Contract 11d and its net" gives every part). **Contract 11** is
+  11d at two to four seats: my token and one per opponent, each opponent's
+  embedded by the same layer, and 11d's heads reading the opponents' mean
+  token where 11d's read the one opponent's, and their combined hand.
 
 ## The contract-8 network (`hexn.model`)
 
@@ -135,7 +138,7 @@ option, compound and ordinary together.
 | `global_seat` | `False` | the global head (bank trades, buying a card, development plays, ending the turn) reads the perspective's own seat token beside the table's |
 | `points` | `False` | a points head beside the win head: one number per seat, the perspective first (`Prediction.points`) |
 | `double_turn` | `"joint"` | how the double turn is chosen: `"joint"`, one decision over every ordered pair of setup turns, or `"parts"`, the setup head twice, the second on the board after the first |
-| `contract` | `"9"` | `"9"`, `"9.1"`, `"9d"`, `"9d.1"` or `"11d"` |
+| `contract` | `"9"` | `"9"`, `"9.1"`, `"9d"`, `"9d.1"`, `"11d"` or `"11"` |
 | `setup_rounds` | 0 | contract 11d: more pooled rounds for setup positions only (before the game's first roll: every setup decision and the finished setup), after the trunk's |
 | `setup_attend` | 0 | pre-norm transformer layers over every hex, vertex, seat and table token for setup positions only, after `setup_rounds`; with both 0 the net has no setup branch |
 | `setup_value` | `False` | contract 11d: a setup value head beside the win head, a hidden layer over the win head's read, each seat's win chance (`Prediction.setup_value_logits`); it feeds nothing else |
@@ -166,6 +169,12 @@ input weights at zero, so the loaded net plays as it did:
   head's seat weights at zero.
 - A `"joint"` checkpoint initialises a `"parts"` net without its first,
   second and pair heads (`model9.without_joint_head`).
+- An 11d checkpoint loads into an 11 net: 11's tokens and board block begin
+  with 11d's columns, so the embedding weights are copied and 11's appended
+  columns start at zero. At a table of two the loaded net plays as the 11d
+  net; at more, every opponent is read by the 11d opponent's layer.
+  `python -m hexn.widen9 <11d.pt> <11.pt> --players 4` writes such a
+  checkpoint (`hexn.widen9.widen`), its `widened_from` the source's sha256.
 
 A checkpoint whose input projections read another contract's widths is
 refused when it is loaded, naming the widths.
@@ -348,7 +357,7 @@ contract-9 one a decision graph (`hexn.export_onnx9`).
   `hexn.model9.option_probs`), so paired rollouts can search whole
   decisions; and, for a net with a points head, `points`, which HexSet does
   not read.
-- `contract` is the net's own (`9`, `9.1`, `9d`, `9d.1` or `11d`), `double_turn`
+- `contract` is the net's own (`9`, `9.1`, `9d`, `9d.1`, `11d` or `11`), `double_turn`
   describes the net, and `max_offers` is `"0"` unless asked for: a contract-9
   net reads no trading inputs and makes no offers of its own.
 

@@ -63,7 +63,8 @@ from torch import Tensor, nn
 from hexset.actions import YEAR_OF_PLENTY_PAIRS, Action, ActionSpace, ActionType
 from hexset.board.terrain import NUM_RESOURCES
 from hexset.contract9 import (
-    BOARD_COLUMNS_11D, CARD_SCALE, CONTRACTS, HEX_FEATURES, MY_COLUMNS_11D, MY_FEATURES_11D, OTHER_COLUMNS_11D, OTHER_FEATURES_11D,
+    BOARD_COLUMNS_11D, BOARD_FEATURES_11D, CARD_SCALE, CONTRACTS, HEX_FEATURES, MY_COLUMNS_11D, MY_FEATURES_11, MY_FEATURES_11D,
+    OTHER_COLUMNS_11, OTHER_COLUMNS_11D, OTHER_FEATURES_11, OTHER_FEATURES_11D,
     PIECE_SCALE, SEAT_FEATURES, SEAT_FEATURES_9D, TABLE_FEATURES, VERTEX_FEATURES, Layout9, features, hex_features,
     incidences,
 )
@@ -216,8 +217,8 @@ class ModelConfig:
             raise ValueError("setup_rounds and setup_attend count layers: 0 or more")
         if (self.setup_rounds or self.setup_attend) and self.messages != "pooled":
             raise ValueError("the setup branch runs pooled rounds: messages must be \"pooled\"")
-        if self.setup_value and self.contract != "11d":
-            raise ValueError("the setup value head is contract 11d's")
+        if self.setup_value and self.contract not in ("11d", "11"):
+            raise ValueError("the setup value head is contract 11d's and 11's")
         if self.setup_value_rounds < 0 or self.setup_value_attend < 0:
             raise ValueError("setup_value_rounds and setup_value_attend count layers: 0 or more")
         if self.setup_value_rounds or self.setup_value_attend:
@@ -465,20 +466,27 @@ class HexNet(nn.Module):
         super().__init__()
         self.config = config or ModelConfig()
         self.CONTRACT = self.config.contract
-        # Contract 11d: two seat tokens of their own widths and a board token.
-        self.two = self.CONTRACT == "11d"
-        if self.two and players != 2:
+        # Contracts 11d and 11: my token and the opponents' of their own widths,
+        # and a board token. 11 seats two to four, its opponents embedded by one
+        # layer; at two seats it reads as 11d.
+        self.two = self.CONTRACT in ("11d", "11")
+        self.eleven = self.CONTRACT == "11"
+        if self.CONTRACT == "11d" and players != 2:
             raise ValueError(f"contract 11d is the two-seat observation, not {players} seats")
+        if self.eleven and not 2 <= players <= 4:
+            raise ValueError(f"contract 11 seats two to four, not {players}")
+        self.my_width = MY_FEATURES_11 if self.eleven else MY_FEATURES_11D
+        self.other_width = OTHER_FEATURES_11 if self.eleven else OTHER_FEATURES_11D
         self.players = players
         self.space = space
         width = self.config.width
         hexes, vertices, edges = topology.num_hexes, topology.num_vertices, topology.num_edges
         self.num_hexes, self.num_vertices, self.num_edges = hexes, vertices, edges
 
-        seat_features, table_features = features(self.CONTRACT)
+        seat_features, table_features = features(self.CONTRACT, players) if self.eleven else features(self.CONTRACT)
         if self.two:
-            self.embed_me = nn.Linear(MY_FEATURES_11D, width)
-            self.embed_other = nn.Linear(OTHER_FEATURES_11D, width)
+            self.embed_me = nn.Linear(self.my_width, width)
+            self.embed_other = nn.Linear(self.other_width, width)
             self.embed_board = nn.Linear(table_features, width)
         else:
             self.embed_seat = nn.Linear(seat_features, width)
@@ -580,6 +588,13 @@ class HexNet(nn.Module):
             self.my_rates = MY_COLUMNS_11D["rates"]
             self.their_hand = slice(MY_FEATURES_11D + OTHER_COLUMNS_11D["hand"].start,
                                     MY_FEATURES_11D + OTHER_COLUMNS_11D["hand"].stop)
+            # 11: every opponent's hand columns, summed into the opponents'
+            # combined hand (exact: 19 of each less the bank and my hand).
+            if self.eleven:
+                hand = OTHER_COLUMNS_11["hand"]
+                their_hands = [MY_FEATURES_11 + i * OTHER_FEATURES_11 + c for i in range(players - 1)
+                               for c in range(hand.start, hand.stop)]
+                self.register_buffer("their_hands", torch.tensor(their_hands, dtype=torch.long), persistent=False)
             # The flat row is gathered, not concatenated block by block: each
             # slot's type score (the robber block a zero column: `robber_logits`
             # scores it on demand), plus each slot's term in `_emit_queries`'
@@ -665,6 +680,18 @@ class HexNet(nn.Module):
             target = self.state_dict()["embed_seat.weight"]
             if weight is not None and tuple(weight.shape) == (target.shape[0], SEAT_FEATURES_9D):
                 state_dict[key] = nn.functional.pad(weight, (0, target.shape[1] - SEAT_FEATURES_9D))
+        # An 11 net can start from 11d: 11d's columns keep their places, so my
+        # token's and the opponents' embedding weights are copied and the
+        # columns 11 appends start at zero. At a table of two it plays as the
+        # 11d net; at four, each opponent is read by the 11d opponent's layer.
+        if self.eleven:
+            for name, old_width in (("embed_me.weight", MY_FEATURES_11D), ("embed_other.weight", OTHER_FEATURES_11D),
+                                    ("embed_board.weight", BOARD_FEATURES_11D)):
+                key = prefix + name
+                weight = state_dict.get(key)
+                target = self.state_dict()[name]
+                if weight is not None and tuple(weight.shape) == (target.shape[0], old_width):
+                    state_dict[key] = nn.functional.pad(weight, (0, target.shape[1] - old_width))
         if self.config.global_seat and isinstance(self.global_head, nn.Linear):
             key = prefix + "global_head.weight"
             weight = state_dict.get(key)
@@ -901,6 +928,12 @@ class HexNet(nn.Module):
         and the table token: under 11d my token and the opponent's, each by
         its own layer from its own columns, and the board token from the
         board block."""
+        if self.eleven:
+            me = self.embed_me(seats[..., :self.my_width]).unsqueeze(1)                  # (B, 1, W)
+            others = self.embed_other(seats[..., self.my_width:].reshape(
+                seats.shape[0], self.players - 1, self.other_width))                     # (B, P - 1, W)
+            s = torch.cat([me, others], 1)
+            return (s if dim == 1 else s.transpose(0, 1)), self.embed_board(table)
         if self.two:
             return (torch.stack([self.embed_me(seats[..., :MY_FEATURES_11D]),
                                  self.embed_other(seats[..., MY_FEATURES_11D:])], dim), self.embed_board(table))
@@ -1143,7 +1176,8 @@ class HexNet(nn.Module):
         discard candidates read `types`, `rb_road`, `edge_keys`,
         `hand_context` and `hands`."""
         batch = s.shape[0]
-        me, other = s[:, 0], s[:, 1]
+        # 11d's opponent; under 11 the opponents' mean, which at two seats is the one.
+        me, other = s[:, 0], (s[:, 1:].mean(1) if self.eleven else s[:, 1])
         context = torch.cat([me, other, t], -1)
         types = self.move_head(context)                                           # (B, types)
         # Each role's normalised query with its scale and 1/sqrt(KEY_WIDTH) folded in.
@@ -1158,7 +1192,9 @@ class HexNet(nn.Module):
         on_edge = k_edge @ _as(queries[:, roles:roles + len(EDGE_ROLES)], k_edge.dtype).transpose(1, 2)
         settle, city, setup, paying_read = on_vertex.unbind(-1)
         road_read, setup_road, rb_road = on_edge.unbind(-1)
-        mine, theirs = seats[:, self.my_hand], seats[:, self.their_hand]          # (B, resources)
+        mine = seats[:, self.my_hand]                                             # (B, resources)
+        theirs = (seats.index_select(1, self.their_hands).reshape(batch, self.players - 1, NUM_RESOURCES).sum(1)
+                  if self.eleven else seats[:, self.their_hand])
         # A setup settlement pays the starting hand when it is the seat's
         # second: with a settlement already placed, fewer than all are left.
         paying = seats[:, self.settlements_left] * PIECE_SCALE < MAX_SETTLEMENTS - 0.5

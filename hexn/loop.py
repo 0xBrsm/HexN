@@ -486,13 +486,14 @@ def add_net9_flags(parser: argparse.ArgumentParser) -> None:
     `net9_config` reads them by. Inert under contract 8."""
     parser.add_argument(
         "--contract",
-        choices=("8", "9", "9.1", "9d", "9d.1", "11d"),
+        choices=("8", "9", "9.1", "9d", "9d.1", "11d", "11"),
         default="8",
         help="the network contract: 8, hexn.model.HexNet on hexset.encoding and one action a decision; 9, "
         "hexn.model9.HexNet on hexset.contract9, asked for whole decisions (hexset.decisions); 9.1 observes "
         "the table's rules; 9d is the two-seat observation (--players 2), 9d.1 adds each seat's production and bank "
         "rates; 11d is the two-seat observation with two seat tokens of their own widths, no table token and the "
-        "hex number one-hot, read by the contract-11d query heads",
+        "hex number one-hot, read by the contract-11d query heads; 11 is 11d at two to four seats, my token and "
+        "each opponent's, read by the same heads",
     )
     parser.add_argument("--heads", choices=("linear", "mlp"), default="linear",
                         help="contract 9: every head one linear layer, or each with a hidden layer")

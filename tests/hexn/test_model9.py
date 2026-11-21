@@ -1272,3 +1272,142 @@ def test_the_setup_value_branch_feeds_the_setup_value_head_alone():
     plain = HexNet(space_for(game), game._state.board.topology, 2, ModelConfig(**{**shape, "setup_value": False}))
     with pytest.raises(ValueError, match="no setup value head"):
         plain.setup_value(**inputs)
+
+
+# --- contract 11: 11d at two to four live seats ---------------------------------
+
+
+def _four_seat_decisions(count=60, seed=0, contract="11", every=5):
+    """Positions from random four-seat play with the decision at each, every
+    `every`th decision, every discard and every grouped one; the snake seat's
+    double turn asked as two setup turns, as a "parts" net takes it."""
+    rng = random.Random(seed)
+    out = []
+    g = 0
+    while len(out) < count:
+        game = start(random_base_board(random.Random(seed + g)), 4, random.Random(seed + g))
+        space = space_for(game)
+        step = 0
+        while not is_over(game) and len(out) < count:
+            seat = players_owing_discards(game)[0] if game.phase is Phase.DISCARD else to_move(game)
+            options = D.options(game, seat, double_turn=False)
+            choice = rng.choice(options)
+            if step % every == 0 or game.phase is Phase.DISCARD or any(isinstance(o, D.Compound) for o in options):
+                decision = D.tensors(game, seat, space, double_turn=False)
+                kind, index = D.locate(decision, choice, game, seat, space)
+                out.append((contract9.flatten(contract9.encode9(game, seat, contract)), decision, int(kind), index,
+                            (list(game._state.hands[seat]), list(game._state.bank)), seat))
+            D.apply_option(game, choice, seat if game.phase is Phase.DISCARD else None)
+            step += 1
+        g += 1
+    return out, game
+
+
+def _widened(net, game, players):
+    """`net` (contract 11d) through `hexn.widen9.widen` as an 11 net for `players` seats."""
+    import dataclasses
+
+    from hexn.model9 import config_of
+    from hexn.widen9 import widen
+
+    topology = game._state.board.topology
+    state = {"net": net.state_dict(), "model_config": dataclasses.asdict(net.config), "args": {"players": 2}}
+    out = widen(state, players, topology)
+    assert out["model_config"]["contract"] == "11" and out["args"] == {"players": players, "contract": "11"}
+    from hexset.actions import build_space
+
+    space = build_space(topology.num_vertices, topology.num_edges, topology.num_hexes, players)
+    wide = HexNet(space, topology, players, config_of(out["model_config"])).eval()
+    wide.load_state_dict(out["net"])
+    return wide
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_an_11d_net_widened_to_11_plays_as_it_at_a_table_of_two(fused):
+    """Widened (`hexn.widen9`), an 11d net reads 11 at a table of two as it
+    read 11d: the same win chances and the same log-probability of every
+    decision, the grouped ones and the robber's among them, up to float
+    reassociation. 11's appended columns start at zero weight."""
+    rows, game = _duel_decisions(count=80, seed=3, contract="11d")
+    rows11, _ = _duel_decisions(count=80, seed=3, contract="11")
+    assert [r[3] for r in rows] == [r[3] for r in rows11]
+    net = _two_seat_net(game, 4)
+    wide = _widened(net, game, 2)
+    assert wide.embed_me.weight[:, 35:].abs().sum() == 0 and wide.embed_other.weight[:, 27:].abs().sum() == 0
+    assert wide.embed_board.weight[:, 3:].abs().sum() == 0
+    net.fused = wide.fused = fused
+    batch, batch11 = _batch(rows), _batch(rows11)
+    del batch["double"], batch11["double"]
+    with torch.no_grad():
+        out = net(**unpack9(contract9.layout(2, 19, 54, 72, "11d"), batch["x"]))
+        out11 = wide(**unpack9(contract9.layout(2, 19, 54, 72, "11"), batch11["x"]))
+        torch.testing.assert_close(out11.value, out.value, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(wide.full_logits(out11), net.full_logits(out), atol=1e-4, rtol=1e-5)
+        torch.testing.assert_close(decision_log_prob(wide, out11, batch11)[0], decision_log_prob(net, out, batch)[0],
+                                   atol=1e-4, rtol=1e-5)
+
+
+def test_an_11_net_reads_four_seats_and_trains():
+    """At four seats an 11 net reads my token and three opponents' (one
+    embedding layer for the three), gives a win chance per seat summing to
+    one and a robber score per hex and victim, values Monopoly against the
+    opponents' combined hand, which is exact where the view's pool is the
+    uncertified cards, and a batch trains."""
+    rows, game = _four_seat_decisions(count=80, seed=5)
+    torch.manual_seed(0)
+    net = _widened(_two_seat_net(game, 6), game, 4)
+    layout = contract9.layout(4, 19, 54, 72, "11")
+    batch = _batch(rows)
+    del batch["double"]
+    with torch.no_grad():
+        out = net(**unpack9(layout, batch["x"]))
+    assert out.value.shape == (len(rows), 4)
+    torch.testing.assert_close(out.value.sum(-1), torch.ones(len(rows)))
+    assert net.robber_logits(out, torch.arange(len(rows))).shape == (len(rows), 19 * 5)
+    exact = 0
+    for i, (x, _, _, _, (hand, bank), seat) in enumerate(rows):
+        theirs = out.hands[i, 1].numpy() * 10
+        np.testing.assert_allclose(out.hands[i, 0].numpy() * 10, hand, atol=1e-4)
+        total = [19 - bank[r] - hand[r] for r in range(5)]
+        if np.allclose(theirs, total, atol=1e-3):
+            exact += 1
+    assert exact >= 0.9 * len(rows)
+    net.train()
+    optimiser = torch.optim.AdamW(net.parameters(), lr=3e-3)
+    losses = []
+    for _ in range(80):
+        out = net(**unpack9(layout, batch["x"]))
+        loss = -decision_log_prob(net, out, batch)[0].mean()
+        optimiser.zero_grad()
+        loss.backward()
+        optimiser.step()
+        losses.append(float(loss.detach()))
+    assert losses[-1] < 0.75 * losses[0]
+
+
+def test_the_fused_trunk_computes_the_reference_under_11_at_four_seats():
+    rows, game = _four_seat_decisions(count=40, seed=9)
+    net = _widened(_two_seat_net(game, 8), game, 4)
+    inputs = unpack9(contract9.layout(4, 19, 54, 72, "11"), torch.from_numpy(np.stack([r[0] for r in rows])))
+    with torch.no_grad():
+        net.fused = False
+        reference = net(**inputs)
+        net.fused = True
+        fused = net(**inputs)
+    torch.testing.assert_close(fused.value, reference.value, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(net.full_logits(fused), net.full_logits(reference), atol=1e-4, rtol=1e-5)
+
+
+def test_widen_refuses_another_contract_or_seat_count():
+    import dataclasses
+
+    from hexn.widen9 import widen
+
+    rows, game = _duel_decisions(count=2, seed=1, contract="11d")
+    net = _two_seat_net(game, 1)
+    state = {"net": net.state_dict(), "model_config": {**dataclasses.asdict(net.config), "contract": "9d.1"}}
+    with pytest.raises(ValueError, match="11d"):
+        widen(state, 4, game._state.board.topology)
+    state["model_config"]["contract"] = "11d"
+    with pytest.raises(ValueError, match="two to four"):
+        widen(state, 5, game._state.board.topology)
