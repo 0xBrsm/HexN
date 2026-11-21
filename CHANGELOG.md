@@ -2,6 +2,29 @@
 
 All notable changes to the `hexn` package are recorded here.
 
+## 0.58.0
+
+### Breaking
+
+- **The exporter writes no trade gate continuation.** `hexn.export_onnx`'s
+  `--gate-plies` flag and the `gate_plies` argument of `export` and
+  `export_onnx9.serving_props` are removed; HexSet no longer loads a file
+  that sets `gate_plies` above 0.
+
+- **`--gate-own-frame` takes only 1.** `hexn.export_onnx --gate-own-frame 0`
+  and `serving_props(gate_own_frame=False)` are refused; HexSet no longer
+  loads a file that sets `gate_own_frame` to 0.
+
+### Fixed
+
+- **The suite passes without PyTorch.** `tests/hexn/test_schedule.py`'s
+  warm-up test skips where torch is not installed, as the other
+  torch-dependent tests do.
+
+- **`docs/checkpoints.md` gives `widened_from` as the source's contract and
+  sha256, as `hexn.widen9` writes it, and calls the deciding seat's token the
+  seat's own token.**
+
 ## 0.57.0
 
 ### Added

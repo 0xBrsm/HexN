@@ -289,8 +289,6 @@ def test_the_exported_metadata_says_contract_8_and_matches_the_checkpoints_own_a
     assert "search" not in meta
     assert "simulations" not in meta
     assert "wave" not in meta
-    # Nor about the trade gate's own continuation budget: the UI's gate
-    # rolls no rollout unless a file asks for one.
     assert "gate_plies" not in meta
     # Nor about a trader: the file trades through its own gate.
     assert "trader" not in meta
@@ -326,24 +324,6 @@ def test_a_search_export_declares_itself_in_the_keys_hexset_reads(tmp_path):
     assert meta["search"] == "mcts"
     assert meta["simulations"] == "256"
     assert meta["wave"] == "32"
-
-
-def test_a_gate_plies_export_declares_itself_in_the_keys_hexset_reads(tmp_path):
-    """`hexset.clients._modelmeta.gate_config`: `gate_plies` is the trade gate's
-    own continuation budget, independent of `search` -- a plain policy file
-    (no `search` at all here) can still ask its gate to roll forward."""
-    checkpoint = tmp_path / "latest.pt"
-    board = a_checkpoint(checkpoint)
-    out = tmp_path / "gated8.onnx"
-
-    export(str(checkpoint), out, topology=board.topology, gate_plies=8)
-
-    meta = ort.InferenceSession(
-        str(out), providers=["CPUExecutionProvider"]
-    ).get_modelmeta().custom_metadata_map
-    assert meta["contract"] == "8"
-    assert meta["gate_plies"] == "8"
-    assert "search" not in meta
 
 
 @needs("mybot")

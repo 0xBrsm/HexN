@@ -332,7 +332,7 @@ def test_the_served_shape_is_written_by_the_command_line_in_the_keys_hexset_read
     game = deal_game(0, 0, 4)
     loaded = load(str(out), game._state.board.topology)
     assert loaded.trader == "mybot" and loaded.trader_veto and loaded.trade_floor == pytest.approx(0.03)
-    assert loaded.gate.max_offers == 1 and loaded.gate.gate_own_frame and loaded.robber_hits
+    assert loaded.gate.max_offers == 1 and loaded.robber_hits
     assert declared_trader(loaded, str(out)) == "mybot"
 
 
@@ -353,6 +353,18 @@ def test_a_veto_with_nothing_to_veto_is_refused_not_written(tmp_path):
     with pytest.raises(ValueError):
         serving_props(trader="mybot", trader_veto=True, max_offers=0)
     assert not list(tmp_path.glob("*.onnx")) and not list(tmp_path.glob(".x.onnx*"))
+
+
+def test_a_gate_own_frame_of_0_is_refused_not_written(tmp_path):
+    """HexSet refuses to load a file whose `gate_own_frame` is 0, so the
+    exporter never writes one."""
+    source = a_checkpoint(tmp_path / "net.pt", PARTS)
+    with pytest.raises(SystemExit):
+        export_main(["--checkpoint", str(source), "--out", str(tmp_path / "x.onnx"), "--gate-own-frame", "0"])
+    with pytest.raises(ValueError, match="gate_own_frame"):
+        serving_props(gate_own_frame=False)
+    assert serving_props(gate_own_frame=True) == {"gate_own_frame": "1"}
+    assert not list(tmp_path.glob("*.onnx"))
 
 
 def _real_checkpoints():

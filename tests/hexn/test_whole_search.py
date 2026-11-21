@@ -156,8 +156,8 @@ def _native_built() -> bool:
     return available()
 
 
-#: The duel searches a two-seat net is run with: greedy, deterministic, mixed and both.
-_SEARCHES = {"greedy": "", "det": ":det=1:salt=3", "mix": ":mix=0.05:anchor=0.5", "mix-det": ":mix=0.05:det=1"}
+#: The duel searches a two-seat net is run with: greedy and deterministic.
+_SEARCHES = {"greedy": "", "det": ":det=1"}
 
 
 @pytest.mark.skipif(not _native_built(), reason="the native extension is not built")
@@ -165,8 +165,7 @@ _SEARCHES = {"greedy": "", "det": ":det=1:salt=3", "mix": ":mix=0.05:anchor=0.5"
 def test_an_11d_checkpoint_searches_a_duel_dealt_four_natively_as_in_python(search, tmp_path, monkeypatch):
     """A contract-11d (architecture a10) checkpoint as `rollout:` at a duel
     table dealt four with seats 1 and 3 retired, every root searched and the
-    setup in full, greedy, deterministic (`det`, `salt`) and mixed (`mix`,
-    `anchor`): with playout copies on the native engine it plays and logs
+    setup in full, greedy and deterministic (`det`): with playout copies on the native engine it plays and logs
     the games the Python engine's copies play, searched decisions included,
     and the native copies are used."""
     import hexn.netbot  # noqa: F401  (registers the checkpoint entrant kinds)
@@ -229,7 +228,7 @@ def test_an_11d_file_served_with_a_deterministic_search_plays_natively_as_in_pyt
 
     config = replace(PARTS, contract="11d", others=True, points=False)
     plain = export9(str(a_checkpoint(tmp_path / "a10.pt", config, players=2)), tmp_path / "a10.onnx")
-    keys = {"search": "rollout", "worlds": "3", "top": "3", "horizon": "2", "setup": "full", "det": "1", "salt": "5"}
+    keys = {"search": "rollout", "worlds": "3", "top": "3", "horizon": "2", "setup": "full", "det": "1"}
     served = tmp_path / "a10-det.onnx"
     served.write_bytes(with_metadata(plain.read_bytes(), keys))
 

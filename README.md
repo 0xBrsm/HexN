@@ -72,10 +72,10 @@ python -m hexn.ppo runs/first
 python -m hexset.bench.duel --runtime hexn.netbot --runtime <bot runtime> \
     network:runs/first/latest.pt searchbot --games 400
 
-# export for the served table: search budget and the trade gate's own look-ahead are
-# per-file metadata HexSet reads (`search`/`simulations`, `gate_plies`)
+# export for the served table: the search budget is per-file metadata HexSet
+# reads (`search`/`simulations`)
 python -m hexn.export_onnx --checkpoint runs/first/latest.pt --out latest.onnx \
-    --search mcts --simulations 256 --gate-plies 8
+    --search mcts --simulations 256
 
 # the test suite; torch-dependent files skip where torch is absent, and the
 # tests that seat a named bot play the suite's own `mybot` unless a

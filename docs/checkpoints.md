@@ -51,13 +51,13 @@ shape changed":
   table's rules and next-roll odds to the table token.
 - **Contract 9d** is the two-seat observation: each hand exact, only the
   development deck hidden. **Contract 9d.1** appends each seat's production
-  and bank rates to its token. **Contract 11d** is two-seat too: my token and
-  the opponent's of their own widths, a board block in the table's place and
+  and bank rates to its token. **Contract 11d** is two-seat too: the seat's own
+  token and the opponent's of their own widths, a board block in the table's place and
   the hex number one-hot. Its net is architecture a10: a score per move type
   and a query per targeted role read against keys of each vertex, edge and
   robber target, and a hand value for the resource moves (the changelog
   entry "Contract 11d and its net" gives every part). **Contract 11** is
-  11d at two to four seats: my token and one per opponent, each opponent's
+  11d at two to four seats: the seat's own token and one per opponent, each opponent's
   embedded by the same layer, and 11d's heads reading the opponents' mean
   token where 11d's read the one opponent's, and their combined hand.
 
@@ -174,7 +174,7 @@ input weights at zero, so the loaded net plays as it did:
   columns start at zero. At a table of two the loaded net plays as the 11d
   net; at more, every opponent is read by the 11d opponent's layer.
   `python -m hexn.widen9 <11d.pt> <11.pt> --players 4` writes such a
-  checkpoint (`hexn.widen9.widen`), its `widened_from` the source's sha256.
+  checkpoint (`hexn.widen9.widen`), its `widened_from` the source's contract and sha256.
 
 A checkpoint whose input projections read another contract's widths is
 refused when it is loaded, naming the widths.
@@ -370,8 +370,7 @@ HexSet's `docs/onnx.md` gives both graphs' inputs and outputs in full.
   run's recorded offer budget for a contract-8 net, empty for none; a file
   still carrying the older `max_trades` key is read as it), and `iteration`.
   Only when asked for on the command line: `search=mcts` with
-  `simulations`/`wave`, `gate_plies` (the served trade gate's own look-ahead
-  budget, independent of `--search`), and the serving keys below. A
+  `simulations`/`wave`, and the serving keys below. A
   contract-8 export also writes `trader` when the run trained with one, and
   every export writes `hold_shape` and `hold_scale` when the checkpoint
   declares a hold model (`hexn.hold`).
@@ -390,12 +389,11 @@ The serving flags, written as HexSet's metadata keys of the same names
 | Flag | Writes |
 | --- | --- |
 | `--search mcts`, `--simulations`, `--wave` | `search`, `simulations`, `wave` |
-| `--gate-plies N` | `gate_plies` |
 | `--trader <bot>` | `trader`: a bot, as a lineup names it, registered by a `--runtime` module, that answers the file's trades while the network plays every move. The server that loads the file needs the same runtime |
 | `--max-offers N` | `max_offers`, over the recorded budget |
 | `--trade-floor F` | `trade_floor`, in [0, 1] |
 | `--trader-veto` | `trader_veto`: the file's own gate vetoes its trader. Needs `--trader` and `--max-offers` above 0 |
-| `--gate-own-frame 0\|1` | `gate_own_frame` |
+| `--gate-own-frame 1` | `gate_own_frame = 1`: the gate prices every turn from the file's own frame, as it does without the key. HexSet does not load a file that sets it to `0` |
 | `--robber-tip F` | `robber_tip`, in [0, 1] |
 | `--robber-hits` | `robber_hits`: the file's robber moves stay on other seats' hexes where one is legal |
 

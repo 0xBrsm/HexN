@@ -87,6 +87,7 @@ def test_no_warmup_is_the_rate():
 def test_the_schedule_warms_the_constant_and_the_linear_rate():
     from argparse import Namespace
 
+    pytest.importorskip("torch", reason="hexn.ppo needs PyTorch, which runs on the training box only")
     from hexn.ppo.__main__ import scheduled_lr
 
     def args(schedule, length):

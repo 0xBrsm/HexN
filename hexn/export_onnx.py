@@ -87,8 +87,7 @@ command line dispatch to it by the checkpoint's own `contract`.
   `num_hexes`/`num_vertices`/
   `num_edges` fingerprint are required; `max_offers` (`""` for none) and
   `iteration` are read with defaults; and only when asked for on the command
-  line, `search=mcts` with `simulations`/`wave`, and `gate_plies` (the trade
-  gate's own continuation budget, independent of `search`). Inference device
+  line, `search=mcts` with `simulations`/`wave`. Inference device
   is not metadata: the UI takes it from its own `--device`.
 * **Provenance props**, which nothing reads at runtime and everything reads
   afterwards: `source_checkpoint` (repo-relative), `checkpoint_sha256`,
@@ -117,7 +116,7 @@ Needs `torch` (not a declared dependency of this package -- see
         --out mcts256.onnx --search mcts --simulations 256
 
 The serving keys a served file carries -- `--max-offers`, `--trade-floor`,
-`--trader`, `--trader-veto`, `--gate-own-frame`, `--gate-plies`,
+`--trader`, `--trader-veto`, `--gate-own-frame`,
 `--robber-tip`, `--robber-hits` -- are written as asked, for either contract
 (`hexn.export_onnx9.serving_props`).
 
@@ -577,7 +576,6 @@ def _embed_metadata(
     search: str,
     simulations: int | None,
     wave: int | None,
-    gate_plies: int | None,
     trader: str | None = None,
     serving: dict[str, str] | None = None,
     contract: str = "8",
@@ -594,12 +592,7 @@ def _embed_metadata(
     for. `hexset.clients._modelmeta` would ignore a stray budget anyway ("a stale
     `simulations` left behind by an export cannot quietly turn a policy
     checkpoint into a search"), so leaving the keys out keeps the file's
-    metadata saying exactly what it does. `gate_plies` -- the trade gate's
-    own continuation budget, unrelated to `search` -- follows the same rule
-    for the same reason: written only when this export was asked for one,
-    so a file that never asked reads at `hexset.clients._modelmeta`'s
-    default (no rollout) rather than whatever the exporter's own default
-    happens to be."""
+    metadata saying exactly what it does."""
     import onnx
 
     props = {
@@ -622,9 +615,7 @@ def _embed_metadata(
             props["simulations"] = str(simulations)
         if wave is not None:
             props["wave"] = str(wave)
-    if gate_plies is not None:
-        props["gate_plies"] = str(gate_plies)
-    # Written only when there is one, like `gate_plies`: a file naming no
+    # Written only when there is one: a file naming no
     # trader trades through its own gate (`hexset.clients._modelmeta`).
     if trader is not None:
         props["trader"] = trader
@@ -747,7 +738,6 @@ def export(
     search: str = "none",
     simulations: int | None = None,
     wave: int | None = None,
-    gate_plies: int | None = None,
     trader: str | None = None,
     serving: dict[str, str] | None = None,
 ) -> Path:
@@ -759,15 +749,6 @@ def export(
     file ask hexset to search over its own priors; the default plays one
     forward pass per move. A budget without a search is refused rather than
     written, since the UI would read the file as a plain policy regardless.
-
-    `gate_plies` asks the file's trade gate to roll its own continuation
-    forward that many plies before valuing an exchange -- conceptually a
-    search on the trade decision, same footing as `search`/`simulations`.
-    Independent of `search` -- a plain policy file
-    can still ask its gate to roll forward. `None`, the default, writes
-    nothing, so training collection's own exports (which never pass this
-    flag) leave the served file to `hexset.clients._modelmeta`'s
-    default of no rollout.
 
     `trader` names a HexSet bot, as a lineup names it, to answer the served
     file's trades while the network plays every move (`hexset.arena.traded`).
@@ -789,8 +770,6 @@ def export(
             keys.update((k, str(v)) for k, v in (("simulations", simulations), ("wave", wave)) if v is not None)
         if trader is not None:
             keys["trader"] = trader
-        if gate_plies is not None:
-            keys["gate_plies"] = str(gate_plies)
         return export9(checkpoint, out, topology=topology, opset=opset, serving=keys)
 
     topology = topology or _base_topology()
@@ -840,7 +819,6 @@ def export(
         search=search,
         simulations=simulations,
         wave=wave,
-        gate_plies=gate_plies,
         serving=serving,
         contract=contract,
         **meta,
@@ -882,14 +860,6 @@ def main(argv: list[str] | None = None) -> None:
         help="MCTS leaves batched per expansion (hexset defaults to 16, caps at 256).",
     )
     parser.add_argument(
-        "--gate-plies",
-        type=int,
-        default=None,
-        help="The served trade gate's own continuation budget: how many plies the "
-        "mover's greedy policy rolls forward before an exchange is valued "
-        "(hexset defaults to 0, no rollout, caps at 16). Independent of --search.",
-    )
-    parser.add_argument(
         "--trader",
         default=None,
         help="A bot, as a lineup names it (e.g. 'mybot', registered by a "
@@ -904,8 +874,8 @@ def main(argv: list[str] | None = None) -> None:
                         help="The win-probability gain a trade must clear at the file's own gate.")
     parser.add_argument("--trader-veto", action="store_true",
                         help="The file's own gate vetoes its --trader: each exchange must clear its floor too.")
-    parser.add_argument("--gate-own-frame", type=int, choices=(0, 1), default=None,
-                        help="Price another seat's turn from the file's own frame (1) or the mover's (0).")
+    parser.add_argument("--gate-own-frame", type=int, choices=(1,), default=None,
+                        help="Write gate_own_frame = 1: the gate prices every turn from the file's own frame.")
     parser.add_argument("--robber-tip", type=float, default=None,
                         help="How far its robber moves lean to the leader its value head names, in [0, 1].")
     parser.add_argument("--robber-hits", action="store_true",
@@ -938,7 +908,6 @@ def main(argv: list[str] | None = None) -> None:
         search=args.search,
         simulations=args.simulations,
         wave=args.wave,
-        gate_plies=args.gate_plies,
         trader=args.trader,
         serving=serving,
     )

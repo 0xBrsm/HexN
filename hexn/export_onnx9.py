@@ -235,20 +235,22 @@ def serving_props(
     trader_veto: bool = False,
     trade_floor: float | None = None,
     gate_own_frame: bool | None = None,
-    gate_plies: int | None = None,
     robber_tip: float | None = None,
     robber_hits: bool = False,
 ) -> dict[str, str]:
     """The serving keys `hexset.clients._modelmeta` reads, for what is asked:
     nothing for an argument left at its default. A `trader_veto` needs a
     `trader` to veto and a seat that trades (`max_offers` not 0), as
-    `hexset.arena.traded` does."""
+    `hexset.arena.traded` does. `gate_own_frame` is `True` or `None`: HexSet
+    refuses to load a file that sets it to `0`."""
     if trader_veto and (trader is None or not max_offers):
         raise ValueError("a trader veto needs a trader and max_offers above 0")
     if trade_floor is not None and not 0.0 <= trade_floor <= 1.0:
         raise ValueError(f"trade_floor is a win-probability gain in [0, 1], not {trade_floor}")
     if robber_tip is not None and not 0.0 <= robber_tip <= 1.0:
         raise ValueError(f"robber_tip is a fraction in [0, 1], not {robber_tip}")
+    if gate_own_frame is not None and not gate_own_frame:
+        raise ValueError("gate_own_frame is 1 or absent: HexSet does not load a file that sets it to 0")
     props: dict[str, str] = {}
     if max_offers is not None:
         props["max_offers"] = str(int(max_offers))
@@ -259,9 +261,7 @@ def serving_props(
     if trade_floor is not None:
         props["trade_floor"] = repr(float(trade_floor))
     if gate_own_frame is not None:
-        props["gate_own_frame"] = "1" if gate_own_frame else "0"
-    if gate_plies is not None:
-        props["gate_plies"] = str(int(gate_plies))
+        props["gate_own_frame"] = "1"
     if robber_tip is not None:
         props["robber_tip"] = repr(float(robber_tip))
     if robber_hits:
