@@ -535,6 +535,7 @@ class Collector:
         board: Board | None = None,
         max_offers: int | None = None,
         trader: str | None = None,
+        no_trade: bool = False,
         first_game: int = 0,
         deal: int | None = None,
         fill: bool = True,
@@ -579,6 +580,10 @@ class Collector:
         `first_game = base + w, stride = K` and the workers' index sets are
         disjoint by construction while every game stays the same pure function
         of `(seed, index)` it always was.
+
+        `no_trade` puts every learner's seat out of player trading, under a
+        trade embargo with every other seat, while the other seats trade
+        among themselves as their own bots do.
 
         `pair_boards` transplants the duel pairing to collection: games `2k`
         and `2k+1` share the board keyed `f"{seed}:{2k}:board"` while each
@@ -681,6 +686,10 @@ class Collector:
         self.turn_cap = turn_cap
         self.max_offers = max_offers
         self.trader = trader
+        # The learners' seats out of player trading: each under a trade
+        # embargo with every other seat (`hexset.gym.lanes.LaneEnv`'s
+        # `no_trade`), so the other seats trade only among themselves.
+        self.no_trade = bool(no_trade)
         self.board = board
         self.pair_boards = pair_boards
         self.stride = stride
@@ -802,6 +811,7 @@ class Collector:
                 for pid in self._batched
                 if getattr(self._batched[pid], "trader", None) is not None
             },
+            no_trade=self._learners if self.no_trade else (),
             first_game=first_game,
             stride=self.stride,
             # Every episode carries the engine's own `hexset.record.Record`
@@ -1017,6 +1027,7 @@ class Collector:
             and self.sample_stream == "game"
             and self.max_offers == 0
             and self.trader is None
+            and not self.no_trade
         ):
             return False
         # Imported only here: `hexn.policy9` needs torch, and this module does not.

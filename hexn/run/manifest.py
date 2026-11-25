@@ -128,6 +128,7 @@ ADDED: dict[str, dict[str, Any]] = {
         "c9_clip": "per-decision",
         "eval_seed": None,
         "lr_warmup": 0,
+        "learner_no_trade": False,
     },
     "exit": {
         "collect_trunk": "reference",

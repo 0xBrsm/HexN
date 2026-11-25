@@ -2,6 +2,16 @@
 
 All notable changes to the `hexn` package are recorded here.
 
+## 0.59.0
+
+### Added
+
+- **`--learner-no-trade`** (`hexn.ppo`): the learning network's seats are out
+  of player trading in collection, each under a trade embargo with every
+  other seat, while the other seats trade among themselves as their own bots
+  do (`hexn.selfplay.Collector`'s `no_trade`, `WorkerSpec.no_trade`). A
+  manifest frozen before the flag loads with it off.
+
 ## 0.58.0
 
 ### Breaking

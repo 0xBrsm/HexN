@@ -981,6 +981,9 @@ class WorkerSpec:
     vp_reward: float = 0.0
     # A bot that answers the networks' trades (`hexn.trade.trader_gate`).
     trader: str | None = None
+    # The learners' seats out of player trading (`hexn.selfplay.Collector`'s
+    # `no_trade`).
+    no_trade: bool = False
     # The runtime modules providing the bots this shard names -- `mix`,
     # `trader` -- loaded before anything is built (`hexn.runtime`): a spawned
     # worker inherits none of its parent's registrations.
@@ -1095,6 +1098,7 @@ def _build9(spec: WorkerSpec) -> tuple[list, Collector]:
         seed=spec.seed,
         action_cap=spec.action_cap,
         max_offers=spec.max_offers,
+        no_trade=spec.no_trade,
         first_game=spec.first_game,
         stride=spec.stride,
         opponents=opponents,
@@ -1268,6 +1272,7 @@ def _build(spec: WorkerSpec) -> tuple[list[NetworkPolicy], Collector]:
         seed=spec.seed,
         action_cap=spec.action_cap,
         max_offers=spec.max_offers,
+        no_trade=spec.no_trade,
         trader=spec.trader,
         first_game=spec.first_game,
         stride=spec.stride,

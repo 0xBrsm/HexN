@@ -424,6 +424,28 @@ def test_a_scripted_opponent_is_seated_as_its_own_trader():
     assert all(hasattr(game.gates[seat], "gains_many") for seat in (1, 3))
 
 
+def test_an_embargoed_learner_is_out_of_trading_with_every_other_seat():
+    """`no_trade`: every learner seat is under an embargo with every other
+    seat, and the opponents' seats are not embargoed with each other."""
+    from hexset.arena import entrant_from_name, spawn
+
+    entrant = entrant_from_name("mybot")
+    bots = BoardBots(lambda board: spawn(entrant, board, random.Random(0)),
+                     seat_spawn=lambda board, rng: spawn(entrant, board, rng))
+    collector = Collector(
+        RandomPolicy(random.Random(1)),
+        lanes=1,
+        seed=7,
+        opponents=[bots],
+        caster=lambda index: (0, 1, 1, 1),
+        no_trade=True,
+        keep=kept(),
+    )
+    game = next(collector.in_flight())
+    pairs = {frozenset(pair) for pair in game.embargoes}
+    assert pairs == {frozenset((0, other)) for other in (1, 2, 3)}
+
+
 def test_the_cast_is_taken_from_the_game_index_not_the_lane():
     def swaps(index: int) -> tuple[int, ...]:
         return (0, 1, 0, 1) if index % 2 == 0 else (1, 0, 1, 0)

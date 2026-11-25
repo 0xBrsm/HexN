@@ -154,6 +154,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="a bot, by lineup name (e.g. 'mybot', registered by a --runtime), that answers every network seat's trades in collection and the ladder (hexn.trade.trader_gate); the network still plays every move. Not combinable with --max-offers",
     )
+    parser.add_argument(
+        "--learner-no-trade",
+        action="store_true",
+        help="put the learning network's seats out of player trading in collection: each is under a trade embargo with every other seat, and the other seats trade among themselves as their own bots do",
+    )
     # HexSet ships no bots: `--trader`, `--mix` and a rung name one only once
     # the runtime registering it is loaded (`hexn.runtime`).
     runtime.add_argument(parser)
@@ -930,6 +935,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     action_cap=args.action_cap,
                     max_offers=args.max_offers,
                     trader=getattr(args, "trader", None),
+                    no_trade=bool(getattr(args, "learner_no_trade", False)),
                     runtime=tuple(getattr(args, "runtime", None) or ()),
                     first_game=first_game + worker,
                     stride=args.collect_workers,
@@ -984,6 +990,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             first_game=first_game,
             max_offers=args.max_offers,
             trader=getattr(args, "trader", None),
+            no_trade=bool(getattr(args, "learner_no_trade", False)),
             opponents=opponents,
             caster=mix_caster(mix, args.players, args.seed) if opponents else None,
             temperatures=(
