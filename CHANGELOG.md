@@ -2,6 +2,12 @@
 
 All notable changes to the `hexn` package are recorded here.
 
+## 0.59.1
+
+### Fixed
+
+- **`docs/training.md` documents `--learner-no-trade`.**
+
 ## 0.59.0
 
 ### Added

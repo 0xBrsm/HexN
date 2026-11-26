@@ -1,6 +1,6 @@
 [project]
 name = "hexn"
-version = "0.59.0"
+version = "0.59.1"
 description = "PPO/training research on the hexset engine"
 requires-python = ">=3.11"
 license = { text = "GPL-3.0-only" }
@@ -22,7 +22,7 @@ classifiers = [
 # names with `--runtime <module>` wherever hexn resolves one by name
 # (`hexn.runtime`). The tests that seat one skip without it.
 dependencies = [
-    "hexset @ git+https://github.com/0xBrsm/HexSet.git@879119b31e652b485cabb212f6a15de9294c31c3",
+    "hexset @ git+https://github.com/0xBrsm/HexSet.git@fdea7029cb8484dfb882a385138083b215d8ecaa",
     "numpy>=1.26",
 ]
 

@@ -82,6 +82,11 @@ collected against as well as evaluated on. A bot HexSet does not ship
 resolves only once its runtime is loaded: name the module with `--runtime`
 (repeatable; frozen into the config), and the trainer loads it before it
 resolves anything and hands it to every collector worker.
+`--learner-no-trade` puts the learning network's seats out of player trading
+in collection: each is under a trade embargo with every other seat
+(HexSet's `hexset.gym.lanes.LaneEnv` `no_trade`), while the other seats trade among themselves
+as their own bots do. A manifest frozen before the flag existed loads with
+it off.
 
 **Seeds.** `--seed` is the run's training seed, and `hexn.run.init` holds
 it to the seed policy's `rl` seeds (`hexset.seeds`; [runs.md](runs.md#seeds)).
